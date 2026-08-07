@@ -1,0 +1,4 @@
+# Permit only members of the dedicated tbstream group to open USB4STREAM
+# character devices.  The stream UAPI exposes DMA-mapped pages, so do not use
+# a world-writable mode here.
+SUBSYSTEM=="misc", KERNEL=="tbstream[0-9]*", GROUP="tbstream", MODE="0660"

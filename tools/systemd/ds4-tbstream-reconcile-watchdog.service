@@ -1,0 +1,17 @@
+[Unit]
+Description=Check the DS4 USB4STREAM endpoint without bootstrap retries
+Documentation=file:/usr/local/share/doc/strix-rdma/tbstream-lifecycle.md
+After=systemd-modules-load.service sys-kernel-config.mount
+RequiresMountsFor=/sys/kernel/config
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sysconfig/ds4-tbstream
+RuntimeDirectory=ds4-tbstream
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/libexec/ds4-tbstream-reconcile.sh --once
+SuccessExitStatus=75
+TimeoutStartSec=60
+UMask=0022

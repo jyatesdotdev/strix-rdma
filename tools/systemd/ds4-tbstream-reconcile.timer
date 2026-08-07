@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically reconcile the DS4 USB4STREAM endpoint
+
+[Timer]
+OnBootSec=1s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+RandomizedDelaySec=1s
+Unit=ds4-tbstream-reconcile-watchdog.service
+
+[Install]
+WantedBy=timers.target

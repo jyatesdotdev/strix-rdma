@@ -1,0 +1,4 @@
+# Reconcile promptly when the peer's USB4STREAM service appears.
+# The systemd timer handles property changes, remove events, and missed notifications;
+# do not run a long-lived helper directly from udev.
+ACTION=="add", SUBSYSTEM=="thunderbolt", ATTR{key}=="stream", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ds4-tbstream-reconcile.service"
