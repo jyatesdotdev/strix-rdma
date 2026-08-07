@@ -1,0 +1,56 @@
+From c22266fc173e972ad52d49c38b285b00655bdff4 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Sun, 2 Aug 2026 19:17:07 -0700
+Subject: [PATCH 1/2] thunderbolt: Allow clients to suppress per-frame
+ completion interrupts
+
+The NHI ring code requests a completion interrupt for every descriptor
+it writes. Clients moving large multi-frame messages only need to know
+when the last frame of a message is done, so per-frame interrupts are
+pure overhead.
+
+Add RING_FRAME_NO_INTERRUPT, an input flag on struct ring_frame that
+suppresses the descriptor interrupt for that frame. Clients must make
+sure a later frame on the same ring requests an interrupt so that
+completed frames are eventually processed.
+---
+ drivers/thunderbolt/nhi.c   |  4 +++-
+ include/linux/thunderbolt.h | 10 ++++++++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index c89b3063..1b7cfb6a 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -254,7 +254,9 @@ static void ring_write_descriptors(struct tb_ring *ring)
+ 		descriptor = &ring->descriptors[ring->head];
+ 		descriptor->phys = frame->buffer_phy;
+ 		descriptor->time = 0;
+-		descriptor->flags = RING_DESC_POSTED | RING_DESC_INTERRUPT;
++		descriptor->flags = RING_DESC_POSTED;
++		if (!(frame->flags & RING_FRAME_NO_INTERRUPT))
++			descriptor->flags |= RING_DESC_INTERRUPT;
+ 		if (ring->is_tx) {
+ 			descriptor->length = frame->size;
+ 			descriptor->eof = frame->eof;
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 727aa21f..13af681a 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -609,6 +609,16 @@ enum ring_desc_flags {
+ 	RING_DESC_INTERRUPT = 0x8,
+ };
+ 
++/*
++ * Input flag for &struct ring_frame flags. If set when the frame is
++ * enqueued, no completion interrupt is requested for its descriptor.
++ * The client must make sure a later frame on the same ring requests an
++ * interrupt, otherwise completion of this frame may not be noticed
++ * until the ring is flushed or stopped. Cleared by the NHI on RX
++ * completion when the hardware descriptor flags are copied back.
++ */
++#define RING_FRAME_NO_INTERRUPT	BIT(11)
++
+ /**
+  * struct ring_frame - For use with ring_rx/ring_tx
+  * @buffer_phy: DMA mapped address of the frame

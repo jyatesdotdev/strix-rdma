@@ -1,0 +1,112 @@
+From c144e0fddaacb9cfcea495abfcfe86822c166572 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <me@jyates.dev>
+Date: Wed, 5 Aug 2026 20:05:17 -0700
+Subject: [PATCH] thunderbolt: stream: Prime Rx ring before enabling DMA paths
+
+USB4STREAM enables its XDomain DMA paths before either NHI ring is
+started and before the receive ring has any descriptors. A peer can
+therefore reach an enabled receive path with no buffers available. With
+E2E flow control, repeated close and reopen cycles can then start with no
+credits and make no descriptor progress.
+
+Follow the ordering already used by ThunderboltIP: configure and start
+both rings, populate the receive ring, and enable the DMA paths last.
+Extend the start error path to release partially allocated receive and
+transmit buffers after stopping active rings, and clear freed frame-array
+and ring pointers so the cleanup is safe to retry.
+
+Fixes: 6db21d817b43 ("thunderbolt: Add support for USB4STREAM")
+Signed-off-by: Jonathan Yates <me@jyates.dev>
+---
+ drivers/thunderbolt/stream.c | 36 +++++++++++++++++++++++++-----------
+ 1 file changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index b58d80df9..1f374a3ab 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -323,10 +323,15 @@ static inline bool tbstream_valid(const struct tbstream *stream)
+ 
+ static void tbstream_ring_free(struct tbstream_ring *ring)
+ {
+-	struct device *dma_dev = tb_ring_dma_device(ring->ring);
++	struct device *dma_dev;
+ 	enum dma_data_direction dir;
+ 	int i;
+ 
++	if (!ring->frames)
++		return;
++
++	dma_dev = tb_ring_dma_device(ring->ring);
++
+ 	if (ring->ring->is_tx)
+ 		dir = DMA_TO_DEVICE;
+ 	else
+@@ -347,6 +352,7 @@ static void tbstream_ring_free(struct tbstream_ring *ring)
+ 	ring->prod = 0;
+ 	ring->cons = 0;
+ 	kfree(ring->frames);
++	ring->frames = NULL;
+ }
+ 
+ static inline bool tbstream_ring_available(const struct tbstream_ring *ring)
+@@ -861,7 +867,7 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 
+ 	ret = tbstream_dev_alloc_tx_buffers(sdev);
+ 	if (ret)
+-		goto err_free_tx;
++		goto err_free_tx_buffers;
+ 
+ 	e2e_tx_hop = ring->hop;
+ 	sof_mask = BIT(TBSTREAM_FRAME_START);
+@@ -877,13 +883,6 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	}
+ 	sdev->rx_ring.ring = ring;
+ 
+-	ret = tb_xdomain_enable_paths(xd, sdev->out_hopid,
+-				     sdev->tx_ring.ring->hop,
+-				     sdev->in_hopid,
+-				     sdev->rx_ring.ring->hop);
+-	if (ret)
+-		goto err_free_rx;
+-
+ 	tb_ring_throttling(sdev->tx_ring.ring, sdev->throttling);
+ 	tb_ring_throttling(sdev->rx_ring.ring, sdev->throttling);
+ 
+@@ -893,17 +892,32 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	ret = tbstream_dev_alloc_rx_buffers(sdev);
+ 	if (ret)
+ 		goto err_stop;
++
++	/*
++	 * Enable the DMA paths only after the receive ring is running and
++	 * fully primed. Otherwise the remote host can transmit before there
++	 * are receive descriptors available, which can leave E2E flow control
++	 * without credits when the device is reopened.
++	 */
++	ret = tb_xdomain_enable_paths(xd, sdev->out_hopid,
++				      sdev->tx_ring.ring->hop,
++				      sdev->in_hopid,
++				      sdev->rx_ring.ring->hop);
++	if (ret)
++		goto err_stop;
++
+ 	return 0;
+ 
+ err_stop:
+ 	tb_ring_stop(sdev->rx_ring.ring);
+ 	tb_ring_stop(sdev->tx_ring.ring);
+-err_free_rx:
++	tbstream_ring_free(&sdev->rx_ring);
+ 	tb_ring_free(sdev->rx_ring.ring);
++	sdev->rx_ring.ring = NULL;
+ err_free_tx_buffers:
+ 	tbstream_ring_free(&sdev->tx_ring);
+-err_free_tx:
+ 	tb_ring_free(sdev->tx_ring.ring);
++	sdev->tx_ring.ring = NULL;
+ 
+ 	return ret;
+ }
+-- 
+2.50.1 (Apple Git-155)

@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Tue, 4 Aug 2026 12:00:00 -0700
+Subject: [PATCH] thunderbolt: stream: Require exclusive zero-copy use
+
+The zero-copy producer/consumer cursors and mapped frame pools belong to
+the stream device rather than to an open file. Allowing multiple open file
+descriptions while zero-copy mode is active lets unrelated callers submit,
+reap, or repost each other's slots and corrupt the ownership protocol.
+
+Reject enabling zero-copy when more than one user already has the device
+open, and reject new opens after zero-copy has been enabled. Regular stream
+read/write mode retains its existing multi-open behavior.
+
+Signed-off-by: Jonathan Yates <jonjryjo@gmail.com>
+---
+ drivers/thunderbolt/stream.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index d54a0cd15563..1749b3017648 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -929,6 +929,10 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 		ret = -ENXIO;
+ 		goto out_unlock;
+ 	}
++	if (sdev->users != 1) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
+ 	if (sdev->zc)
+ 		goto out_unlock;
+ 
+@@ -1220,6 +1224,12 @@ static int tbstream_dev_fops_open(struct inode *inode, struct file *file)
+ 		}
+ 	}
+ 
++	/* Zero-copy pool ownership is device-wide and must stay exclusive. */
++	if (sdev->zc) {
++		ret = -EBUSY;
++		goto err_unlock;
++	}
++
+ 	/* Only on first open we allocate rings and enable paths */
+ 	if (!sdev->users++) {
+ 		ret = tbstream_dev_start(sdev);
+-- 
+2.50.1
+

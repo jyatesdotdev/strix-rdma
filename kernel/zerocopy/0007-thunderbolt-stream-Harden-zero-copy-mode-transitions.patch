@@ -1,0 +1,449 @@
+From 6af37333c02d026c43a257711e0c769b536c4e76 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Wed, 5 Aug 2026 08:30:00 -0700
+Subject: [PATCH] thunderbolt: stream: Harden zero-copy mode transitions
+
+Zero-copy mode uses device-wide cursors even though its enable ioctl and
+legacy I/O methods can be called concurrently through one file description.
+A completed legacy TX also leaves the software cursor nonzero, while the
+zero-copy UAPI starts userspace and completion accounting at slot zero.
+Likewise, an RX completion racing enable can be handled as legacy traffic
+and never receive a zero-copy event.
+
+Serialize TX-idle and RX-pristine checks with their callbacks, and rebase
+the idle TX cursor when enabling the mode. Restore device ownership if the
+RX check aborts the transition. Recheck the mode after every legacy I/O
+mutex acquisition and wake legacy waiters during the transition.
+
+Copy the selected first slot to userspace before any frame is queued so a
+late EFAULT cannot hide a successful transfer. If enqueue fails, return the
+unsent slot to CPU ownership and roll back its software consumer cursor. A
+failure after earlier frames makes the message boundary unrecoverable, so
+latch a device-wide zero-copy error and wake waiters with EPOLLHUP and
+EPOLLERR. Reject later operations with EIO until close and reopen.
+
+Serialize event reapers, peek and copy each event before removing it, and
+release the device mutex while waiting. A userspace copy fault now leaves
+the event queued for a later retry instead of losing slot ownership.
+
+Signed-off-by: Jonathan Yates <jonjryjo@gmail.com>
+---
+ drivers/thunderbolt/stream.c | 178 ++++++++++++++++++++++++++++++-----
+ 1 file changed, 153 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 6b68be8fc..08ffdde1f 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -158,6 +158,7 @@ struct tbstream_dev {
+ 	bool closed;
+ 	bool removed;
+ 	bool zc;
++	bool zc_failed;
+ 	u32 zc_tx_pending;
+ 	u32 zc_tx_done;
+ 	u32 zc_rx_msg_frames;
+@@ -366,6 +367,10 @@ tbstream_dev_zc_rx(struct tbstream_dev *sdev, struct tbstream_frame *sf)
+ 				DMA_FROM_DEVICE);
+ 
+ 	spin_lock_irqsave(&sdev->zc_lock, flags);
++	if (sdev->zc_failed) {
++		spin_unlock_irqrestore(&sdev->zc_lock, flags);
++		return;
++	}
+ 	sdev->zc_rx_msg_frames++;
+ 	sdev->zc_rx_msg_bytes += tb_ring_frame_size(&sf->frame);
+ 
+@@ -399,18 +404,23 @@ tbstream_dev_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ {
+ 	struct tbstream_frame *sf = container_of(frame, typeof(*sf), frame);
+ 	struct tbstream_dev *sdev = sf->sdev;
++	unsigned long flags;
++	bool zc;
+ 
+ 	if (canceled)
+ 		return;
+ 
+ 	sf->completed = true;
++	spin_lock_irqsave(&sdev->zc_lock, flags);
+ 	sdev->rx_ring.prod++;
++	zc = READ_ONCE(sdev->zc);
++	spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 
+ 	if (sf->frame.flags & RING_DESC_CRC_ERROR)
+ 		pr_warn("RX CRC error\n");
+ 	else if (sf->frame.flags & RING_DESC_BUFFER_OVERRUN)
+ 		pr_warn("RX buffer overrun\n");
+-	else if (READ_ONCE(sdev->zc))
++	else if (zc)
+ 		tbstream_dev_zc_rx(sdev, sf);
+ 	else
+ 		wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
+@@ -500,6 +510,7 @@ tbstream_dev_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ {
+ 	struct tbstream_frame *sf = container_of(frame, typeof(*sf), frame);
+ 	struct tbstream_dev *sdev = sf->sdev;
++	unsigned long flags;
+ 	bool zc;
+ 
+ 	if (canceled)
+@@ -514,13 +525,18 @@ tbstream_dev_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 					DMA_TO_DEVICE);
+ 	}
+ 
++	spin_lock_irqsave(&sdev->zc_lock, flags);
+ 	sdev->tx_ring.prod++;
++	spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 
+ 	if (zc) {
+-		unsigned long flags;
+ 		bool wake = false;
+ 
+ 		spin_lock_irqsave(&sdev->zc_lock, flags);
++		if (sdev->zc_failed) {
++			spin_unlock_irqrestore(&sdev->zc_lock, flags);
++			return;
++		}
+ 		sdev->zc_tx_pending++;
+ 		if (sf->frame.eof == TBSTREAM_DATA) {
+ 			struct tbstream_zc_event ev = {
+@@ -737,7 +753,7 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ {
+ 	struct file *file = kiocb->ki_filp;
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+-	size_t nbytes;
++	size_t nbytes = 0;
+ 	int ret;
+ 
+ 	ret = tbstream_dev_valid(sdev);
+@@ -748,6 +764,10 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock))
+ 		return -ERESTARTSYS;
++	if (sdev->zc) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
+ 
+ 	while (!tbstream_ring_available(&sdev->rx_ring)) {
+ 		mutex_unlock(&sdev->lock);
+@@ -756,6 +776,7 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 			return -EAGAIN;
+ 		ret = wait_event_interruptible(sdev->wait,
+ 				tbstream_ring_available(&sdev->rx_ring) ||
++				READ_ONCE(sdev->zc) ||
+ 				tbstream_dev_valid(sdev) != 0 ||
+ 				tbstream_dev_closed(sdev) ||
+ 				tbstream_dev_removed(sdev));
+@@ -771,9 +792,12 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 
+ 		if (mutex_lock_interruptible(&sdev->lock))
+ 			return -ERESTARTSYS;
++		if (sdev->zc) {
++			ret = -EBUSY;
++			goto out_unlock;
++		}
+ 	}
+ 
+-	nbytes = 0;
+ 	while (nbytes < iov_iter_count(to)) {
+ 		struct tbstream_frame *sf;
+ 		size_t size, sf_size;
+@@ -820,6 +844,7 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 		nbytes += size;
+ 	}
+ 
++out_unlock:
+ 	mutex_unlock(&sdev->lock);
+ 	if (ret)
+ 		return ret;
+@@ -831,7 +856,7 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ {
+ 	struct file *file = kiocb->ki_filp;
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+-	size_t nbytes;
++	size_t nbytes = 0;
+ 	int ret;
+ 
+ 	ret = tbstream_dev_valid(sdev);
+@@ -842,6 +867,10 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock))
+ 		return -ERESTARTSYS;
++	if (sdev->zc) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
+ 
+ 	while (!tbstream_ring_available(&sdev->tx_ring)) {
+ 		mutex_unlock(&sdev->lock);
+@@ -850,6 +879,7 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 			return -EAGAIN;
+ 		ret = wait_event_interruptible(sdev->wait,
+ 				tbstream_ring_available(&sdev->tx_ring) ||
++				READ_ONCE(sdev->zc) ||
+ 				tbstream_dev_valid(sdev) != 0 ||
+ 				tbstream_dev_closed(sdev) ||
+ 				tbstream_dev_removed(sdev));
+@@ -865,9 +895,12 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 
+ 		if (mutex_lock_interruptible(&sdev->lock))
+ 			return -ERESTARTSYS;
++		if (sdev->zc) {
++			ret = -EBUSY;
++			goto out_unlock;
++		}
+ 	}
+ 
+-	nbytes = 0;
+ 	while (nbytes < iov_iter_count(from)) {
+ 		size_t size;
+ 
+@@ -886,6 +919,7 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 		nbytes += size;
+ 	}
+ 
++out_unlock:
+ 	mutex_unlock(&sdev->lock);
+ 	if (ret)
+ 		return ret;
+@@ -903,10 +937,14 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 	if (tbstream_dev_valid(sdev) != 0) {
+ 		mask |= EPOLLHUP | EPOLLERR;
+ 	} else if (sdev->zc) {
+-		if (!kfifo_is_empty(&sdev->zc_events))
+-			mask |= EPOLLIN | EPOLLRDNORM;
+-		if (tbstream_ring_available(&sdev->tx_ring))
+-			mask |= EPOLLOUT | EPOLLWRNORM;
++		if (sdev->zc_failed) {
++			mask |= EPOLLHUP | EPOLLERR;
++		} else {
++			if (!kfifo_is_empty(&sdev->zc_events))
++				mask |= EPOLLIN | EPOLLRDNORM;
++			if (tbstream_ring_available(&sdev->tx_ring))
++				mask |= EPOLLOUT | EPOLLWRNORM;
++		}
+ 	} else {
+ 		if (tbstream_ring_available(&sdev->tx_ring))
+ 			mask |= EPOLLOUT | EPOLLWRNORM;
+@@ -919,6 +957,7 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ {
+ 	struct device *dma_dev;
++	unsigned long flags;
+ 	size_t size, i;
+ 	int ret;
+ 
+@@ -944,16 +983,19 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 		goto out_unlock;
+ 
+ 	size = tb_ring_size(sdev->tx_ring.ring);
++	spin_lock_irqsave(&sdev->zc_lock, flags);
+ 	if (sdev->tx_ring.prod - sdev->tx_ring.cons != size - 1) {
++		spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
++	spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 
+-	spin_lock_init(&sdev->zc_lock);
+ 	sdev->zc_tx_pending = 0;
+ 	sdev->zc_tx_done = 0;
+ 	sdev->zc_rx_msg_frames = 0;
+ 	sdev->zc_rx_msg_bytes = 0;
++	sdev->zc_failed = false;
+ 
+ 	ret = kfifo_alloc(&sdev->zc_events,
+ 			  tb_ring_size(sdev->rx_ring.ring) * 2, GFP_KERNEL);
+@@ -969,10 +1011,34 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 					TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);
+ 	}
+ 
+-	/* Ring callbacks only touch the zc state once this is set */
++	spin_lock_irqsave(&sdev->zc_lock, flags);
++	if (sdev->rx_ring.cons || sdev->rx_ring.prod) {
++		spin_unlock_irqrestore(&sdev->zc_lock, flags);
++		for (i = 0; i < size; i++) {
++			struct tbstream_frame *sf = &sdev->tx_ring.frames[i];
++
++			dma_sync_single_for_device(dma_dev,
++						   sf->frame.buffer_phy,
++						   TB_MAX_FRAME_SIZE,
++						   DMA_TO_DEVICE);
++		}
++		ret = -EBUSY;
++		goto out_free_fifo;
++	}
++
++	/* The zero-copy UAPI starts its TX slot cursor at zero. */
++	sdev->tx_ring.cons = 0;
++	sdev->tx_ring.prod = size - 1;
++
++	/* Ring callbacks only touch the initialized zc state once this is set. */
+ 	smp_wmb();
+ 	WRITE_ONCE(sdev->zc, true);
++	spin_unlock_irqrestore(&sdev->zc_lock, flags);
++	wake_up_interruptible(&sdev->wait);
++	goto out_unlock;
+ 
++out_free_fifo:
++	kfifo_free(&sdev->zc_events);
+ out_unlock:
+ 	mutex_unlock(&sdev->lock);
+ 	return ret;
+@@ -1026,6 +1092,10 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+ 	}
++	if (sdev->zc_failed) {
++		ret = -EIO;
++		goto out_unlock;
++	}
+ 
+ 	size = tb_ring_size(sdev->tx_ring.ring);
+ 	if (tx.nframes >= size) {
+@@ -1039,6 +1109,10 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ 
+ 	dma_dev = tb_ring_dma_device(sdev->tx_ring.ring);
+ 	tx.first = sdev->tx_ring.cons % size;
++	if (copy_to_user(arg, &tx, sizeof(tx))) {
++		ret = -EFAULT;
++		goto out_unlock;
++	}
+ 
+ 	for (i = 0; i < tx.nframes; i++) {
+ 		int index = sdev->tx_ring.cons % size;
+@@ -1055,13 +1129,25 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ 		dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy,
+ 					   TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);
+ 		ret = tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
+-		if (ret)
++		if (ret) {
++			dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
++						TB_MAX_FRAME_SIZE,
++						DMA_TO_DEVICE);
++			sdev->tx_ring.cons--;
++			if (i) {
++				unsigned long flags;
++
++				spin_lock_irqsave(&sdev->zc_lock, flags);
++				sdev->zc_failed = true;
++				spin_unlock_irqrestore(&sdev->zc_lock, flags);
++				wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
++			}
+ 			goto out_unlock;
++		}
+ 	}
+ 
+ 	mutex_unlock(&sdev->lock);
+-
+-	return copy_to_user(arg, &tx, sizeof(tx)) ? -EFAULT : 0;
++	return 0;
+ 
+ out_unlock:
+ 	mutex_unlock(&sdev->lock);
+@@ -1083,6 +1169,10 @@ static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
+ 	ret = tbstream_dev_valid(sdev);
+ 	if (ret)
+ 		goto out_unlock;
++	if (sdev->zc_failed) {
++		ret = -EIO;
++		goto out_unlock;
++	}
+ 	if (!sdev->zc || nframes > sdev->rx_ring.prod - sdev->rx_ring.cons) {
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+@@ -1120,35 +1210,72 @@ static int tbstream_dev_zc_reap(struct tbstream_dev *sdev, struct file *file,
+ 		return -EFAULT;
+ 	if (!reap.max || (reap.flags & ~TBSTREAM_ZC_REAP_NONBLOCK))
+ 		return -EINVAL;
+-	if (!READ_ONCE(sdev->zc))
+-		return -EINVAL;
+ 
+ 	uevents = u64_to_user_ptr(reap.events);
+ 
+-	while (kfifo_is_empty(&sdev->zc_events)) {
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++
++	for (;;) {
++		if (!sdev->zc) {
++			ret = -EINVAL;
++			goto out_unlock;
++		}
++		if (sdev->zc_failed) {
++			ret = -EIO;
++			goto out_unlock;
++		}
++		ret = tbstream_dev_valid(sdev);
++		if (ret || tbstream_dev_removed(sdev)) {
++			ret = -ENXIO;
++			goto out_unlock;
++		}
++		if (!kfifo_is_empty(&sdev->zc_events))
++			break;
++
++		mutex_unlock(&sdev->lock);
+ 		if ((reap.flags & TBSTREAM_ZC_REAP_NONBLOCK) ||
+ 		    (file->f_flags & O_NONBLOCK))
+ 			return -EAGAIN;
+ 
+ 		ret = wait_event_interruptible(sdev->wait,
+ 				!kfifo_is_empty(&sdev->zc_events) ||
++				READ_ONCE(sdev->zc_failed) ||
+ 				tbstream_dev_valid(sdev) != 0 ||
+ 				tbstream_dev_removed(sdev));
+ 		if (ret)
+ 			return ret;
+ 
+-		if (tbstream_dev_valid(sdev) || tbstream_dev_removed(sdev))
+-			return -ENXIO;
++		if (mutex_lock_interruptible(&sdev->lock))
++			return -ERESTARTSYS;
+ 	}
+ 
+-	while (n < reap.max &&
+-	       kfifo_out_spinlocked(&sdev->zc_events, &ev, 1, &sdev->zc_lock)) {
+-		if (copy_to_user(&uevents[n], &ev, sizeof(ev)))
+-			return n ? n : -EFAULT;
++	while (n < reap.max) {
++		unsigned long flags;
++		bool have_event;
++
++		spin_lock_irqsave(&sdev->zc_lock, flags);
++		have_event = kfifo_peek(&sdev->zc_events, &ev);
++		spin_unlock_irqrestore(&sdev->zc_lock, flags);
++		if (!have_event)
++			break;
++
++		if (copy_to_user(&uevents[n], &ev, sizeof(ev))) {
++			ret = n ? n : -EFAULT;
++			goto out_unlock;
++		}
++
++		/* The device mutex keeps the peeked head stable across the copy. */
++		spin_lock_irqsave(&sdev->zc_lock, flags);
++		kfifo_skip(&sdev->zc_events);
++		spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 		n++;
+ 	}
+ 
+-	return n;
++	ret = n;
++out_unlock:
++	mutex_unlock(&sdev->lock);
++	return ret;
+ }
+ 
+ static long
+@@ -1785,6 +1912,7 @@ tbstream_dev_make_group(struct config_group *group, const char *name)
+ 	sdev->ring_size = TBSTREAM_DEV_RING_SIZE;
+ 	sdev->throttling = TBSTREAM_DEV_THROTTLING;
+ 	mutex_init(&sdev->lock);
++	spin_lock_init(&sdev->zc_lock);
+ 	init_waitqueue_head(&sdev->wait);
+ 	INIT_LIST_HEAD(&sdev->list);
+ 	/* This point forward tbstream_dev_put() must be used to release sdev */
+-- 
+2.50.1 (Apple Git-155)
+

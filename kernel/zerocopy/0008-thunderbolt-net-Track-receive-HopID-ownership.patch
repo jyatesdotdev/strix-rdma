@@ -1,0 +1,95 @@
+From 30c43b5b715b27a3b7f99ee0a18124a1b16afa04 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Wed, 5 Aug 2026 09:55:00 -0700
+Subject: [PATCH] thunderbolt: net: Track receive HopID ownership
+
+tb_xdomain_alloc_in_hopid() treats a positive HopID as the bottom of an
+allocation range, not as an exact request. If the peer's requested receive
+HopID is already occupied, the allocator can therefore return a different,
+non-negative HopID.
+
+ThunderboltIP rejects that mismatch, but currently leaves the returned
+HopID allocated. A later teardown then releases remote_transmit_path even
+though this tbnet instance never acquired it. This leaks the HopID that was
+actually returned and can release a HopID owned by another XDomain client.
+
+Release a non-negative mismatch immediately. Record the exact receive
+HopID only after the requested allocation succeeds, and use that record to
+pair the setup-error and teardown releases with actual ownership.
+
+Signed-off-by: Jonathan Yates <jonjryjo@gmail.com>
+---
+ drivers/net/thunderbolt/main.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/thunderbolt/main.c b/drivers/net/thunderbolt/main.c
+index f8f97e8e..d2551d05 100644
+--- a/drivers/net/thunderbolt/main.c
++++ b/drivers/net/thunderbolt/main.c
+@@ -151,6 +151,7 @@ struct tbnet_frame {
+  *		    host
+  * @local_transmit_path: HopID we are using to send out packets
+  * @remote_transmit_path: HopID the other end is using to send packets to us
++ * @rx_hopid: Input HopID currently owned for @remote_transmit_path, or %0
+  * @connection_lock: Lock serializing access to @login_sent,
+  *		     @login_received and @transmit_path.
+  * @login_retries: Number of login retries currently done
+@@ -181,6 +182,7 @@ struct tbnet {
+ 	bool login_received;
+ 	int local_transmit_path;
+ 	int remote_transmit_path;
++	int rx_hopid;
+ 	struct mutex connection_lock;
+ 	int login_retries;
+ 	struct delayed_work login_work;
+@@ -348,6 +350,15 @@ static void tbnet_free_buffers(struct tbnet_ring *ring)
+ 	ring->prod = 0;
+ }
+ 
++static void tbnet_release_rx_hopid(struct tbnet *net)
++{
++	if (!net->rx_hopid)
++		return;
++
++	tb_xdomain_release_in_hopid(net->xd, net->rx_hopid);
++	net->rx_hopid = 0;
++}
++
+ static void tbnet_tear_down(struct tbnet *net, bool send_logout)
+ {
+ 	netif_carrier_off(net->dev);
+@@ -380,8 +391,8 @@ static void tbnet_tear_down(struct tbnet *net, bool send_logout)
+ 		if (ret)
+ 			netdev_warn(net->dev, "failed to disable DMA paths\n");
+ 
+-		tb_xdomain_release_in_hopid(net->xd, net->remote_transmit_path);
++		tbnet_release_rx_hopid(net);
+ 		net->remote_transmit_path = 0;
+ 	}
+ 
+ 	net->login_retries = 0;
+@@ -603,9 +614,13 @@ static void tbnet_connected_work(struct work_struct *work)
+ 
+ 	ret = tb_xdomain_alloc_in_hopid(net->xd, net->remote_transmit_path);
+ 	if (ret != net->remote_transmit_path) {
+-		netdev_err(net->dev, "failed to allocate Rx HopID\n");
++		if (ret >= 0)
++			tb_xdomain_release_in_hopid(net->xd, ret);
++		netdev_err(net->dev, "failed to allocate Rx HopID %d, got %d\n",
++			   net->remote_transmit_path, ret);
+ 		return;
+ 	}
++	net->rx_hopid = ret;
+ 
+ 	/* Both logins successful so enable the rings, high-speed DMA
+ 	 * paths and start the network device queue.
+@@ -645,6 +660,6 @@ err_stop_rings:
+ 	tb_ring_stop(net->rx_ring.ring);
+ 	tb_ring_stop(net->tx_ring.ring);
+-	tb_xdomain_release_in_hopid(net->xd, net->remote_transmit_path);
++	tbnet_release_rx_hopid(net);
+ }
+ 
+ static void tbnet_login_work(struct work_struct *work)
+-- 
+2.50.1

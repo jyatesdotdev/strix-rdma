@@ -1,0 +1,27 @@
+# Reference kernel checkout — huge, re-cloneable, never committed here
+/linux/
+
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+*.symvers
+*.order
+modules.order
+Module.symvers
+.tmp_versions/
+build/
+
+# Editor/OS noise
+.DS_Store
+*.swp
+*.dSYM/
+__pycache__/
+*.pyc
+tools/pingpong/pingpong
+tools/ds4-shape/tbstream-ds4-gate
+tools/rocm-map/tbstream-hip-map
+tools/rocm-map/tbstream-hip-zc

@@ -1,0 +1,111 @@
+From c82680c3f1e40acb62696145d6f32167daee2751 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Wed, 5 Aug 2026 08:15:00 -0700
+Subject: [PATCH] thunderbolt: stream: Synchronize zero-copy TX DMA ownership
+
+The TX frame pool uses streaming DMA_TO_DEVICE mappings. Zero-copy
+mode exposes those pages to userspace without first transferring ownership
+back from the NHI, and TX completion publishes reusable slots without a
+matching sync for CPU access. Coherent x86 systems can hide the missing
+transitions, but they remain required by the DMA API and can surface as
+stale payloads at mapping boundaries.
+
+Require an idle TX ring before the ownership handoff. Synchronize each
+complete mapped page at enable, submission, and completion, and unmap all
+TX and RX pages with their original mapping size. Publish the completed
+slot only after returning its ownership to CPU/userspace.
+
+Signed-off-by: Jonathan Yates <jonjryjo@gmail.com>
+---
+ drivers/thunderbolt/stream.c | 35 +++++++++++++++++++++++++++++++----
+ 1 file changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index fb0e10f9a..6b68be8fc 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -271,7 +271,7 @@ static void tbstream_ring_free(struct tbstream_ring *ring)
+ 
+ 		if (sf->frame.buffer_phy)
+ 			dma_unmap_page(dma_dev, sf->frame.buffer_phy,
+-				       tb_ring_frame_size(&sf->frame), dir);
++				       TB_MAX_FRAME_SIZE, dir);
+ 		sf->frame.buffer_phy = 0;
+ 		if (sf->page)
+ 			__free_page(sf->page);
+@@ -500,13 +500,23 @@ tbstream_dev_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ {
+ 	struct tbstream_frame *sf = container_of(frame, typeof(*sf), frame);
+ 	struct tbstream_dev *sdev = sf->sdev;
++	bool zc;
+ 
+ 	if (canceled)
+ 		return;
+ 
++	zc = READ_ONCE(sdev->zc);
++	if (zc) {
++		struct device *dma_dev = tb_ring_dma_device(ring);
++
++		dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
++					TB_MAX_FRAME_SIZE,
++					DMA_TO_DEVICE);
++	}
++
+ 	sdev->tx_ring.prod++;
+ 
+-	if (READ_ONCE(sdev->zc)) {
++	if (zc) {
+ 		unsigned long flags;
+ 		bool wake = false;
+ 
+@@ -908,6 +918,8 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 
+ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ {
++	struct device *dma_dev;
++	size_t size, i;
+ 	int ret;
+ 
+ 	if (PAGE_SIZE != TB_MAX_FRAME_SIZE)
+@@ -931,6 +943,12 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 	if (sdev->zc)
+ 		goto out_unlock;
+ 
++	size = tb_ring_size(sdev->tx_ring.ring);
++	if (sdev->tx_ring.prod - sdev->tx_ring.cons != size - 1) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
+ 	spin_lock_init(&sdev->zc_lock);
+ 	sdev->zc_tx_pending = 0;
+ 	sdev->zc_tx_done = 0;
+@@ -942,6 +960,15 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 	if (ret)
+ 		goto out_unlock;
+ 
++	/* Hand the idle TX pool to CPU/userspace before it can be mapped. */
++	dma_dev = tb_ring_dma_device(sdev->tx_ring.ring);
++	for (i = 0; i < size; i++) {
++		struct tbstream_frame *sf = &sdev->tx_ring.frames[i];
++
++		dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
++					TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);
++	}
++
+ 	/* Ring callbacks only touch the zc state once this is set */
+ 	smp_wmb();
+ 	WRITE_ONCE(sdev->zc, true);
+@@ -1025,8 +1052,8 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ 		sf->frame.eof = last ? TBSTREAM_DATA : TBSTREAM_DATA_MORE;
+ 		sf->frame.flags = last ? 0 : RING_FRAME_NO_INTERRUPT;
+ 
+-		dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy, len,
+-					   DMA_TO_DEVICE);
++		dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy,
++					   TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);
+ 		ret = tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
+ 		if (ret)
+ 			goto out_unlock;
+-- 
+2.50.1 (Apple Git-155)

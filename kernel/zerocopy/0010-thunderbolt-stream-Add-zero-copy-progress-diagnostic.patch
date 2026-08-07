@@ -1,0 +1,1333 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Wed, 5 Aug 2026 19:00:28 -0700
+Subject: [PATCH 10/10] thunderbolt: stream: Add zero-copy progress diagnostics
+
+The DS4-shaped asymmetric workload can stop making progress without
+enough state to distinguish a fabric delivery failure from a missed
+interrupt, ring harvest, or stream event publication failure.
+
+Add lock-consistent NHI ring counters and snapshots, a privileged and
+explicitly enabled diagnostic work kick, and zero-copy stream counters
+exposed through a compat-stable UAPI. Preserve the first terminal error,
+make FIFO and descriptor errors fail explicitly, and retain queued events
+for reaping before EIO.
+
+Also make partial RX repost failures transactional and report TX drain,
+CLOSE, and path-disable failures with stable device identifiers.
+
+Signed-off-by: Jonathan Yates <jonjryjo@gmail.com>
+---
+ drivers/thunderbolt/nhi.c               | 134 ++++++
+ drivers/thunderbolt/stream.c            | 514 ++++++++++++++++++++++--
+ include/linux/thunderbolt.h             |  72 ++++
+ include/uapi/linux/thunderbolt-stream.h | 184 +++++++++
+ 4 files changed, 862 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index 1b7cfb6a7..51a494c07 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -238,6 +238,16 @@ static bool ring_empty(struct tb_ring *ring)
+ 	return ring->head == ring->tail;
+ }
+ 
++static u32 ring_list_count(struct list_head *head)
++{
++	struct list_head *pos;
++	u32 count = 0;
++
++	list_for_each(pos, head)
++		count++;
++	return count;
++}
++
+ /*
+  * ring_write_descriptors() - post frames from ring->queue to the controller
+  *
+@@ -262,6 +272,7 @@ static void ring_write_descriptors(struct tb_ring *ring)
+ 			descriptor->eof = frame->eof;
+ 			descriptor->sof = frame->sof;
+ 		}
++		ring->descriptors_posted++;
+ 		ring->head = (ring->head + 1) % ring->size;
+ 		if (ring->is_tx)
+ 			ring_iowrite_prod(ring, ring->head);
+@@ -288,6 +299,7 @@ static void ring_work(struct work_struct *work)
+ 	LIST_HEAD(done);
+ 
+ 	spin_lock_irqsave(&ring->lock, flags);
++	ring->work_runs++;
+ 
+ 	if (!ring->running) {
+ 		/*  Move all frames to done and mark them as canceled. */
+@@ -310,6 +322,7 @@ static void ring_work(struct work_struct *work)
+ 			frame->sof = ring->descriptors[ring->tail].sof;
+ 			frame->flags = ring->descriptors[ring->tail].flags;
+ 		}
++		ring->descriptors_completed++;
+ 		ring->tail = (ring->tail + 1) % ring->size;
+ 	}
+ 	ring_write_descriptors(ring);
+@@ -462,6 +475,7 @@ static irqreturn_t ring_msix(int irq, void *data)
+ 	spin_lock(&ring->nhi->lock);
+ 	ring_clear_msix(ring);
+ 	spin_lock(&ring->lock);
++	ring->interrupts++;
+ 	__ring_interrupt(ring);
+ 	spin_unlock(&ring->lock);
+ 	spin_unlock(&ring->nhi->lock);
+@@ -910,6 +924,125 @@ int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec)
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_throttling);
+ 
++/**
++ * tb_ring_get_stats() - Snapshot diagnostic ring progress
++ * @ring: Ring to snapshot
++ * @stats: Destination for the snapshot
++ *
++ * The snapshot holds the NHI lock followed by the ring lock, matching the
++ * interrupt path. It deliberately avoids the clear-on-read notification
++ * registers.
++ *
++ * Return: %0 on success, %-EINVAL for an invalid destination.
++ */
++int tb_ring_get_stats(struct tb_ring *ring, struct tb_ring_stats *stats)
++{
++	struct ring_desc *descriptor;
++	unsigned long flags;
++	u32 index, indices;
++	int interrupt;
++	int pm_ret;
++
++	if (!stats)
++		return -EINVAL;
++
++	memset(stats, 0, sizeof(*stats));
++	pm_ret = pm_runtime_get_if_active(&ring->nhi->pdev->dev);
++	spin_lock_irqsave(&ring->nhi->lock, flags);
++	spin_lock(&ring->lock);
++
++	stats->descriptors_posted = ring->descriptors_posted;
++	stats->descriptors_completed = ring->descriptors_completed;
++	stats->interrupts = ring->interrupts;
++	stats->work_runs = ring->work_runs;
++	stats->kick_requests = ring->kick_requests;
++	stats->kick_pending = ring->kick_pending;
++	stats->size = ring->size;
++	stats->hop = ring->hop;
++	stats->head = ring->head;
++	stats->tail = ring->tail;
++	stats->queued = ring_list_count(&ring->queue);
++	stats->in_flight = ring_list_count(&ring->in_flight);
++	stats->interval_nsec = ring->interval_nsec;
++	stats->irq = ring->irq;
++	stats->vector = ring->vector;
++	stats->is_tx = ring->is_tx;
++	stats->running = ring->running;
++
++	if (!ring_empty(ring)) {
++		descriptor = &ring->descriptors[ring->tail];
++		stats->tail_flags = descriptor->flags;
++		if (stats->tail_flags & RING_DESC_COMPLETED)
++			dma_rmb();
++		stats->tail_length = descriptor->length;
++		stats->tail_eof = descriptor->eof;
++		stats->tail_sof = descriptor->sof;
++	}
++
++	if (pm_ret > 0 && ring->running && !ring->nhi->going_away) {
++		indices = ioread32(ring_desc_base(ring) + 8);
++		if (ring->is_tx) {
++			stats->hw_posted = indices >> 16;
++			stats->hw_completed = indices & GENMASK(15, 0);
++		} else {
++			stats->hw_posted = indices & GENMASK(15, 0);
++			stats->hw_completed = indices >> 16;
++		}
++		stats->options = ioread32(ring_options_base(ring));
++
++		interrupt = ring_interrupt_index(ring);
++		index = REG_RING_INTERRUPT_BASE + interrupt / 32 * 4;
++		stats->interrupt_enabled =
++			ioread32(ring->nhi->iobase + index) & BIT(interrupt % 32);
++		stats->hw_valid = true;
++	}
++
++	spin_unlock(&ring->lock);
++	spin_unlock_irqrestore(&ring->nhi->lock, flags);
++	if (pm_ret > 0)
++		pm_runtime_put_noidle(&ring->nhi->pdev->dev);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(tb_ring_get_stats);
++
++/**
++ * tb_ring_kick() - Explicitly schedule normal ring completion work
++ * @ring: Ring whose work should be scheduled
++ *
++ * This diagnostic helper does not modify descriptors or interrupt state.
++ *
++ * Return: %0 when the running ring was kicked, %-ENODEV if the NHI is being
++ * removed, or %-ESHUTDOWN if the ring is stopped.
++ */
++int tb_ring_kick(struct tb_ring *ring)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&ring->nhi->lock, flags);
++	spin_lock(&ring->lock);
++	if (ring->nhi->going_away) {
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++	if (!ring->running) {
++		ret = -ESHUTDOWN;
++		goto out_unlock;
++	}
++
++	ring->kick_requests++;
++	if (!ring_empty(ring) &&
++	    ring->descriptors[ring->tail].flags & RING_DESC_COMPLETED)
++		ring->kick_pending++;
++	schedule_work(&ring->work);
++
++out_unlock:
++	spin_unlock(&ring->lock);
++	spin_unlock_irqrestore(&ring->nhi->lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tb_ring_kick);
++
+ /**
+  * nhi_mailbox_cmd() - Send a command through NHI mailbox
+  * @nhi: Pointer to the NHI structure
+@@ -1014,6 +1147,7 @@ static void nhi_interrupt_work(struct work_struct *work)
+ 		}
+ 
+ 		spin_lock(&ring->lock);
++		ring->interrupts++;
+ 		__ring_interrupt(ring);
+ 		spin_unlock(&ring->lock);
+ 	}
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 9ae7a4c99..b58d80df9 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -9,6 +9,7 @@
+ 
+ #define pr_fmt(fmt) "tbstream: " fmt
+ 
++#include <linux/capability.h>
+ #include <linux/configfs.h>
+ #include <linux/file.h>
+ #include <linux/fs.h>
+@@ -79,6 +80,17 @@
+ #define TBSTREAM_DEV_THROTTLING		8192
+ #define TBSTREAM_DEV_MAX_THROTTLING	16776960
+ 
++static bool zc_diagnostic_kick;
++module_param(zc_diagnostic_kick, bool, 0600);
++MODULE_PARM_DESC(zc_diagnostic_kick,
++		 "allow privileged zero-copy diagnostic ring kicks");
++
++static_assert(sizeof(struct tbstream_zc_ring_stats) == 128);
++static_assert(sizeof(struct tbstream_zc_stats) == 528);
++static_assert(offsetof(struct tbstream_zc_stats, tx) == 272);
++static_assert(offsetof(struct tbstream_zc_stats, rx) == 400);
++static_assert(sizeof(struct tbstream_zc_kick) == 8);
++
+ /**
+  * enum tbstream_frame_pdf - PDF numbers for tunneled frames
+  * @TBSTREAM_FRAME_START: PDF of the start of the frame
+@@ -124,6 +136,54 @@ struct tbstream_ring {
+ 	struct tbstream_frame *frames;
+ };
+ 
++/**
++ * struct tbstream_zc_counters - Monotonic counters for one zero-copy session
++ * @tx_submit_calls: TX submit attempts
++ * @tx_submit_frames: TX frames requested
++ * @tx_callbacks: Non-canceled TX frame callbacks
++ * @tx_terminal_callbacks: Message-ending TX callbacks
++ * @tx_events: TX completion events queued
++ * @tx_enqueue_errors: TX enqueue failures
++ * @rx_callbacks: Non-canceled RX frame callbacks
++ * @rx_data_more: Continuation RX callbacks
++ * @rx_data: Message-ending DATA RX callbacks
++ * @rx_close: CLOSE RX callbacks
++ * @rx_events: RX or CLOSE events queued
++ * @rx_repost_calls: RX repost attempts
++ * @rx_repost_frames: RX frames requested for repost
++ * @rx_repost_errors: RX enqueue failures during repost
++ * @reap_calls: Event reap attempts
++ * @reaped_events: Events copied and dequeued
++ * @event_drops: Events that could not be queued
++ * @crc_errors: RX CRC errors
++ * @overrun_errors: RX buffer overruns
++ * @canceled_callbacks: Ring callbacks canceled during shutdown
++ * @failures: Transitions into terminal zero-copy failure
++ */
++struct tbstream_zc_counters {
++	u64 tx_submit_calls;
++	u64 tx_submit_frames;
++	u64 tx_callbacks;
++	u64 tx_terminal_callbacks;
++	u64 tx_events;
++	u64 tx_enqueue_errors;
++	u64 rx_callbacks;
++	u64 rx_data_more;
++	u64 rx_data;
++	u64 rx_close;
++	u64 rx_events;
++	u64 rx_repost_calls;
++	u64 rx_repost_frames;
++	u64 rx_repost_errors;
++	u64 reap_calls;
++	u64 reaped_events;
++	u64 event_drops;
++	u64 crc_errors;
++	u64 overrun_errors;
++	u64 canceled_callbacks;
++	u64 failures;
++};
++
+ /**
+  * struct tbstream_dev - Stream character device
+  * @group: ConfigFS group for this device
+@@ -143,6 +203,7 @@ struct tbstream_ring {
+  * @lock: Lock protecting this structure
+  * @tx_ring: Transmit ring
+  * @rx_ring: Receive ring
++ * @zc_counters: Diagnostic counters for the active zero-copy session
+  * @list: Stream devices are linked through this
+  */
+ struct tbstream_dev {
+@@ -161,6 +222,7 @@ struct tbstream_dev {
+ 	bool removed;
+ 	bool zc;
+ 	bool zc_failed;
++	u32 zc_last_error;
+ 	u32 zc_tx_pending;
+ 	u32 zc_tx_done;
+ 	u32 zc_rx_msg_frames;
+@@ -171,6 +233,7 @@ struct tbstream_dev {
+ 	struct mutex lock;
+ 	struct tbstream_ring tx_ring;
+ 	struct tbstream_ring rx_ring;
++	struct tbstream_zc_counters zc_counters;
+ 	struct list_head list;
+ };
+ 
+@@ -348,7 +411,7 @@ static inline int tbstream_dev_valid(const struct tbstream_dev *sdev)
+ 
+ static inline bool tbstream_dev_removed(const struct tbstream_dev *sdev)
+ {
+-	return sdev->removed;
++	return READ_ONCE(sdev->removed);
+ }
+ 
+ static inline bool tbstream_dev_closed(const struct tbstream_dev *sdev)
+@@ -356,12 +419,59 @@ static inline bool tbstream_dev_closed(const struct tbstream_dev *sdev)
+ 	return sdev->closed;
+ }
+ 
++/* sdev->zc_lock must be held. */
++static bool tbstream_zc_fail_locked(struct tbstream_dev *sdev, u32 error)
++{
++	if (sdev->zc_failed)
++		return false;
++
++	sdev->zc_failed = true;
++	sdev->zc_last_error = error;
++	sdev->zc_counters.failures++;
++	return true;
++}
++
++static void tbstream_dev_zc_fail(struct tbstream_dev *sdev, u32 error)
++{
++	unsigned long flags;
++	bool wake;
++
++	spin_lock_irqsave(&sdev->zc_lock, flags);
++	wake = tbstream_zc_fail_locked(sdev, error);
++	spin_unlock_irqrestore(&sdev->zc_lock, flags);
++	if (wake)
++		wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
++}
++
++static bool tbstream_dev_zc_failed(struct tbstream_dev *sdev)
++{
++	unsigned long flags;
++	bool failed;
++
++	spin_lock_irqsave(&sdev->zc_lock, flags);
++	failed = sdev->zc_failed;
++	spin_unlock_irqrestore(&sdev->zc_lock, flags);
++	return failed;
++}
++
++static bool tbstream_dev_zc_has_events(struct tbstream_dev *sdev)
++{
++	unsigned long flags;
++	bool has_events;
++
++	spin_lock_irqsave(&sdev->zc_lock, flags);
++	has_events = !kfifo_is_empty(&sdev->zc_events);
++	spin_unlock_irqrestore(&sdev->zc_lock, flags);
++	return has_events;
++}
++
+ static void
+ tbstream_dev_zc_rx(struct tbstream_dev *sdev, struct tbstream_frame *sf)
+ {
+ 	struct device *dma_dev = tb_ring_dma_device(sdev->rx_ring.ring);
+ 	size_t size = tb_ring_size(sdev->rx_ring.ring);
+ 	unsigned long flags;
++	bool wake_error = false;
+ 	bool wake = false;
+ 
+ 	dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
+@@ -391,12 +501,20 @@ tbstream_dev_zc_rx(struct tbstream_dev *sdev, struct tbstream_frame *sf)
+ 		}
+ 		sdev->zc_rx_msg_frames = 0;
+ 		sdev->zc_rx_msg_bytes = 0;
+-		kfifo_put(&sdev->zc_events, ev);
+-		wake = true;
++		if (!kfifo_put(&sdev->zc_events, ev)) {
++			sdev->zc_counters.event_drops++;
++			wake_error = tbstream_zc_fail_locked(sdev,
++							     TBSTREAM_ZC_ERROR_EVENT_DROP);
++		} else {
++			sdev->zc_counters.rx_events++;
++			wake = true;
++		}
+ 	}
+ 	spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 
+-	if (wake)
++	if (wake_error)
++		wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
++	else if (wake)
+ 		wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
+ }
+ 
+@@ -407,25 +525,62 @@ tbstream_dev_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 	struct tbstream_frame *sf = container_of(frame, typeof(*sf), frame);
+ 	struct tbstream_dev *sdev = sf->sdev;
+ 	unsigned long flags;
++	bool rx_error;
+ 	bool zc;
+ 
+-	if (canceled)
++	if (canceled) {
++		spin_lock_irqsave(&sdev->zc_lock, flags);
++		if (READ_ONCE(sdev->zc))
++			sdev->zc_counters.canceled_callbacks++;
++		spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 		return;
++	}
+ 
+ 	sf->completed = true;
++	rx_error = sf->frame.flags &
++		   (RING_DESC_CRC_ERROR | RING_DESC_BUFFER_OVERRUN);
+ 	spin_lock_irqsave(&sdev->zc_lock, flags);
+ 	sdev->rx_ring.prod++;
+ 	zc = READ_ONCE(sdev->zc);
++	if (zc) {
++		sdev->zc_counters.rx_callbacks++;
++		switch (sf->frame.eof) {
++		case TBSTREAM_DATA_MORE:
++			sdev->zc_counters.rx_data_more++;
++			break;
++		case TBSTREAM_DATA:
++			sdev->zc_counters.rx_data++;
++			break;
++		case TBSTREAM_CLOSE:
++			sdev->zc_counters.rx_close++;
++			break;
++		default:
++			break;
++		}
++		if (sf->frame.flags & RING_DESC_CRC_ERROR)
++			sdev->zc_counters.crc_errors++;
++		if (sf->frame.flags & RING_DESC_BUFFER_OVERRUN)
++			sdev->zc_counters.overrun_errors++;
++	}
+ 	spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 
+ 	if (sf->frame.flags & RING_DESC_CRC_ERROR)
+ 		pr_warn("RX CRC error\n");
+ 	else if (sf->frame.flags & RING_DESC_BUFFER_OVERRUN)
+ 		pr_warn("RX buffer overrun\n");
+-	else if (zc)
++	if (rx_error) {
++		if (zc) {
++			u32 error = sf->frame.flags & RING_DESC_CRC_ERROR ?
++				TBSTREAM_ZC_ERROR_RX_CRC :
++				TBSTREAM_ZC_ERROR_RX_OVERRUN;
++
++			tbstream_dev_zc_fail(sdev, error);
++		}
++	} else if (zc) {
+ 		tbstream_dev_zc_rx(sdev, sf);
+-	else
++	} else {
+ 		wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
++	}
+ }
+ 
+ static struct tbstream_frame *
+@@ -450,12 +605,17 @@ static int tbstream_dev_consume_rx(struct tbstream_dev *sdev)
+ {
+ 	struct device *dma_dev = tb_ring_dma_device(sdev->rx_ring.ring);
+ 	struct tbstream_frame *sf;
++	unsigned int frame_offset;
++	u32 frame_size;
+ 	int index;
++	int ret;
+ 
+ 	index = sdev->rx_ring.cons % tb_ring_size(sdev->rx_ring.ring);
+ 	sdev->rx_ring.cons++;
+ 
+ 	sf = &sdev->rx_ring.frames[index];
++	frame_offset = sf->offset;
++	frame_size = sf->frame.size;
+ 	sf->completed = false;
+ 	sf->offset = 0;
+ 	sf->frame.size = 0;
+@@ -464,7 +624,16 @@ static int tbstream_dev_consume_rx(struct tbstream_dev *sdev)
+ 				   tb_ring_frame_size(&sf->frame),
+ 				   DMA_FROM_DEVICE);
+ 
+-	return tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
++	ret = tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
++	if (ret) {
++		dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
++					TB_MAX_FRAME_SIZE, DMA_FROM_DEVICE);
++		sf->offset = frame_offset;
++		sf->frame.size = frame_size;
++		sf->completed = true;
++		sdev->rx_ring.cons--;
++	}
++	return ret;
+ }
+ 
+ static int tbstream_dev_alloc_rx_buffers(struct tbstream_dev *sdev)
+@@ -515,8 +684,13 @@ tbstream_dev_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 	unsigned long flags;
+ 	bool zc;
+ 
+-	if (canceled)
++	if (canceled) {
++		spin_lock_irqsave(&sdev->zc_lock, flags);
++		if (READ_ONCE(sdev->zc))
++			sdev->zc_counters.canceled_callbacks++;
++		spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 		return;
++	}
+ 
+ 	zc = READ_ONCE(sdev->zc);
+ 	if (zc) {
+@@ -529,9 +703,15 @@ tbstream_dev_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 
+ 	spin_lock_irqsave(&sdev->zc_lock, flags);
+ 	sdev->tx_ring.prod++;
++	if (zc) {
++		sdev->zc_counters.tx_callbacks++;
++		if (sf->frame.eof == TBSTREAM_DATA)
++			sdev->zc_counters.tx_terminal_callbacks++;
++	}
+ 	spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 
+ 	if (zc) {
++		bool wake_error = false;
+ 		bool wake = false;
+ 
+ 		spin_lock_irqsave(&sdev->zc_lock, flags);
+@@ -550,12 +730,21 @@ tbstream_dev_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 			sdev->zc_tx_done += sdev->zc_tx_pending;
+ 			ev.first = (sdev->zc_tx_done - sdev->zc_tx_pending) % size;
+ 			sdev->zc_tx_pending = 0;
+-			kfifo_put(&sdev->zc_events, ev);
+-			wake = true;
++			if (!kfifo_put(&sdev->zc_events, ev)) {
++				sdev->zc_counters.event_drops++;
++				wake_error = tbstream_zc_fail_locked(sdev,
++								     TBSTREAM_ZC_ERROR_EVENT_DROP);
++			} else {
++				sdev->zc_counters.tx_events++;
++				wake = true;
++			}
+ 		}
+ 		spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 
+-		if (wake)
++		if (wake_error)
++			wake_up_interruptible_poll(&sdev->wait,
++						   EPOLLHUP | EPOLLERR);
++		else if (wake)
+ 			wake_up_interruptible_poll(&sdev->wait,
+ 					EPOLLIN | EPOLLOUT | EPOLLWRNORM);
+ 		return;
+@@ -721,20 +910,39 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 
+ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ {
++	struct tb_ring_stats stats;
+ 	struct tb_xdomain *xd;
++	int ret;
+ 
+ 	/* Wait for the ring to complete any outstanding frames */
+-	tb_ring_flush(sdev->tx_ring.ring, 500);
++	if (!tb_ring_flush(sdev->tx_ring.ring, 500)) {
++		tb_ring_get_stats(sdev->tx_ring.ring, &stats);
++		pr_warn("device %d TX ring %d flush timed out: hw-valid=%u sw-head=%u sw-tail=%u hw-posted-index=%u hw-completed-index=%u queued=%u in-flight=%u posted-count=%llu completed-count=%llu irq-count=%llu work-count=%llu\n",
++			sdev->index, stats.hop, stats.hw_valid, stats.head,
++			stats.tail, stats.hw_posted, stats.hw_completed,
++			stats.queued, stats.in_flight,
++			(unsigned long long)stats.descriptors_posted,
++			(unsigned long long)stats.descriptors_completed,
++			(unsigned long long)stats.interrupts,
++			(unsigned long long)stats.work_runs);
++	}
+ 	tb_ring_stop(sdev->tx_ring.ring);
++	/*
++	 * A receive ring normally retains posted buffers, so an RX flush
++	 * timeout is not itself an error. Stop still cancels those buffers.
++	 */
+ 	tb_ring_flush(sdev->rx_ring.ring, 500);
+ 	tb_ring_stop(sdev->rx_ring.ring);
+ 
+ 	xd = tbstream_dev_xdomain(sdev);
+ 	if (xd) {
+-		tb_xdomain_disable_paths(xd, sdev->out_hopid,
+-					 sdev->tx_ring.ring->hop,
+-					 sdev->in_hopid,
+-					 sdev->rx_ring.ring->hop);
++		ret = tb_xdomain_disable_paths(xd, sdev->out_hopid,
++					       sdev->tx_ring.ring->hop,
++					       sdev->in_hopid,
++					       sdev->rx_ring.ring->hop);
++		if (ret)
++			pr_warn("device %d failed to disable DMA paths: %d\n",
++				sdev->index, ret);
+ 	}
+ 
+ 	tbstream_ring_free(&sdev->rx_ring);
+@@ -936,14 +1144,16 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 
+ 	poll_wait(file, &sdev->wait, wait);
+ 	guard(mutex)(&sdev->lock);
+-	if (tbstream_dev_valid(sdev) != 0) {
++	if (tbstream_dev_valid(sdev) != 0 || tbstream_dev_removed(sdev)) {
+ 		mask |= EPOLLHUP | EPOLLERR;
+ 	} else if (sdev->zc) {
+-		if (sdev->zc_failed) {
++		bool failed = tbstream_dev_zc_failed(sdev);
++
++		if (tbstream_dev_zc_has_events(sdev))
++			mask |= EPOLLIN | EPOLLRDNORM;
++		if (failed) {
+ 			mask |= EPOLLHUP | EPOLLERR;
+ 		} else {
+-			if (!kfifo_is_empty(&sdev->zc_events))
+-				mask |= EPOLLIN | EPOLLRDNORM;
+ 			if (tbstream_ring_available(&sdev->tx_ring))
+ 				mask |= EPOLLOUT | EPOLLWRNORM;
+ 		}
+@@ -998,6 +1208,8 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 	sdev->zc_rx_msg_frames = 0;
+ 	sdev->zc_rx_msg_bytes = 0;
+ 	sdev->zc_failed = false;
++	sdev->zc_last_error = TBSTREAM_ZC_ERROR_NONE;
++	memset(&sdev->zc_counters, 0, sizeof(sdev->zc_counters));
+ 
+ 	ret = kfifo_alloc(&sdev->zc_events,
+ 			  tb_ring_size(sdev->rx_ring.ring) * 2, GFP_KERNEL);
+@@ -1074,6 +1286,7 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ {
+ 	struct tbstream_zc_tx tx;
+ 	struct device *dma_dev;
++	unsigned long irqflags;
+ 	size_t size;
+ 	u32 i;
+ 	int ret;
+@@ -1094,7 +1307,11 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+ 	}
+-	if (sdev->zc_failed) {
++	spin_lock_irqsave(&sdev->zc_lock, irqflags);
++	sdev->zc_counters.tx_submit_calls++;
++	sdev->zc_counters.tx_submit_frames += tx.nframes;
++	spin_unlock_irqrestore(&sdev->zc_lock, irqflags);
++	if (tbstream_dev_zc_failed(sdev)) {
+ 		ret = -EIO;
+ 		goto out_unlock;
+ 	}
+@@ -1132,18 +1349,21 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ 					   TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);
+ 		ret = tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
+ 		if (ret) {
++			bool wake_error = false;
++
+ 			dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
+ 						TB_MAX_FRAME_SIZE,
+ 						DMA_TO_DEVICE);
+ 			sdev->tx_ring.cons--;
+-			if (i) {
+-				unsigned long flags;
+-
+-				spin_lock_irqsave(&sdev->zc_lock, flags);
+-				sdev->zc_failed = true;
+-				spin_unlock_irqrestore(&sdev->zc_lock, flags);
+-				wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
+-			}
++			spin_lock_irqsave(&sdev->zc_lock, irqflags);
++			sdev->zc_counters.tx_enqueue_errors++;
++			if (i)
++				wake_error = tbstream_zc_fail_locked(sdev,
++								     TBSTREAM_ZC_ERROR_TX_PARTIAL);
++			spin_unlock_irqrestore(&sdev->zc_lock, irqflags);
++			if (wake_error)
++				wake_up_interruptible_poll(&sdev->wait,
++							   EPOLLHUP | EPOLLERR);
+ 			goto out_unlock;
+ 		}
+ 	}
+@@ -1159,6 +1379,7 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
+ 				   u32 flags)
+ {
++	unsigned long irqflags;
+ 	u32 i;
+ 	int ret;
+ 
+@@ -1171,11 +1392,19 @@ static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
+ 	ret = tbstream_dev_valid(sdev);
+ 	if (ret)
+ 		goto out_unlock;
+-	if (sdev->zc_failed) {
++	if (!sdev->zc) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++	spin_lock_irqsave(&sdev->zc_lock, irqflags);
++	sdev->zc_counters.rx_repost_calls++;
++	sdev->zc_counters.rx_repost_frames += nframes;
++	spin_unlock_irqrestore(&sdev->zc_lock, irqflags);
++	if (tbstream_dev_zc_failed(sdev)) {
+ 		ret = -EIO;
+ 		goto out_unlock;
+ 	}
+-	if (!sdev->zc || nframes > sdev->rx_ring.prod - sdev->rx_ring.cons) {
++	if (nframes > sdev->rx_ring.prod - sdev->rx_ring.cons) {
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+ 	}
+@@ -1190,8 +1419,20 @@ static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
+ 				  i != 0 && i != nframes - 1 ?
+ 				  RING_FRAME_NO_INTERRUPT : 0;
+ 		ret = tbstream_dev_consume_rx(sdev);
+-		if (ret)
++		if (ret) {
++			bool wake_error = false;
++
++			spin_lock_irqsave(&sdev->zc_lock, irqflags);
++			sdev->zc_counters.rx_repost_errors++;
++			if (i)
++				wake_error = tbstream_zc_fail_locked(sdev,
++								     TBSTREAM_ZC_ERROR_RX_PARTIAL);
++			spin_unlock_irqrestore(&sdev->zc_lock, irqflags);
++			if (wake_error)
++				wake_up_interruptible_poll(&sdev->wait,
++							   EPOLLHUP | EPOLLERR);
+ 			break;
++		}
+ 	}
+ 
+ out_unlock:
+@@ -1218,22 +1459,30 @@ static int tbstream_dev_zc_reap(struct tbstream_dev *sdev, struct file *file,
+ 	if (mutex_lock_interruptible(&sdev->lock))
+ 		return -ERESTARTSYS;
+ 
++	if (sdev->zc) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&sdev->zc_lock, flags);
++		sdev->zc_counters.reap_calls++;
++		spin_unlock_irqrestore(&sdev->zc_lock, flags);
++	}
++
+ 	for (;;) {
+ 		if (!sdev->zc) {
+ 			ret = -EINVAL;
+ 			goto out_unlock;
+ 		}
+-		if (sdev->zc_failed) {
+-			ret = -EIO;
+-			goto out_unlock;
+-		}
+ 		ret = tbstream_dev_valid(sdev);
+ 		if (ret || tbstream_dev_removed(sdev)) {
+ 			ret = -ENXIO;
+ 			goto out_unlock;
+ 		}
+-		if (!kfifo_is_empty(&sdev->zc_events))
++		if (tbstream_dev_zc_has_events(sdev))
+ 			break;
++		if (tbstream_dev_zc_failed(sdev)) {
++			ret = -EIO;
++			goto out_unlock;
++		}
+ 
+ 		mutex_unlock(&sdev->lock);
+ 		if ((reap.flags & TBSTREAM_ZC_REAP_NONBLOCK) ||
+@@ -1241,8 +1490,8 @@ static int tbstream_dev_zc_reap(struct tbstream_dev *sdev, struct file *file,
+ 			return -EAGAIN;
+ 
+ 		ret = wait_event_interruptible(sdev->wait,
+-				!kfifo_is_empty(&sdev->zc_events) ||
+-				READ_ONCE(sdev->zc_failed) ||
++				tbstream_dev_zc_has_events(sdev) ||
++				tbstream_dev_zc_failed(sdev) ||
+ 				tbstream_dev_valid(sdev) != 0 ||
+ 				tbstream_dev_removed(sdev));
+ 		if (ret)
+@@ -1270,6 +1519,7 @@ static int tbstream_dev_zc_reap(struct tbstream_dev *sdev, struct file *file,
+ 		/* The device mutex keeps the peeked head stable across the copy. */
+ 		spin_lock_irqsave(&sdev->zc_lock, flags);
+ 		kfifo_skip(&sdev->zc_events);
++		sdev->zc_counters.reaped_events++;
+ 		spin_unlock_irqrestore(&sdev->zc_lock, flags);
+ 		n++;
+ 	}
+@@ -1280,6 +1530,174 @@ static int tbstream_dev_zc_reap(struct tbstream_dev *sdev, struct file *file,
+ 	return ret;
+ }
+ 
++static void
++tbstream_dev_zc_copy_ring_stats(struct tbstream_zc_ring_stats *dst,
++				const struct tb_ring_stats *src)
++{
++	dst->descriptors_posted = src->descriptors_posted;
++	dst->descriptors_completed = src->descriptors_completed;
++	dst->interrupts = src->interrupts;
++	dst->work_runs = src->work_runs;
++	dst->kick_requests = src->kick_requests;
++	dst->kick_pending = src->kick_pending;
++	if (src->is_tx)
++		dst->flags |= TBSTREAM_ZC_RING_F_TX;
++	if (src->running)
++		dst->flags |= TBSTREAM_ZC_RING_F_RUNNING;
++	if (src->irq > 0)
++		dst->flags |= TBSTREAM_ZC_RING_F_MSIX;
++	if (src->interrupt_enabled)
++		dst->flags |= TBSTREAM_ZC_RING_F_INTERRUPT_ENABLED;
++	if (src->tail_flags & RING_DESC_COMPLETED)
++		dst->flags |= TBSTREAM_ZC_RING_F_TAIL_COMPLETED;
++	if (src->hw_valid)
++		dst->flags |= TBSTREAM_ZC_RING_F_HW_VALID;
++	dst->hop = src->hop;
++	dst->irq = src->irq;
++	dst->vector = src->vector;
++	dst->size = src->size;
++	dst->sw_head = src->head;
++	dst->sw_tail = src->tail;
++	dst->hw_posted = src->hw_posted;
++	dst->hw_completed = src->hw_completed;
++	dst->queued = src->queued;
++	dst->in_flight = src->in_flight;
++	dst->tail_flags = src->tail_flags;
++	dst->tail_length = src->tail_length;
++	dst->tail_eof = src->tail_eof;
++	dst->tail_sof = src->tail_sof;
++	dst->options = src->options;
++	dst->interval_nsec = src->interval_nsec;
++}
++
++static int tbstream_dev_zc_get_stats(struct tbstream_dev *sdev,
++				     void __user *arg)
++{
++	struct tbstream_zc_counters *c = &sdev->zc_counters;
++	struct tbstream_zc_stats stats = {
++		.version = TBSTREAM_ZC_STATS_VERSION,
++		.struct_size = sizeof(stats),
++	};
++	struct tb_ring_stats tx, rx;
++	unsigned long flags;
++	int ret;
++
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++
++	if (!sdev->zc || !sdev->tx_ring.ring || !sdev->rx_ring.ring) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	spin_lock_irqsave(&sdev->zc_lock, flags);
++	stats.tx_submit_calls = c->tx_submit_calls;
++	stats.tx_submit_frames = c->tx_submit_frames;
++	stats.tx_callbacks = c->tx_callbacks;
++	stats.tx_terminal_callbacks = c->tx_terminal_callbacks;
++	stats.tx_events = c->tx_events;
++	stats.tx_enqueue_errors = c->tx_enqueue_errors;
++	stats.rx_callbacks = c->rx_callbacks;
++	stats.rx_data_more = c->rx_data_more;
++	stats.rx_data = c->rx_data;
++	stats.rx_close = c->rx_close;
++	stats.rx_events = c->rx_events;
++	stats.rx_repost_calls = c->rx_repost_calls;
++	stats.rx_repost_frames = c->rx_repost_frames;
++	stats.rx_repost_errors = c->rx_repost_errors;
++	stats.reap_calls = c->reap_calls;
++	stats.reaped_events = c->reaped_events;
++	stats.event_drops = c->event_drops;
++	stats.crc_errors = c->crc_errors;
++	stats.overrun_errors = c->overrun_errors;
++	stats.canceled_callbacks = c->canceled_callbacks;
++	stats.failures = c->failures;
++	stats.tx_prod = sdev->tx_ring.prod;
++	stats.tx_cons = sdev->tx_ring.cons;
++	stats.rx_prod = sdev->rx_ring.prod;
++	stats.rx_cons = sdev->rx_ring.cons;
++	stats.tx_pending = sdev->zc_tx_pending;
++	stats.tx_done = sdev->zc_tx_done;
++	stats.rx_partial_frames = sdev->zc_rx_msg_frames;
++	stats.rx_partial_bytes = sdev->zc_rx_msg_bytes;
++	stats.fifo_len = kfifo_len(&sdev->zc_events);
++	stats.fifo_avail = kfifo_avail(&sdev->zc_events);
++	if (sdev->zc_failed)
++		stats.flags |= TBSTREAM_ZC_STATS_F_FAILED;
++	if (sdev->closed)
++		stats.flags |= TBSTREAM_ZC_STATS_F_CLOSED;
++	stats.last_error = sdev->zc_last_error;
++	spin_unlock_irqrestore(&sdev->zc_lock, flags);
++
++	if (tbstream_dev_removed(sdev))
++		stats.flags |= TBSTREAM_ZC_STATS_F_REMOVED;
++	stats.in_hopid = sdev->in_hopid;
++	stats.out_hopid = sdev->out_hopid;
++	stats.throttling = sdev->throttling;
++
++	ret = tb_ring_get_stats(sdev->tx_ring.ring, &tx);
++	if (ret)
++		goto out_unlock;
++	ret = tb_ring_get_stats(sdev->rx_ring.ring, &rx);
++	if (ret)
++		goto out_unlock;
++	tbstream_dev_zc_copy_ring_stats(&stats.tx, &tx);
++	tbstream_dev_zc_copy_ring_stats(&stats.rx, &rx);
++
++	mutex_unlock(&sdev->lock);
++	return copy_to_user(arg, &stats, sizeof(stats)) ? -EFAULT : 0;
++
++out_unlock:
++	mutex_unlock(&sdev->lock);
++	return ret;
++}
++
++static int tbstream_dev_zc_kick(struct tbstream_dev *sdev, void __user *arg)
++{
++	struct tbstream_zc_kick kick;
++	int ret = 0;
++
++	if (!zc_diagnostic_kick)
++		return -EACCES;
++	if (!capable(CAP_SYS_RAWIO))
++		return -EPERM;
++	if (copy_from_user(&kick, arg, sizeof(kick)))
++		return -EFAULT;
++	if (!kick.rings ||
++	    (kick.rings & ~(TBSTREAM_ZC_KICK_TX | TBSTREAM_ZC_KICK_RX)) ||
++	    kick.reserved)
++		return -EINVAL;
++
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++	ret = tbstream_dev_valid(sdev);
++	if (ret || tbstream_dev_removed(sdev)) {
++		ret = -ENXIO;
++		goto out_unlock;
++	}
++	if (!sdev->zc || !sdev->tx_ring.ring || !sdev->rx_ring.ring) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	if (kick.rings & TBSTREAM_ZC_KICK_RX) {
++		int rx_ret = tb_ring_kick(sdev->rx_ring.ring);
++
++		if (!ret)
++			ret = rx_ret;
++	}
++	if (kick.rings & TBSTREAM_ZC_KICK_TX) {
++		int tx_ret = tb_ring_kick(sdev->tx_ring.ring);
++
++		if (!ret)
++			ret = tx_ret;
++	}
++
++out_unlock:
++	mutex_unlock(&sdev->lock);
++	return ret;
++}
++
+ static long
+ tbstream_dev_fops_ioctl(struct file *file, unsigned int cmd,
+ 			unsigned long arg)
+@@ -1306,6 +1724,10 @@ tbstream_dev_fops_ioctl(struct file *file, unsigned int cmd,
+ 		if (copy_from_user(&rx, uarg, sizeof(rx)))
+ 			return -EFAULT;
+ 		return tbstream_dev_zc_post_rx(sdev, rx.nframes, rx.flags);
++	case TBSTREAM_ZC_GET_STATS:
++		return tbstream_dev_zc_get_stats(sdev, uarg);
++	case TBSTREAM_ZC_KICK:
++		return tbstream_dev_zc_kick(sdev, uarg);
+ 	default:
+ 		return -ENOTTY;
+ 	}
+@@ -1422,6 +1844,7 @@ static int tbstream_dev_fops_open(struct inode *inode, struct file *file)
+ static int tbstream_dev_fops_release(struct inode *inode, struct file *file)
+ {
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	int ret;
+ 
+ 	mutex_lock(&sdev->lock);
+ 	if (--sdev->users == 0) {
+@@ -1430,7 +1853,14 @@ static int tbstream_dev_fops_release(struct inode *inode, struct file *file)
+ 		 * that we are closing the file. We do this twice if the
+ 		 * first one fails.
+ 		 */
+-		tbstream_dev_send_close(sdev);
++		ret = tbstream_dev_send_close(sdev);
++		if (ret) {
++			int retry = tbstream_dev_send_close(sdev);
++
++			if (retry)
++				pr_warn("device %d failed to send CLOSE twice: %d, %d\n",
++					sdev->index, ret, retry);
++		}
+ 		tbstream_dev_stop(sdev);
+ 	}
+ 	mutex_unlock(&sdev->lock);
+@@ -2025,7 +2455,7 @@ tbstream_dev_drop_item(struct config_group *group, struct config_item *item)
+ 	scoped_guard(mutex, &sg->lock)
+ 		list_del(&sdev->list);
+ 	/* Notify any task that the underlying group was removed  */
+-	sdev->removed = true;
++	WRITE_ONCE(sdev->removed, true);
+ 	wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
+ 	config_item_put(item);
+ }
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 13af681ae..b237ace06 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -539,6 +539,12 @@ struct tb_nhi {
+  * @queue: Queue holding frames to be transferred over this ring
+  * @in_flight: Queue holding frames that are currently in flight
+  * @work: Interrupt work structure
++ * @descriptors_posted: Number of descriptors posted to the NHI
++ * @descriptors_completed: Number of completed descriptors harvested
++ * @interrupts: Number of interrupts observed for this ring
++ * @work_runs: Number of ring work executions
++ * @kick_requests: Number of explicit diagnostic kick requests
++ * @kick_pending: Kicks that found a completed tail descriptor
+  * @is_tx: Is the ring Tx or Rx
+  * @running: Is the ring running
+  * @irq: MSI-X irq number if the ring uses MSI-X. %0 otherwise.
+@@ -567,6 +573,12 @@ struct tb_ring {
+ 	struct list_head queue;
+ 	struct list_head in_flight;
+ 	struct work_struct work;
++	u64 descriptors_posted;
++	u64 descriptors_completed;
++	u64 interrupts;
++	u64 work_runs;
++	u64 kick_requests;
++	u64 kick_pending;
+ 	bool is_tx:1;
+ 	bool running:1;
+ 	int irq;
+@@ -581,6 +593,64 @@ struct tb_ring {
+ 	wait_queue_head_t wait;
+ };
+ 
++/**
++ * struct tb_ring_stats - Diagnostic snapshot of one NHI ring
++ * @descriptors_posted: Descriptors posted since allocation
++ * @descriptors_completed: Completed descriptors harvested by ring work
++ * @interrupts: Interrupts observed for this ring
++ * @work_runs: Ring work executions
++ * @kick_requests: Explicit diagnostic kick requests
++ * @kick_pending: Kicks that found a completed tail descriptor
++ * @size: Descriptor count
++ * @hop: Local NHI ring HopID
++ * @head: Software producer/head index
++ * @tail: Software consumer/tail index
++ * @hw_posted: NHI-visible posted-descriptor index
++ * @hw_completed: NHI-visible completed-descriptor index
++ * @queued: Frames waiting for descriptor space
++ * @in_flight: Frames owned by the NHI
++ * @tail_flags: Current software-tail descriptor flags
++ * @tail_length: Current software-tail descriptor length
++ * @tail_eof: Current software-tail descriptor EOF/PDF value
++ * @tail_sof: Current software-tail descriptor SOF/PDF value
++ * @options: Raw NHI ring options register
++ * @interval_nsec: Configured interrupt-throttling interval
++ * @irq: Linux MSI-X IRQ, or 0 for shared MSI
++ * @vector: MSI-X vector index
++ * @is_tx: Whether this is a transmit ring
++ * @running: Whether the ring is enabled
++ * @interrupt_enabled: Whether the ring interrupt mask bit is enabled
++ * @hw_valid: Whether the hardware register fields are valid
++ */
++struct tb_ring_stats {
++	u64 descriptors_posted;
++	u64 descriptors_completed;
++	u64 interrupts;
++	u64 work_runs;
++	u64 kick_requests;
++	u64 kick_pending;
++	u32 size;
++	s32 hop;
++	u32 head;
++	u32 tail;
++	u32 hw_posted;
++	u32 hw_completed;
++	u32 queued;
++	u32 in_flight;
++	u32 tail_flags;
++	u32 tail_length;
++	u32 tail_eof;
++	u32 tail_sof;
++	u32 options;
++	u32 interval_nsec;
++	s32 irq;
++	u32 vector;
++	bool is_tx;
++	bool running;
++	bool interrupt_enabled;
++	bool hw_valid;
++};
++
+ /* Leave ring interrupt enabled on suspend */
+ #define RING_FLAG_NO_SUSPEND	BIT(0)
+ /* Configure the ring to be in frame mode */
+@@ -716,6 +786,8 @@ struct ring_frame *tb_ring_poll(struct tb_ring *ring);
+ void tb_ring_poll_complete(struct tb_ring *ring);
+ 
+ int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec);
++int tb_ring_get_stats(struct tb_ring *ring, struct tb_ring_stats *stats);
++int tb_ring_kick(struct tb_ring *ring);
+ 
+ /**
+  * tb_ring_dma_device() - Return device used for DMA mapping
+diff --git a/include/uapi/linux/thunderbolt-stream.h b/include/uapi/linux/thunderbolt-stream.h
+index 40aab2f68..c7a663d49 100644
+--- a/include/uapi/linux/thunderbolt-stream.h
++++ b/include/uapi/linux/thunderbolt-stream.h
+@@ -130,6 +130,186 @@ struct tbstream_zc_rx {
+ #define TBSTREAM_ZC_RX_F_INTERRUPT_LAST \
+ 	TBSTREAM_ZC_RX_F_INTERRUPT_BOUNDARIES /* source compatibility */
+ 
++/**
++ * struct tbstream_zc_ring_stats - Diagnostic snapshot of one NHI ring
++ * @descriptors_posted: Descriptors posted to the NHI since ring allocation
++ * @descriptors_completed: Completed descriptors harvested by ring work
++ * @interrupts: Interrupts observed for this ring
++ * @work_runs: Ring work executions
++ * @kick_requests: Explicit diagnostic kick requests
++ * @kick_pending: Kicks that found a completed descriptor awaiting harvest
++ * @flags: %TBSTREAM_ZC_RING_F_* flags
++ * @hop: Local NHI ring HopID
++ * @irq: Linux MSI-X IRQ, or 0 when the shared MSI path is used
++ * @vector: MSI-X vector index, or 0 for shared MSI
++ * @size: Descriptor count
++ * @sw_head: Next descriptor software will post
++ * @sw_tail: Next descriptor software will complete
++ * @hw_posted: NHI-visible posted-descriptor index
++ * @hw_completed: NHI-visible completed-descriptor index
++ * @queued: Frames waiting for descriptor space
++ * @in_flight: Frames owned by the NHI
++ * @tail_flags: Current software-tail descriptor flags
++ * @tail_length: Current software-tail descriptor length
++ * @tail_eof: Current software-tail descriptor EOF/PDF value
++ * @tail_sof: Current software-tail descriptor SOF/PDF value
++ * @options: Raw NHI ring options register
++ * @interval_nsec: Configured interrupt-throttling interval
++ * @reserved: Must be ignored
++ *
++ * Hardware and software can advance while this structure is copied. Fields
++ * are one lock-consistent ring snapshot, not a cross-ring transaction.
++ */
++struct tbstream_zc_ring_stats {
++	__aligned_u64 descriptors_posted;
++	__aligned_u64 descriptors_completed;
++	__aligned_u64 interrupts;
++	__aligned_u64 work_runs;
++	__aligned_u64 kick_requests;
++	__aligned_u64 kick_pending;
++	__u32 flags;
++	__s32 hop;
++	__s32 irq;
++	__u32 vector;
++	__u32 size;
++	__u32 sw_head;
++	__u32 sw_tail;
++	__u32 hw_posted;
++	__u32 hw_completed;
++	__u32 queued;
++	__u32 in_flight;
++	__u32 tail_flags;
++	__u32 tail_length;
++	__u32 tail_eof;
++	__u32 tail_sof;
++	__u32 options;
++	__u32 interval_nsec;
++	__u32 reserved[2];
++};
++
++#define TBSTREAM_ZC_RING_F_TX			0x1
++#define TBSTREAM_ZC_RING_F_RUNNING		0x2
++#define TBSTREAM_ZC_RING_F_MSIX			0x4
++#define TBSTREAM_ZC_RING_F_INTERRUPT_ENABLED	0x8
++#define TBSTREAM_ZC_RING_F_TAIL_COMPLETED	0x10
++#define TBSTREAM_ZC_RING_F_HW_VALID		0x20
++
++/**
++ * struct tbstream_zc_stats - Zero-copy and NHI progress snapshot
++ * @version: %TBSTREAM_ZC_STATS_VERSION
++ * @struct_size: Size of this structure in bytes
++ * @tx_submit_calls: Successful or failed TX submit attempts
++ * @tx_submit_frames: TX frames requested by submit calls
++ * @tx_callbacks: Non-canceled TX frame callbacks
++ * @tx_terminal_callbacks: TX callbacks carrying a message-ending PDF
++ * @tx_events: TX completion events queued
++ * @tx_enqueue_errors: TX frame enqueue failures
++ * @rx_callbacks: Non-canceled RX frame callbacks
++ * @rx_data_more: RX callbacks carrying a continuation PDF
++ * @rx_data: RX callbacks carrying a message-ending DATA PDF
++ * @rx_close: RX callbacks carrying CLOSE
++ * @rx_events: RX or CLOSE events queued
++ * @rx_repost_calls: RX repost attempts
++ * @rx_repost_frames: RX frames requested by repost calls
++ * @rx_repost_errors: RX frame enqueue failures during repost
++ * @reap_calls: Event reap attempts
++ * @reaped_events: Events successfully copied and dequeued
++ * @event_drops: Events that could not be queued
++ * @crc_errors: RX descriptors reporting CRC errors
++ * @overrun_errors: RX descriptors reporting buffer overrun
++ * @canceled_callbacks: Ring callbacks canceled during shutdown
++ * @failures: Times zero-copy mode entered its terminal error state
++ * @tx_prod: Stream TX producer cursor
++ * @tx_cons: Stream TX consumer cursor
++ * @rx_prod: Stream RX producer cursor
++ * @rx_cons: Stream RX consumer cursor
++ * @tx_pending: Frames accumulated toward the next TX completion event
++ * @tx_done: Frames represented by TX completion events
++ * @rx_partial_frames: Frames accumulated toward the next RX message event
++ * @rx_partial_bytes: Bytes accumulated toward the next RX message event
++ * @fifo_len: Events currently queued
++ * @fifo_avail: Unused event slots
++ * @flags: %TBSTREAM_ZC_STATS_F_* flags
++ * @in_hopid: Stream input path HopID
++ * @out_hopid: Stream output path HopID
++ * @throttling: Configured interrupt-throttling interval in ns
++ * @last_error: First terminal zero-copy error, a %TBSTREAM_ZC_ERROR_* value
++ * @reserved: Must be ignored
++ * @tx: Transmit NHI ring snapshot
++ * @rx: Receive NHI ring snapshot
++ */
++struct tbstream_zc_stats {
++	__u32 version;
++	__u32 struct_size;
++	__aligned_u64 tx_submit_calls;
++	__aligned_u64 tx_submit_frames;
++	__aligned_u64 tx_callbacks;
++	__aligned_u64 tx_terminal_callbacks;
++	__aligned_u64 tx_events;
++	__aligned_u64 tx_enqueue_errors;
++	__aligned_u64 rx_callbacks;
++	__aligned_u64 rx_data_more;
++	__aligned_u64 rx_data;
++	__aligned_u64 rx_close;
++	__aligned_u64 rx_events;
++	__aligned_u64 rx_repost_calls;
++	__aligned_u64 rx_repost_frames;
++	__aligned_u64 rx_repost_errors;
++	__aligned_u64 reap_calls;
++	__aligned_u64 reaped_events;
++	__aligned_u64 event_drops;
++	__aligned_u64 crc_errors;
++	__aligned_u64 overrun_errors;
++	__aligned_u64 canceled_callbacks;
++	__aligned_u64 failures;
++	__aligned_u64 tx_prod;
++	__aligned_u64 tx_cons;
++	__aligned_u64 rx_prod;
++	__aligned_u64 rx_cons;
++	__u32 tx_pending;
++	__u32 tx_done;
++	__u32 rx_partial_frames;
++	__u32 rx_partial_bytes;
++	__u32 fifo_len;
++	__u32 fifo_avail;
++	__u32 flags;
++	__s32 in_hopid;
++	__s32 out_hopid;
++	__u32 throttling;
++	__u32 last_error;
++	__u32 reserved[4];
++	struct tbstream_zc_ring_stats tx;
++	struct tbstream_zc_ring_stats rx;
++};
++
++#define TBSTREAM_ZC_STATS_VERSION	1
++#define TBSTREAM_ZC_STATS_F_FAILED	0x1
++#define TBSTREAM_ZC_STATS_F_CLOSED	0x2
++#define TBSTREAM_ZC_STATS_F_REMOVED	0x4
++
++#define TBSTREAM_ZC_ERROR_NONE		0
++#define TBSTREAM_ZC_ERROR_RX_CRC	1
++#define TBSTREAM_ZC_ERROR_RX_OVERRUN	2
++#define TBSTREAM_ZC_ERROR_EVENT_DROP	3
++#define TBSTREAM_ZC_ERROR_TX_PARTIAL	4
++#define TBSTREAM_ZC_ERROR_RX_PARTIAL	5
++
++/**
++ * struct tbstream_zc_kick - Explicitly schedule normal NHI ring work
++ * @rings: %TBSTREAM_ZC_KICK_* mask
++ * @reserved: Must be 0
++ *
++ * This is a diagnostic operation. It does not alter descriptors, reset a
++ * path, or bypass normal ring completion processing.
++ */
++struct tbstream_zc_kick {
++	__u32 rings;
++	__u32 reserved;
++};
++
++#define TBSTREAM_ZC_KICK_TX	0x1
++#define TBSTREAM_ZC_KICK_RX	0x2
++
+ #define TBSTREAM_ZC_MAGIC	0xb4
+ 
+ #define TBSTREAM_ZC_ENABLE	_IO(TBSTREAM_ZC_MAGIC, 0x00)
+@@ -139,5 +319,9 @@ struct tbstream_zc_rx {
+ #define TBSTREAM_ZC_REAP	_IOWR(TBSTREAM_ZC_MAGIC, 0x04, struct tbstream_zc_reap)
+ #define TBSTREAM_ZC_POST_RX_FLAGS \
+ 	_IOW(TBSTREAM_ZC_MAGIC, 0x05, struct tbstream_zc_rx)
++#define TBSTREAM_ZC_GET_STATS \
++	_IOR(TBSTREAM_ZC_MAGIC, 0x06, struct tbstream_zc_stats)
++#define TBSTREAM_ZC_KICK \
++	_IOW(TBSTREAM_ZC_MAGIC, 0x07, struct tbstream_zc_kick)
+ 
+ #endif /* _UAPI_LINUX_THUNDERBOLT_STREAM_H */
+-- 
+2.50.1 (Apple Git-155)
+

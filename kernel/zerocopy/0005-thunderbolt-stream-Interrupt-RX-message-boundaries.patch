@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Tue, 4 Aug 2026 18:15:00 -0700
+Subject: [PATCH] thunderbolt: stream: Interrupt RX message boundaries
+
+The flagged RX repost operation originally armed only the final descriptor
+of a fixed-size message group. The next CLOSE frame then lands on the first
+descriptor of the following group, where its interrupt is suppressed, and
+userspace can block forever waiting for peer close.
+
+Keep interrupts on both the first and final reposted descriptors. The final
+descriptor wakes for the complete data message, while the first guarantees
+that a following one-frame CLOSE is surfaced. This still reduces a multi-page
+message to at most two RX interrupts and retains the same flag value. Keep the
+old flag name as a source-compatible alias.
+
+Signed-off-by: Jonathan Yates <jonjryjo@gmail.com>
+---
+ drivers/thunderbolt/stream.c            |  7 ++++---
+ include/uapi/linux/thunderbolt-stream.h | 15 +++++++++------
+ 2 files changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 7238fd5c5f13..3ec4159742f4 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -1047,7 +1047,7 @@ static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
+ 	u32 i;
+ 	int ret;
+ 
+-	if (!nframes || (flags & ~TBSTREAM_ZC_RX_F_INTERRUPT_LAST))
++	if (!nframes || (flags & ~TBSTREAM_ZC_RX_F_INTERRUPT_BOUNDARIES))
+ 		return -EINVAL;
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock))
+@@ -1067,8 +1067,9 @@ static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
+ 			    tb_ring_size(sdev->rx_ring.ring);
+ 
+ 		sf = &sdev->rx_ring.frames[index];
+-		sf->frame.flags = flags & TBSTREAM_ZC_RX_F_INTERRUPT_LAST &&
+-				  i != nframes - 1 ? RING_FRAME_NO_INTERRUPT : 0;
++		sf->frame.flags = flags & TBSTREAM_ZC_RX_F_INTERRUPT_BOUNDARIES &&
++				  i != 0 && i != nframes - 1 ?
++				  RING_FRAME_NO_INTERRUPT : 0;
+ 		ret = tbstream_dev_consume_rx(sdev);
+ 		if (ret)
+ 			break;
+diff --git a/include/uapi/linux/thunderbolt-stream.h b/include/uapi/linux/thunderbolt-stream.h
+index d623451c6284..93af2a11354f 100644
+--- a/include/uapi/linux/thunderbolt-stream.h
++++ b/include/uapi/linux/thunderbolt-stream.h
+@@ -108,12 +108,13 @@ struct tbstream_zc_reap {
+ /**
+  * struct tbstream_zc_rx - Flagged RX repost request
+  * @nframes: Frames to return to the RX ring
+- * @flags: %TBSTREAM_ZC_RX_F_INTERRUPT_LAST or 0
++ * @flags: %TBSTREAM_ZC_RX_F_INTERRUPT_BOUNDARIES or 0
+  *
+- * INTERRUPT_LAST is intended for fixed-size message streams. It suppresses
+- * interrupts on every reposted frame except the last, allowing the NHI to
+- * complete a whole message before waking the CPU. Applications with variable
+- * message geometry should use the legacy unflagged POST_RX operation.
++ * INTERRUPT_BOUNDARIES is intended for fixed-size message streams. It
++ * suppresses interrupts on every reposted frame except the first and last.
++ * The final interrupt reports a complete message; the first ensures a
++ * following one-frame CLOSE is observed. Applications with variable message
++ * geometry should use the legacy unflagged POST_RX operation.
+  */
+ struct tbstream_zc_rx {
+ 	__u32 nframes;
+@@ -121,7 +122,9 @@ struct tbstream_zc_rx {
+ 	__u32 flags;
+ };
+ 
+-#define TBSTREAM_ZC_RX_F_INTERRUPT_LAST	0x1
++#define TBSTREAM_ZC_RX_F_INTERRUPT_BOUNDARIES	0x1
++#define TBSTREAM_ZC_RX_F_INTERRUPT_LAST \
++	TBSTREAM_ZC_RX_F_INTERRUPT_BOUNDARIES /* source compatibility */
+ 
+ #define TBSTREAM_ZC_MAGIC	0xb4
+ 
+-- 
+2.50.1

@@ -1,0 +1,306 @@
+From 1316e75f55fae41c54b29510baa3e4118b50a9ce Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Wed, 5 Aug 2026 10:35:00 -0700
+Subject: [PATCH] thunderbolt: stream: Make HopID attachment transactional
+
+service_get_hopids() writes the peer-requested IDs into the device
+fields before either allocation. The attach path then ignores both
+allocator return values. If an exact ID is busy, the helper releases the
+different ID returned by the ranged allocator but leaves the requested
+field positive. ConfigFS can consequently report and later release a
+HopID this stream never owned. An input allocation also remains live if
+the following output allocation fails.
+
+Keep requested IDs local until allocation and record each successful
+direction. Roll back only those recorded acquisitions on any later
+failure. Clear both fields on failure so they cannot masquerade as
+ownership. Propagate creation-time failures and warn when attaching a
+pre-existing ConfigFS child fails. Make same-ID writes idempotent and
+retain the old allocation until its replacement succeeds.
+
+Track misc-device registration separately so ConfigFS cleanup after an
+early attach failure does not deregister an unregistered device.
+
+Serialize ConfigFS list insertion and attachment under the group lock so
+service detach cannot pass a newly linked but not yet attached child.
+
+Wake blocked openers after successful attached HopID updates so manual
+recovery becomes visible once both directions are valid.
+
+Signed-off-by: Jonathan Yates <jonjryjo@gmail.com>
+---
+ drivers/thunderbolt/stream.c | 142 +++++++++++++++++++++++++++--------
+ 1 file changed, 110 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 08ffdde1f..9ae7a4c99 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -129,6 +129,7 @@ struct tbstream_ring {
+  * @group: ConfigFS group for this device
+  * @stream: Pointer to the stream if it is attached (%NULL otherwise)
+  * @misc: Character device used for tunneling
++ * @misc_registered: Whether @misc was registered
+  * @kref: Reference count
+  * @index: Unique identifier for the character device
+  * @in_hopid: In HopID
+@@ -148,6 +149,7 @@ struct tbstream_dev {
+ 	struct config_group group;
+ 	struct tbstream *stream;
+ 	struct miscdevice misc;
++	bool misc_registered;
+ 	struct kref kref;
+ 	int index;
+ 	int in_hopid;
+@@ -1589,12 +1591,17 @@ static int tbstream_dev_update_properties(struct tbstream_dev *sdev)
+ static int tbstream_dev_alloc_in_hopid(struct tbstream_dev *sdev, int hopid)
+ {
+ 	struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
++	int old_hopid = sdev->in_hopid;
+ 	int ret;
+ 
+-	if (sdev->in_hopid > 0 && sdev->in_hopid != hopid)
+-		tb_xdomain_release_in_hopid(xd, sdev->in_hopid);
++	if (old_hopid > 0 && old_hopid == hopid)
++		return 0;
++	if (old_hopid <= 0)
++		sdev->in_hopid = 0;
+ 	if (!hopid) {
+-		sdev->in_hopid = hopid;
++		if (old_hopid > 0)
++			tb_xdomain_release_in_hopid(xd, old_hopid);
++		sdev->in_hopid = 0;
+ 		return 0;
+ 	}
+ 	ret = tb_xdomain_alloc_in_hopid(xd, hopid);
+@@ -1608,6 +1615,8 @@ static int tbstream_dev_alloc_in_hopid(struct tbstream_dev *sdev, int hopid)
+ 		tb_xdomain_release_in_hopid(xd, ret);
+ 		return -EBUSY;
+ 	}
++	if (old_hopid > 0)
++		tb_xdomain_release_in_hopid(xd, old_hopid);
+ 	sdev->in_hopid = ret;
+ 	return 0;
+ }
+@@ -1615,12 +1624,17 @@ static int tbstream_dev_alloc_in_hopid(struct tbstream_dev *sdev, int hopid)
+ static int tbstream_dev_alloc_out_hopid(struct tbstream_dev *sdev, int hopid)
+ {
+ 	struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
++	int old_hopid = sdev->out_hopid;
+ 	int ret;
+ 
+-	if (sdev->out_hopid > 0 && sdev->out_hopid != hopid)
+-		tb_xdomain_release_out_hopid(xd, sdev->out_hopid);
++	if (old_hopid > 0 && old_hopid == hopid)
++		return 0;
++	if (old_hopid <= 0)
++		sdev->out_hopid = 0;
+ 	if (!hopid) {
+-		sdev->out_hopid = hopid;
++		if (old_hopid > 0)
++			tb_xdomain_release_out_hopid(xd, old_hopid);
++		sdev->out_hopid = 0;
+ 		return 0;
+ 	}
+ 	ret = tb_xdomain_alloc_out_hopid(xd, hopid);
+@@ -1630,6 +1644,8 @@ static int tbstream_dev_alloc_out_hopid(struct tbstream_dev *sdev, int hopid)
+ 		tb_xdomain_release_out_hopid(xd, ret);
+ 		return -EBUSY;
+ 	}
++	if (old_hopid > 0)
++		tb_xdomain_release_out_hopid(xd, old_hopid);
+ 	sdev->out_hopid = ret;
+ 	return 0;
+ }
+@@ -1654,6 +1670,8 @@ tbstream_dev_in_hopid_store(struct config_item *item, const char *buf,
+ 		if (ret)
+ 			return ret;
+ 		ret = tbstream_dev_update_properties(sdev);
++		if (!ret)
++			wake_up_interruptible(&sdev->wait);
+ 	} else {
+ 		sdev->in_hopid = in_hopid;
+ 	}
+@@ -1689,6 +1707,8 @@ tbstream_dev_out_hopid_store(struct config_item *item, const char *buf,
+ 		if (ret)
+ 			return ret;
+ 		ret = tbstream_dev_update_properties(sdev);
++		if (!ret)
++			wake_up_interruptible(&sdev->wait);
+ 	} else {
+ 		sdev->out_hopid = out_hopid;
+ 	}
+@@ -1775,7 +1795,8 @@ static void tbstream_dev_item_release(struct config_item *item)
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 
+-	misc_deregister(&sdev->misc);
++	if (sdev->misc_registered)
++		misc_deregister(&sdev->misc);
+ 	tbstream_dev_put(sdev);
+ }
+ 
+@@ -1817,38 +1838,80 @@ static void service_get_hopids(struct tb_service *svc, const char *name,
+ 		*in_hopid = p->value.immediate;
+ }
+ 
+-static void
++static int
+ tbstream_dev_attach_stream(struct tbstream_dev *sdev, struct tbstream_group *sg)
+ {
+ 	const char *name = config_item_name(&sdev->group.cg_item);
++	struct tb_xdomain *xd;
+ 	struct tbstream *stream;
++	bool in_allocated = false;
++	bool out_allocated = false;
++	int in_hopid, out_hopid;
++	int ret = 0;
+ 
+ 	stream = tbstream_get(sg->stream);
+ 	if (!stream)
+-		return;
++		return 0;
+ 
+-	scoped_guard(mutex, &sdev->lock) {
+-		sdev->stream = stream;
+-		/*
+-		 * If there is no existing configuration (or automatic
+-		 * configuration is being used) check if the other side
+-		 * has configuration for this and use it.
+-		 */
+-		if (sdev->in_hopid <= 0 && sdev->out_hopid <= 0)
+-			service_get_hopids(stream->svc, name, &sdev->in_hopid,
+-					   &sdev->out_hopid);
+-		if (sdev->in_hopid)
+-			tbstream_dev_alloc_in_hopid(sdev, sdev->in_hopid);
+-		if (sdev->out_hopid)
+-			tbstream_dev_alloc_out_hopid(sdev, sdev->out_hopid);
++	mutex_lock(&sdev->lock);
++	if (WARN_ON(sdev->stream)) {
++		mutex_unlock(&sdev->lock);
++		tbstream_put(stream);
++		return -EBUSY;
+ 	}
++	sdev->stream = stream;
++	in_hopid = sdev->in_hopid;
++	out_hopid = sdev->out_hopid;
++
++	/*
++	 * If there is no existing configuration (or automatic configuration
++	 * is being used), check if the other side has configuration for this
++	 * and use it. Keep the requested values local until each exact
++	 * allocation succeeds so the fields always describe owned HopIDs.
++	 */
++	if (in_hopid <= 0 && out_hopid <= 0)
++		service_get_hopids(stream->svc, name, &in_hopid, &out_hopid);
++	sdev->in_hopid = 0;
++	sdev->out_hopid = 0;
+ 
+-	service_update_properties(stream->svc, name, sdev->in_hopid,
+-				  sdev->out_hopid);
++	if (in_hopid) {
++		ret = tbstream_dev_alloc_in_hopid(sdev, in_hopid);
++		if (ret)
++			goto err_release;
++		in_allocated = true;
++	}
++	if (out_hopid) {
++		ret = tbstream_dev_alloc_out_hopid(sdev, out_hopid);
++		if (ret)
++			goto err_release;
++		out_allocated = true;
++	}
++
++	ret = service_update_properties(stream->svc, name, sdev->in_hopid,
++					sdev->out_hopid);
++	if (ret)
++		goto err_release;
++	mutex_unlock(&sdev->lock);
+ 	tb_service_properties_changed(stream->svc);
+ 
+ 	/* Notify any openerers that the stream is now attached */
+ 	wake_up_interruptible(&sdev->wait);
++	return 0;
++
++err_release:
++	xd = tb_service_parent(stream->svc);
++	if (out_allocated)
++		tb_xdomain_release_out_hopid(xd, sdev->out_hopid);
++	if (in_allocated)
++		tb_xdomain_release_in_hopid(xd, sdev->in_hopid);
++	sdev->in_hopid = 0;
++	sdev->out_hopid = 0;
++	service_update_properties(stream->svc, name, 0, 0);
++	mutex_unlock(&sdev->lock);
++
++	tb_service_properties_changed(stream->svc);
++	wake_up_interruptible(&sdev->wait);
++	return ret;
+ }
+ 
+ static void tbstream_dev_detach_stream(struct tbstream_dev *sdev)
+@@ -1920,10 +1983,18 @@ tbstream_dev_make_group(struct config_group *group, const char *name)
+ 
+ 	config_group_init_type_name(&sdev->group, name, &tbstream_dev_type);
+ 
+-	scoped_guard(mutex, &sg->lock)
+-		list_add_tail(&sdev->list, &sg->dev_list);
+-
+-	tbstream_dev_attach_stream(sdev, sg);
++	mutex_lock(&sg->lock);
++	list_add_tail(&sdev->list, &sg->dev_list);
++	ret = tbstream_dev_attach_stream(sdev, sg);
++	if (ret) {
++		tbstream_dev_detach_stream(sdev);
++		list_del(&sdev->list);
++		mutex_unlock(&sg->lock);
++		/* Calls tbstream_dev_put() */
++		config_group_put(&sdev->group);
++		return ERR_PTR(ret);
++	}
++	mutex_unlock(&sg->lock);
+ 
+ 	sdev->misc.name = kasprintf(GFP_KERNEL, "tbstream%d", index);
+ 	sdev->misc.minor = MISC_DYNAMIC_MINOR;
+@@ -1931,13 +2002,15 @@ tbstream_dev_make_group(struct config_group *group, const char *name)
+ 
+ 	ret = misc_register(&sdev->misc);
+ 	if (ret) {
++		mutex_lock(&sg->lock);
+ 		tbstream_dev_detach_stream(sdev);
+-		scoped_guard(mutex, &sg->lock)
+-			list_del(&sdev->list);
++		list_del(&sdev->list);
++		mutex_unlock(&sg->lock);
+ 		/* Calls tbstream_dev_put() */
+ 		config_group_put(&sdev->group);
+ 		return ERR_PTR(ret);
+ 	}
++	sdev->misc_registered = true;
+ 
+ 	return &sdev->group;
+ }
+@@ -2047,6 +2120,7 @@ static void tbstream_group_attach_stream(struct tbstream *stream)
+ {
+ 	struct tbstream_group *sg;
+ 	struct tbstream_dev *sdev;
++	int ret;
+ 
+ 	sg = tbstream_group_find(stream);
+ 	if (!sg)
+@@ -2064,7 +2138,11 @@ static void tbstream_group_attach_stream(struct tbstream *stream)
+ 	 */
+ 	list_for_each_entry(sdev, &sg->dev_list, list) {
+ 		tbstream_dev_get(sdev);
+-		tbstream_dev_attach_stream(sdev, sg);
++		ret = tbstream_dev_attach_stream(sdev, sg);
++		if (ret)
++			dev_warn(&stream->svc->dev,
++				 "failed to attach stream device %s: %d\n",
++				 config_item_name(&sdev->group.cg_item), ret);
+ 		tbstream_dev_put(sdev);
+ 	}
+ 
+-- 
+2.50.1 (Apple Git-155)
+

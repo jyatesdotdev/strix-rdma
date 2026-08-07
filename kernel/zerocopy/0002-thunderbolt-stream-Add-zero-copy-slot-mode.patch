@@ -1,0 +1,641 @@
+From 53914f3bbddcd82c323c3ef68e65cd83f18fb48c Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Sun, 2 Aug 2026 19:17:07 -0700
+Subject: [PATCH 2/2] thunderbolt: stream: Add zero-copy slot mode
+
+Expose the stream device's fixed DMA-mapped frame pools directly to
+userspace: TBSTREAM_ZC_ENABLE switches an open stream into zero-copy
+mode, mmap() maps the TX and RX pools, and SUBMIT_TX/POST_RX/REAP
+ioctls move whole multi-frame messages by pool index without any
+kernel payload copies.
+
+Messages are delimited with a new TBSTREAM_DATA_MORE PDF on all but
+the final frame, and non-final TX frames are submitted with
+RING_FRAME_NO_INTERRUPT so a message completes with a single TX
+interrupt. RX completion reporting is per-message as well: userspace
+is woken once per message instead of once per frame.
+
+Regular read/write returns -EBUSY while zero-copy mode is active.
+Both ends of the tunnel must use zero-copy mode; this is negotiated
+by the application out of band.
+---
+ drivers/thunderbolt/stream.c            | 378 +++++++++++++++++++++++-
+ include/uapi/linux/thunderbolt-stream.h | 121 ++++++++
+ 2 files changed, 498 insertions(+), 1 deletion(-)
+ create mode 100644 include/uapi/linux/thunderbolt-stream.h
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index c1f5c555..52c8e5d9 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -13,9 +13,13 @@
+ #include <linux/file.h>
+ #include <linux/fs.h>
+ #include <linux/idr.h>
++#include <linux/kfifo.h>
+ #include <linux/miscdevice.h>
++#include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/thunderbolt-stream.h>
+ #include <linux/poll.h>
+ #include <linux/sizes.h>
+ #include <linux/thunderbolt.h>
+@@ -80,11 +84,14 @@
+  * @TBSTREAM_FRAME_START: PDF of the start of the frame
+  * @TBSTREAM_DATA: PDF of the DATA frame
+  * @TBSTREAM_CLOSE: PDF of the CLOSE frame
++ * @TBSTREAM_DATA_MORE: PDF of a DATA frame that is continued by the
++ *			next frame of the same zero-copy message
+  */
+ enum tbstream_frame_pdf {
+ 	TBSTREAM_FRAME_START = 1,
+ 	TBSTREAM_DATA,
+ 	TBSTREAM_CLOSE,
++	TBSTREAM_DATA_MORE,
+ };
+ 
+ /**
+@@ -150,6 +157,13 @@ struct tbstream_dev {
+ 	int users;
+ 	bool closed;
+ 	bool removed;
++	bool zc;
++	u32 zc_tx_pending;
++	u32 zc_tx_done;
++	u32 zc_rx_msg_frames;
++	u32 zc_rx_msg_bytes;
++	spinlock_t zc_lock;
++	DECLARE_KFIFO_PTR(zc_events, struct tbstream_zc_event);
+ 	wait_queue_head_t wait;
+ 	struct mutex lock;
+ 	struct tbstream_ring tx_ring;
+@@ -339,6 +353,46 @@ static inline bool tbstream_dev_closed(const struct tbstream_dev *sdev)
+ 	return sdev->closed;
+ }
+ 
++static void
++tbstream_dev_zc_rx(struct tbstream_dev *sdev, struct tbstream_frame *sf)
++{
++	struct device *dma_dev = tb_ring_dma_device(sdev->rx_ring.ring);
++	size_t size = tb_ring_size(sdev->rx_ring.ring);
++	unsigned long flags;
++	bool wake = false;
++
++	dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
++				tb_ring_frame_size(&sf->frame),
++				DMA_FROM_DEVICE);
++
++	spin_lock_irqsave(&sdev->zc_lock, flags);
++	sdev->zc_rx_msg_frames++;
++	sdev->zc_rx_msg_bytes += tb_ring_frame_size(&sf->frame);
++
++	if (sf->frame.eof != TBSTREAM_DATA_MORE) {
++		struct tbstream_zc_event ev = {
++			.nframes = sdev->zc_rx_msg_frames,
++			.bytes = sdev->zc_rx_msg_bytes,
++		};
++
++		ev.first = (sdev->rx_ring.prod - sdev->zc_rx_msg_frames) % size;
++		if (sf->frame.eof == TBSTREAM_CLOSE) {
++			ev.type = TBSTREAM_ZC_EV_CLOSE;
++			sdev->closed = true;
++		} else {
++			ev.type = TBSTREAM_ZC_EV_RX;
++		}
++		sdev->zc_rx_msg_frames = 0;
++		sdev->zc_rx_msg_bytes = 0;
++		kfifo_put(&sdev->zc_events, ev);
++		wake = true;
++	}
++	spin_unlock_irqrestore(&sdev->zc_lock, flags);
++
++	if (wake)
++		wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
++}
++
+ static void
+ tbstream_dev_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 			 bool canceled)
+@@ -356,6 +410,8 @@ tbstream_dev_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 		pr_warn("RX CRC error\n");
+ 	else if (sf->frame.flags & RING_DESC_BUFFER_OVERRUN)
+ 		pr_warn("RX buffer overrun\n");
++	else if (READ_ONCE(sdev->zc))
++		tbstream_dev_zc_rx(sdev, sf);
+ 	else
+ 		wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
+ }
+@@ -449,6 +505,34 @@ tbstream_dev_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 		return;
+ 
+ 	sdev->tx_ring.prod++;
++
++	if (READ_ONCE(sdev->zc)) {
++		unsigned long flags;
++		bool wake = false;
++
++		spin_lock_irqsave(&sdev->zc_lock, flags);
++		sdev->zc_tx_pending++;
++		if (sf->frame.eof == TBSTREAM_DATA) {
++			struct tbstream_zc_event ev = {
++				.type = TBSTREAM_ZC_EV_TX_DONE,
++				.nframes = sdev->zc_tx_pending,
++			};
++			size_t size = tb_ring_size(ring);
++
++			sdev->zc_tx_done += sdev->zc_tx_pending;
++			ev.first = (sdev->zc_tx_done - sdev->zc_tx_pending) % size;
++			sdev->zc_tx_pending = 0;
++			kfifo_put(&sdev->zc_events, ev);
++			wake = true;
++		}
++		spin_unlock_irqrestore(&sdev->zc_lock, flags);
++
++		if (wake)
++			wake_up_interruptible_poll(&sdev->wait,
++					EPOLLIN | EPOLLOUT | EPOLLWRNORM);
++		return;
++	}
++
+ 	if (sf->frame.eof == TBSTREAM_DATA)
+ 		wake_up_interruptible_poll(&sdev->wait, EPOLLOUT | EPOLLWRNORM);
+ }
+@@ -508,6 +592,7 @@ tbstream_dev_alloc_tx(struct tbstream_dev *sdev, enum tbstream_frame_pdf pdf,
+ 	sf = &sdev->tx_ring.frames[index];
+ 	sf->frame.size = size < TB_MAX_FRAME_SIZE ? size : 0;
+ 	sf->frame.eof = pdf;
++	sf->frame.flags = 0;
+ 
+ 	dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy, size,
+ 				DMA_TO_DEVICE);
+@@ -563,7 +648,8 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 
+ 	e2e_tx_hop = ring->hop;
+ 	sof_mask = BIT(TBSTREAM_FRAME_START);
+-	eof_mask = BIT(TBSTREAM_DATA) | BIT(TBSTREAM_CLOSE);
++	eof_mask = BIT(TBSTREAM_DATA) | BIT(TBSTREAM_CLOSE) |
++		   BIT(TBSTREAM_DATA_MORE);
+ 
+ 	ring = tb_ring_alloc_rx(xd->tb->nhi, -1, sdev->ring_size,
+ 				RING_FLAG_FRAME | RING_FLAG_E2E, e2e_tx_hop,
+@@ -629,6 +715,11 @@ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ 	tbstream_ring_free(&sdev->tx_ring);
+ 	tb_ring_free(sdev->tx_ring.ring);
+ 	sdev->tx_ring.ring = NULL;
++
++	if (sdev->zc) {
++		sdev->zc = false;
++		kfifo_free(&sdev->zc_events);
++	}
+ }
+ 
+ static ssize_t
+@@ -642,6 +733,8 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 	ret = tbstream_dev_valid(sdev);
+ 	if (ret)
+ 		return ret;
++	if (READ_ONCE(sdev->zc))
++		return -EBUSY;
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock))
+ 		return -ERESTARTSYS;
+@@ -734,6 +827,8 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 	ret = tbstream_dev_valid(sdev);
+ 	if (ret)
+ 		return ret;
++	if (READ_ONCE(sdev->zc))
++		return -EBUSY;
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock))
+ 		return -ERESTARTSYS;
+@@ -797,6 +892,11 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 	guard(mutex)(&sdev->lock);
+ 	if (tbstream_dev_valid(sdev) != 0) {
+ 		mask |= EPOLLHUP | EPOLLERR;
++	} else if (sdev->zc) {
++		if (!kfifo_is_empty(&sdev->zc_events))
++			mask |= EPOLLIN | EPOLLRDNORM;
++		if (tbstream_ring_available(&sdev->tx_ring))
++			mask |= EPOLLOUT | EPOLLWRNORM;
+ 	} else {
+ 		if (tbstream_ring_available(&sdev->tx_ring))
+ 			mask |= EPOLLOUT | EPOLLWRNORM;
+@@ -806,6 +906,279 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 	return mask;
+ }
+ 
++static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
++{
++	int ret;
++
++	if (PAGE_SIZE != TB_MAX_FRAME_SIZE)
++		return -EOPNOTSUPP;
++
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++
++	ret = tbstream_dev_valid(sdev);
++	if (ret)
++		goto out_unlock;
++
++	if (!sdev->users || !sdev->tx_ring.ring) {
++		ret = -ENXIO;
++		goto out_unlock;
++	}
++	if (sdev->zc)
++		goto out_unlock;
++
++	spin_lock_init(&sdev->zc_lock);
++	sdev->zc_tx_pending = 0;
++	sdev->zc_tx_done = 0;
++	sdev->zc_rx_msg_frames = 0;
++	sdev->zc_rx_msg_bytes = 0;
++
++	ret = kfifo_alloc(&sdev->zc_events,
++			  tb_ring_size(sdev->rx_ring.ring) * 2, GFP_KERNEL);
++	if (ret)
++		goto out_unlock;
++
++	/* Ring callbacks only touch the zc state once this is set */
++	smp_wmb();
++	WRITE_ONCE(sdev->zc, true);
++
++out_unlock:
++	mutex_unlock(&sdev->lock);
++	return ret;
++}
++
++static int tbstream_dev_zc_get_info(struct tbstream_dev *sdev,
++				    void __user *arg)
++{
++	struct tbstream_zc_info info = {};
++
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++
++	if (!sdev->zc || !sdev->tx_ring.ring) {
++		mutex_unlock(&sdev->lock);
++		return -EINVAL;
++	}
++
++	info.ring_size = tb_ring_size(sdev->tx_ring.ring);
++	info.frame_size = TB_MAX_FRAME_SIZE;
++	info.tx_pool_offset = 0;
++	info.rx_pool_offset = (u64)info.ring_size * TB_MAX_FRAME_SIZE;
++
++	mutex_unlock(&sdev->lock);
++
++	return copy_to_user(arg, &info, sizeof(info)) ? -EFAULT : 0;
++}
++
++static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
++				     void __user *arg)
++{
++	struct tbstream_zc_tx tx;
++	struct device *dma_dev;
++	size_t size;
++	u32 i;
++	int ret;
++
++	if (copy_from_user(&tx, arg, sizeof(tx)))
++		return -EFAULT;
++	if (!tx.nframes || !tx.last_len || tx.last_len > TB_MAX_FRAME_SIZE ||
++	    tx.reserved)
++		return -EINVAL;
++
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++
++	ret = tbstream_dev_valid(sdev);
++	if (ret)
++		goto out_unlock;
++	if (!sdev->zc) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	size = tb_ring_size(sdev->tx_ring.ring);
++	if (tx.nframes >= size) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++	if (tx.nframes > sdev->tx_ring.prod - sdev->tx_ring.cons) {
++		ret = -ENOBUFS;
++		goto out_unlock;
++	}
++
++	dma_dev = tb_ring_dma_device(sdev->tx_ring.ring);
++	tx.first = sdev->tx_ring.cons % size;
++
++	for (i = 0; i < tx.nframes; i++) {
++		int index = sdev->tx_ring.cons % size;
++		struct tbstream_frame *sf = &sdev->tx_ring.frames[index];
++		bool last = i == tx.nframes - 1;
++		size_t len = last ? tx.last_len : TB_MAX_FRAME_SIZE;
++
++		sdev->tx_ring.cons++;
++
++		sf->frame.size = len < TB_MAX_FRAME_SIZE ? len : 0;
++		sf->frame.eof = last ? TBSTREAM_DATA : TBSTREAM_DATA_MORE;
++		sf->frame.flags = last ? 0 : RING_FRAME_NO_INTERRUPT;
++
++		dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy, len,
++					   DMA_TO_DEVICE);
++		ret = tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
++		if (ret)
++			goto out_unlock;
++	}
++
++	mutex_unlock(&sdev->lock);
++
++	return copy_to_user(arg, &tx, sizeof(tx)) ? -EFAULT : 0;
++
++out_unlock:
++	mutex_unlock(&sdev->lock);
++	return ret;
++}
++
++static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev,
++				   void __user *arg)
++{
++	u32 nframes;
++	int ret;
++
++	if (get_user(nframes, (u32 __user *)arg))
++		return -EFAULT;
++	if (!nframes)
++		return -EINVAL;
++
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++
++	ret = tbstream_dev_valid(sdev);
++	if (ret)
++		goto out_unlock;
++	if (!sdev->zc || nframes > sdev->rx_ring.prod - sdev->rx_ring.cons) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	while (nframes--) {
++		ret = tbstream_dev_consume_rx(sdev);
++		if (ret)
++			break;
++	}
++
++out_unlock:
++	mutex_unlock(&sdev->lock);
++	return ret;
++}
++
++static int tbstream_dev_zc_reap(struct tbstream_dev *sdev, struct file *file,
++				void __user *arg)
++{
++	struct tbstream_zc_event __user *uevents;
++	struct tbstream_zc_reap reap;
++	struct tbstream_zc_event ev;
++	unsigned int n = 0;
++	int ret;
++
++	if (copy_from_user(&reap, arg, sizeof(reap)))
++		return -EFAULT;
++	if (!reap.max || (reap.flags & ~TBSTREAM_ZC_REAP_NONBLOCK))
++		return -EINVAL;
++	if (!READ_ONCE(sdev->zc))
++		return -EINVAL;
++
++	uevents = u64_to_user_ptr(reap.events);
++
++	while (kfifo_is_empty(&sdev->zc_events)) {
++		if ((reap.flags & TBSTREAM_ZC_REAP_NONBLOCK) ||
++		    (file->f_flags & O_NONBLOCK))
++			return -EAGAIN;
++
++		ret = wait_event_interruptible(sdev->wait,
++				!kfifo_is_empty(&sdev->zc_events) ||
++				tbstream_dev_valid(sdev) != 0 ||
++				tbstream_dev_removed(sdev));
++		if (ret)
++			return ret;
++
++		if (tbstream_dev_valid(sdev) || tbstream_dev_removed(sdev))
++			return -ENXIO;
++	}
++
++	while (n < reap.max &&
++	       kfifo_out_spinlocked(&sdev->zc_events, &ev, 1, &sdev->zc_lock)) {
++		if (copy_to_user(&uevents[n], &ev, sizeof(ev)))
++			return n ? n : -EFAULT;
++		n++;
++	}
++
++	return n;
++}
++
++static long
++tbstream_dev_fops_ioctl(struct file *file, unsigned int cmd,
++			unsigned long arg)
++{
++	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	void __user *uarg = (void __user *)arg;
++
++	switch (cmd) {
++	case TBSTREAM_ZC_ENABLE:
++		return tbstream_dev_zc_enable(sdev);
++	case TBSTREAM_ZC_GET_INFO:
++		return tbstream_dev_zc_get_info(sdev, uarg);
++	case TBSTREAM_ZC_SUBMIT_TX:
++		return tbstream_dev_zc_submit_tx(sdev, uarg);
++	case TBSTREAM_ZC_POST_RX:
++		return tbstream_dev_zc_post_rx(sdev, uarg);
++	case TBSTREAM_ZC_REAP:
++		return tbstream_dev_zc_reap(sdev, file, uarg);
++	default:
++		return -ENOTTY;
++	}
++}
++
++static int tbstream_dev_fops_mmap(struct file *file,
++				  struct vm_area_struct *vma)
++{
++	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	size_t size, ring_size, i;
++	unsigned long addr;
++	int ret = 0;
++
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++
++	if (!sdev->zc || !sdev->tx_ring.ring) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	ring_size = tb_ring_size(sdev->tx_ring.ring);
++	size = vma->vm_end - vma->vm_start;
++	if (vma->vm_pgoff || size != 2 * ring_size * PAGE_SIZE) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
++
++	addr = vma->vm_start;
++	for (i = 0; i < ring_size; i++, addr += PAGE_SIZE) {
++		ret = vm_insert_page(vma, addr, sdev->tx_ring.frames[i].page);
++		if (ret)
++			goto out_unlock;
++	}
++	for (i = 0; i < ring_size; i++, addr += PAGE_SIZE) {
++		ret = vm_insert_page(vma, addr, sdev->rx_ring.frames[i].page);
++		if (ret)
++			goto out_unlock;
++	}
++
++out_unlock:
++	mutex_unlock(&sdev->lock);
++	return ret;
++}
++
+ static int tbstream_dev_fops_open(struct inode *inode, struct file *file)
+ {
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+@@ -892,6 +1265,9 @@ static const struct file_operations tbstream_dev_fops = {
+ 	.read_iter = tbstream_dev_fops_read_iter,
+ 	.write_iter = tbstream_dev_fops_write_iter,
+ 	.poll = tbstream_dev_fops_poll,
++	.unlocked_ioctl = tbstream_dev_fops_ioctl,
++	.compat_ioctl = compat_ptr_ioctl,
++	.mmap = tbstream_dev_fops_mmap,
+ 	.open = tbstream_dev_fops_open,
+ 	.release = tbstream_dev_fops_release,
+ };
+diff --git a/include/uapi/linux/thunderbolt-stream.h b/include/uapi/linux/thunderbolt-stream.h
+new file mode 100644
+index 00000000..26df257a
+--- /dev/null
++++ b/include/uapi/linux/thunderbolt-stream.h
+@@ -0,0 +1,121 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Zero-copy slot interface for Thunderbolt/USB4 stream devices
++ *
++ * A stream device switched into zero-copy mode exposes its fixed,
++ * DMA-mapped TX and RX frame pools directly to userspace through
++ * mmap(). Messages are submitted and reaped by frame-pool index, so
++ * the payload is never copied by the kernel.
++ *
++ * Frame pools are rings of ring_size frames of TBSTREAM_ZC_FRAME_SIZE
++ * bytes each, consumed strictly in order:
++ *
++ *  - TX: userspace writes payload into the next free frames (its own
++ *    cursor, starting at index 0 and wrapping at ring_size) and calls
++ *    TBSTREAM_ZC_SUBMIT_TX. Frames become free again when the matching
++ *    TBSTREAM_ZC_EV_TX_DONE event is reaped. At most ring_size - 1
++ *    frames may be in flight.
++ *  - RX: all frames start posted to the hardware. A received message
++ *    is reported as a TBSTREAM_ZC_EV_RX event covering nframes frames
++ *    starting at index first. After consuming the payload userspace
++ *    returns the frames with TBSTREAM_ZC_POST_RX. Frames are reposted
++ *    in consumption order.
++ *
++ * A message spans one or more frames; every frame except the last
++ * carries a full TBSTREAM_ZC_FRAME_SIZE bytes of payload. Both sides
++ * of the tunnel must be in zero-copy mode; this is negotiated out of
++ * band by the application.
++ */
++
++#ifndef _UAPI_LINUX_THUNDERBOLT_STREAM_H
++#define _UAPI_LINUX_THUNDERBOLT_STREAM_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#define TBSTREAM_ZC_FRAME_SIZE	4096
++
++/**
++ * struct tbstream_zc_info - Geometry of the zero-copy pools
++ * @ring_size: Number of frames in each pool
++ * @frame_size: Bytes per frame (%TBSTREAM_ZC_FRAME_SIZE)
++ * @tx_pool_offset: mmap() file offset of the first TX frame
++ * @rx_pool_offset: mmap() file offset of the first RX frame
++ *
++ * The whole mapping is 2 * @ring_size * @frame_size bytes starting at
++ * file offset 0.
++ */
++struct tbstream_zc_info {
++	__u32 ring_size;
++	__u32 frame_size;
++	__u64 tx_pool_offset;
++	__u64 rx_pool_offset;
++};
++
++/**
++ * enum tbstream_zc_event_type - Completion event types
++ * @TBSTREAM_ZC_EV_RX: Message received into the RX pool
++ * @TBSTREAM_ZC_EV_TX_DONE: Previously submitted message left the ring
++ * @TBSTREAM_ZC_EV_CLOSE: Peer closed the stream
++ */
++enum tbstream_zc_event_type {
++	TBSTREAM_ZC_EV_RX = 0,
++	TBSTREAM_ZC_EV_TX_DONE = 1,
++	TBSTREAM_ZC_EV_CLOSE = 2,
++};
++
++/**
++ * struct tbstream_zc_event - One completion event
++ * @type: One of &enum tbstream_zc_event_type
++ * @first: Pool index of the first frame of the message
++ * @nframes: Number of frames the message occupies
++ * @bytes: Total payload bytes (RX only, 0 otherwise)
++ */
++struct tbstream_zc_event {
++	__u32 type;
++	__u32 first;
++	__u32 nframes;
++	__u32 bytes;
++};
++
++/**
++ * struct tbstream_zc_tx - TBSTREAM_ZC_SUBMIT_TX argument
++ * @nframes: Frames making up the message (>= 1)
++ * @last_len: Payload bytes in the final frame (1..frame_size)
++ * @first: Filled by the kernel: pool index of the first frame used
++ * @reserved: Must be 0
++ */
++struct tbstream_zc_tx {
++	__u32 nframes;
++	__u32 last_len;
++	__u32 first;
++	__u32 reserved;
++};
++
++/**
++ * struct tbstream_zc_reap - TBSTREAM_ZC_REAP argument
++ * @max: Capacity of the @events array
++ * @flags: %TBSTREAM_ZC_REAP_NONBLOCK or 0
++ * @events: Userspace pointer to struct tbstream_zc_event[]
++ *
++ * Blocks until at least one event is available unless
++ * %TBSTREAM_ZC_REAP_NONBLOCK is set or the file is O_NONBLOCK.
++ * Returns the number of events written.
++ */
++struct tbstream_zc_reap {
++	__u32 max;
++	__u32 flags;
++	__u64 events;
++};
++
++#define TBSTREAM_ZC_REAP_NONBLOCK	0x1
++
++#define TBSTREAM_ZC_MAGIC	0xb4
++
++#define TBSTREAM_ZC_ENABLE	_IO(TBSTREAM_ZC_MAGIC, 0x00)
++#define TBSTREAM_ZC_GET_INFO	_IOR(TBSTREAM_ZC_MAGIC, 0x01, struct tbstream_zc_info)
++#define TBSTREAM_ZC_SUBMIT_TX	_IOWR(TBSTREAM_ZC_MAGIC, 0x02, struct tbstream_zc_tx)
++#define TBSTREAM_ZC_POST_RX	_IOW(TBSTREAM_ZC_MAGIC, 0x03, __u32)
++#define TBSTREAM_ZC_REAP	_IOWR(TBSTREAM_ZC_MAGIC, 0x04, struct tbstream_zc_reap)
++
++#endif /* _UAPI_LINUX_THUNDERBOLT_STREAM_H */

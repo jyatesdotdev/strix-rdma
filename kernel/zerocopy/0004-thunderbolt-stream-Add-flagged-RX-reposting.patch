@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <jonjryjo@gmail.com>
+Date: Tue, 4 Aug 2026 13:00:00 -0700
+Subject: [PATCH] thunderbolt: stream: Add flagged RX reposting
+
+Zero-copy userspace consumes complete multi-frame messages, but RX frames
+are normally reposted with an interrupt on every descriptor. Add an opt-in
+repost operation that suppresses interrupts on every frame except the final
+one in the returned batch. Fixed-size message streams can thereby wake once
+per message rather than once per 4 KiB frame.
+
+Keep the original POST_RX ioctl unchanged for compatibility and for streams
+whose message geometry varies. Such streams cannot safely predict which
+reposted descriptor will end a future message.
+
+Signed-off-by: Jonathan Yates <jonjryjo@gmail.com>
+---
+ drivers/thunderbolt/stream.c            | 29 +++++++++++++++++++++--------
+ include/uapi/linux/thunderbolt-stream.h | 19 +++++++++++++++++++
+ 2 files changed, 40 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index d54a0cd15563..7238fd5c5f13 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -1037,15 +1037,13 @@ out_unlock:
+ 	return ret;
+ }
+ 
+-static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev,
+-				   void __user *arg)
++static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
++				   u32 flags)
+ {
+-	u32 nframes;
++	u32 i;
+ 	int ret;
+ 
+-	if (get_user(nframes, (u32 __user *)arg))
+-		return -EFAULT;
+-	if (!nframes)
++	if (!nframes || (flags & ~TBSTREAM_ZC_RX_F_INTERRUPT_LAST))
+ 		return -EINVAL;
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock))
+@@ -1060,7 +1058,14 @@ static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
+ 		goto out_unlock;
+ 	}
+ 
+-	while (nframes--) {
++	for (i = 0; i < nframes; i++) {
++		struct tbstream_frame *sf;
++		int index = sdev->rx_ring.cons %
++			    tb_ring_size(sdev->rx_ring.ring);
++
++		sf = &sdev->rx_ring.frames[index];
++		sf->frame.flags = flags & TBSTREAM_ZC_RX_F_INTERRUPT_LAST &&
++				  i != nframes - 1 ? RING_FRAME_NO_INTERRUPT : 0;
+ 		ret = tbstream_dev_consume_rx(sdev);
+ 		if (ret)
+ 			break;
+@@ -1120,6 +1125,8 @@ tbstream_dev_fops_ioctl(struct file *file, unsigned int cmd,
+ 			unsigned long arg)
+ {
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	struct tbstream_zc_rx rx;
++	u32 nframes;
+ 	void __user *uarg = (void __user *)arg;
+ 
+ 	switch (cmd) {
+@@ -1129,9 +1131,15 @@ tbstream_dev_fops_ioctl(struct file *file, unsigned int cmd,
+ 	case TBSTREAM_ZC_SUBMIT_TX:
+ 		return tbstream_dev_zc_submit_tx(sdev, uarg);
+ 	case TBSTREAM_ZC_POST_RX:
+-		return tbstream_dev_zc_post_rx(sdev, uarg);
++		if (get_user(nframes, (u32 __user *)uarg))
++			return -EFAULT;
++		return tbstream_dev_zc_post_rx(sdev, nframes, 0);
+ 	case TBSTREAM_ZC_REAP:
+ 		return tbstream_dev_zc_reap(sdev, file, uarg);
++	case TBSTREAM_ZC_POST_RX_FLAGS:
++		if (copy_from_user(&rx, uarg, sizeof(rx)))
++			return -EFAULT;
++		return tbstream_dev_zc_post_rx(sdev, rx.nframes, rx.flags);
+ 	default:
+ 		return -ENOTTY;
+ 	}
+diff --git a/include/uapi/linux/thunderbolt-stream.h b/include/uapi/linux/thunderbolt-stream.h
+index 2d641d4001c7..d623451c6284 100644
+--- a/include/uapi/linux/thunderbolt-stream.h
++++ b/include/uapi/linux/thunderbolt-stream.h
+@@ -99,6 +99,23 @@ struct tbstream_zc_reap {
+ 
+ #define TBSTREAM_ZC_REAP_NONBLOCK	0x1
+ 
++/**
++ * struct tbstream_zc_rx - Flagged RX repost request
++ * @nframes: Frames to return to the RX ring
++ * @flags: %TBSTREAM_ZC_RX_F_INTERRUPT_LAST or 0
++ *
++ * INTERRUPT_LAST is intended for fixed-size message streams. It suppresses
++ * interrupts on every reposted frame except the last, allowing the NHI to
++ * complete a whole message before waking the CPU. Applications with variable
++ * message geometry should use the legacy unflagged POST_RX operation.
++ */
++struct tbstream_zc_rx {
++	__u32 nframes;
++	__u32 flags;
++};
++
++#define TBSTREAM_ZC_RX_F_INTERRUPT_LAST	0x1
++
+ #define TBSTREAM_ZC_MAGIC	0xb4
+ 
+ #define TBSTREAM_ZC_ENABLE	_IO(TBSTREAM_ZC_MAGIC, 0x00)
+@@ -107,5 +124,7 @@ struct tbstream_zc_reap {
+ #define TBSTREAM_ZC_SUBMIT_TX	_IOWR(TBSTREAM_ZC_MAGIC, 0x02, struct tbstream_zc_tx)
+ #define TBSTREAM_ZC_POST_RX	_IOW(TBSTREAM_ZC_MAGIC, 0x03, __u32)
+ #define TBSTREAM_ZC_REAP	_IOWR(TBSTREAM_ZC_MAGIC, 0x04, struct tbstream_zc_reap)
++#define TBSTREAM_ZC_POST_RX_FLAGS \
++	_IOW(TBSTREAM_ZC_MAGIC, 0x05, struct tbstream_zc_rx)
+ 
+ #endif /* _UAPI_LINUX_THUNDERBOLT_STREAM_H */
+-- 
+2.50.1
