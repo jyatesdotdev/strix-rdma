@@ -1,0 +1,7 @@
+pair,order,profile,transport,requests,completion_tokens,wall_seconds,completion_tokens_per_second,mean_service_request_seconds,response_sha256,status
+1,1,off,tcp-v3,10,800,71.741,11.15,7.1484,83d8ce7d879f52d1e285fc5695d29eb19c72ea083b1e48d89361f60491b088c6,PASS
+1,2,on,tcp-v3,10,800,75.721,10.57,7.1468,83d8ce7d879f52d1e285fc5695d29eb19c72ea083b1e48d89361f60491b088c6,PASS
+2,1,on,tcp-v3,10,800,77.042,10.38,7.1562,83d8ce7d879f52d1e285fc5695d29eb19c72ea083b1e48d89361f60491b088c6,PASS
+2,2,off,tcp-v3,10,800,73.766,10.85,7.1480,83d8ce7d879f52d1e285fc5695d29eb19c72ea083b1e48d89361f60491b088c6,PASS
+nhi-staged,1,on,nhi-mapped-staged,2,138,13.088,10.54,6.4565,,PASS
+nhi-direct,1,on,nhi-mapped-direct-tx-fast,2,138,13.028,10.59,6.4525,,PASS
