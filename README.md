@@ -1,5 +1,7 @@
 # strix-rdma
 
+[![CI](https://github.com/jyatesdotdev/strix-rdma/actions/workflows/ci.yml/badge.svg)](https://github.com/jyatesdotdev/strix-rdma/actions/workflows/ci.yml)
+
 Experimental hardware-assisted DS4 tensor transport between two Strix Halo
 systems over Thunderbolt/USB4, built on the Linux `thunderbolt-stream`
 (USB4STREAM) driver and the USB4 NHI DMA rings. The NHI backend is a research
@@ -18,6 +20,19 @@ The full design and rationale live in [docs/PLAN.md](docs/PLAN.md)
   GPU → DMA page → cable → DMA page → GPU.
 - This is *not* one-sided RDMA; the NHI has no rkeys/QPs/atomics and they
   cannot be synthesized in a driver.
+
+## Quick start
+
+```sh
+make            # build the userspace tools (pingpong, ds4-shape)
+make check      # run the no-hardware test suite
+make rocm       # ROCm/HIP tools (needs hipcc)
+```
+
+The full path from clone to a measured stream between two hosts — kernel
+backport, device access policy, stream bring-up, smoke tests — is
+[docs/INSTALL.md](docs/INSTALL.md). Host deployment of the managed stream
+lifecycle is `sudo make install-lifecycle ROLE=allocator|follower`.
 
 ## Repository layout
 
