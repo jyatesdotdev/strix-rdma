@@ -96,3 +96,9 @@ the hosts.
    `--dist-transport auto` without an NHI device while longer soak and active
    peer-reboot testing continue. See
    `bench/results/2026-08-05-nhi-msix-rx-prime-fix.md`.
+
+## License
+
+GPL-2.0 (see [LICENSE](LICENSE)). The `kernel/` patch series is derivative of
+the Linux kernel and is necessarily GPL-2.0; the userspace tools and docs are
+released under the same terms for consistency.
