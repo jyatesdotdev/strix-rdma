@@ -1,17 +1,17 @@
 # Hardware-assisted DS4 transport over Thunderbolt/USB4
 
-> **Current outcome (2026-08-06):** The NHI design remains experimental, but
-> zero-copy patches 11 and 12 repair the reproduced lost-notification and
-> fresh-open failures. The exact asymmetric gate now passes 2,880 exchanges
-> across 27 sessions, and required-NHI CPU-copy and mapped full-model runs pass.
-> Production still selects protocol-v3 TCP because the controlled NHI cohort
-> shows no throughput gain. In-process ROCm events now account for 99.66% of
-> the two-host evaluation span and identify routed MoE, attention output, and
-> QKV preparation as the dominant model work. Direct mapped logits add
-> 0.065 ms to the worker output head, exceeding the lease-fence work they
-> remove. Extended soak/active peer-reboot qualification remains. See
-> `../bench/results/2026-08-05-nhi-msix-rx-prime-fix.md` and
-> `../bench/results/2026-08-06-ds4-rocm-event-profile.md`.
+> **Current outcome (2026-08-14):** The page-backed NHI design remains
+> experimental. Zero-copy patches 11 and 12 repair the reproduced
+> lost-notification and fresh-open failures; the exact asymmetric gate passes
+> 2,880 exchanges across 27 sessions, and required-NHI CPU-copy and mapped
+> full-model runs pass. Production still selects protocol-v3 TCP because the
+> controlled NHI cohort shows no throughput gain. Direct mapped logits add
+> 0.065 ms to the worker output head. Native `hipMalloc` DMA-BUF export is now
+> proven on Strix Halo and is the remaining native-allocation experiment, but
+> actual NHI import and a portable RX system-acquire contract are not proven.
+> See `../bench/results/2026-08-05-nhi-msix-rx-prime-fix.md`,
+> `../bench/results/2026-08-06-ds4-rocm-event-profile.md`, and
+> `GPU_TO_GPU_FEASIBILITY.md`.
 
 ## Goal
 
@@ -27,12 +27,11 @@ would retain the network stack and execute the RDMA protocol in software, so
 they are unlikely to improve on well-tuned TCP over `thunderbolt-net` for this
 latency-sensitive workload.
 
-The promising path is a custom zero-copy DS4 transport built on the USB4/Thunderbolt
-Native Host Interface (NHI) DMA rings. The NHI already performs the physical
-transfer from a local DMA address into pre-posted memory on the other host. A
-kernel driver can expose fixed, mmap-able TX/RX buffer pools to userspace and
-submit those buffers directly to the NHI rings. If ROCm can access the same
-pages, boundary tensors can move:
+The promising path is a custom zero-copy DS4 transport built on the
+USB4/Thunderbolt Native Host Interface (NHI) DMA rings. The NHI performs the
+physical transfer from a local DMA address into pre-posted memory on the other
+host. The implemented driver exposes fixed mmap-able TX/RX pools, and ROCm
+access to those same pages is proven, so boundary tensors can move:
 
 ```text
 sending GPU -> shared DMA page -> NHI -> cable -> NHI -> shared DMA page -> receiving GPU
@@ -120,8 +119,9 @@ Use a dedicated NHI stream only for bulk boundary tensors and batched logits.
 
 ### Kernel side
 
-Start from Linux 7.2 USB4STREAM or backport its driver, then add a zero-copy UAPI
-with the following concepts:
+The Linux 7.2 USB4STREAM backport and driver-owned zero-copy UAPI implement the
+following concepts; the native DMA-BUF experiment extends rather than replaces
+them:
 
 - Fixed TX and RX slot pools allocated and DMA-mapped once.
 - `mmap()` access to those pools from the DS4 process.
@@ -141,20 +141,28 @@ the next tensor can be produced while the previous one is on the link.
 
 ### ROCm integration
 
-The first proof of concept should mmap driver-owned pages into the DS4 process
-and test whether `hipHostRegister()`/mapped host memory lets the Strix Halo GPU
-read and write those pages at acceptable latency. The integrated GPU and shared
-system memory make this plausible, but it must be demonstrated; it should not
-be assumed.
+The driver-owned proof is complete: DS4 registers the fixed mmap with
+`hipHostRegister(..., hipHostRegisterMapped)`, and eligible opt-in direct-slot
+runs wrap those aliases as external graph tensors. That path is true shared-page
+GPU/NHI access, but direct logits into the mapped system pages cost about
+0.065 ms.
 
-If registering driver-mapped pages is unsupported or slow, investigate exporting
-the slot pool as DMA-BUF and importing it through the supported ROCm/KFD memory
-path. Explicit ownership fencing is required in either case:
+Native allocation ownership is now a distinct experiment rather than a fallback
+for failed registration. A complete base `hipMalloc` allocation can be exported
+as a DMA-BUF on Strix Halo. The proposed driver mode imports, pins, and maps one
+bounded TX and RX allocation to the NHI device and creates 4 KiB descriptors
+from the mapped SG tables. It remains gated on actual NHI-device mapping and
+explicit asymmetric ownership:
 
 ```text
-TX: GPU completion -> DMA sync/fence -> NHI owns slot -> TX completion -> reusable
-RX: NHI completion -> DMA sync/fence -> GPU owns slot -> GPU completion -> repost
+TX: GPU system release -> NHI owns mapped slot -> TX completion -> reusable
+RX: NHI completion -> GPU system acquire -> GPU completion -> repost
 ```
+
+An idle `hipDeviceSynchronize()` is not an RX acquire because external NHI DMA
+does not dirty CLR's queue-fence state. DMA-BUF CPU sync and KFD reservation
+fences do not invalidate GPU L2 either. The exact prototype and source-pinned
+event-marker candidate are specified in `GPU_TO_GPU_FEASIBILITY.md`.
 
 The driver must use the Linux DMA API correctly for the NHI device. Keep the
 IOMMU enabled: it provides DMA isolation and does not prevent this design.
@@ -185,10 +193,12 @@ NHI backend should:
    bypassing TCP even though copies remain.
 3. Add mmap-able fixed buffer pools and a userspace ping-pong test. Validate
    correctness, NHI DMA, interrupt count, and QD1 latency before involving ROCm.
-4. Prove GPU access to the mapped pool and measure GPU-to-GPU latency. Fall back
-   to DMA-BUF work only if the simpler mapped-memory path fails.
-5. Add the optional NHI backend to DS4 and pipeline tensor production, transfer,
-   and consumption.
+4. **Mapped path complete.** Treat native HIP DMA-BUF import as a separate
+   bounded performance experiment because mapped registration succeeds but
+   direct mapped output has a measured penalty.
+5. **Optional backend complete:** CPU-copy, mapped staged, and eligible direct
+   aliases are implemented. Native-pool integration waits for the mapping and
+   acquire gates; multi-request tensor/transfer pipelining remains future work.
 6. Tune ring depth, slot count, CPU affinity, interrupt affinity, interrupt
    throttling, frame batching, and spin-versus-sleep completion behavior.
 7. Run long soak tests, disconnect/reconnect tests, IOMMU fault tests, and output
@@ -202,7 +212,8 @@ Compare all three transports with identical tensors and model settings:
 |---|---:|---:|---|
 | TCP over `thunderbolt-net` | Yes | Yes | Production baseline |
 | Stock USB4STREAM | No | Yes | Low-risk intermediate baseline |
-| NHI stream | No | CPU-copy or mapped, by mode | Qualified experimental candidate |
+| NHI stream, driver-owned pages | No | CPU-copy or mapped, by mode | Qualified experimental candidate |
+| NHI stream, native HIP DMA-BUF | No | Intended zero payload copies | Import/synchronization experiment only |
 
 For each, measure:
 
@@ -239,16 +250,19 @@ there is more opportunity to pipeline work.
 - If stock USB4STREAM does not materially beat TCP at DS4's message sizes,
   profile the GPU staging copies and scheduling before writing a large kernel
   patch.
-- If mmap zero-copy materially beats stock USB4STREAM, proceed with GPU mapping.
-- If the GPU cannot access the NHI pool efficiently, estimate DMA-BUF work versus
-  the measured maximum benefit before continuing.
+- Mmap zero-copy and direct graph aliases are proven, but do not improve the
+  current full-model rate. Do not treat topology correctness as a speedup.
+- Proceed with native DMA-BUF only through the bounded no-traffic mapping and
+  stale-cache ownership gates. Stop if it does not remove the mapped-output
+  penalty or show another clear benefit.
 - If true one-sided RDMA semantics become a requirement, use external hardware;
   do not try to synthesize an HCA in the NHI driver.
 
-## Rough effort
+## Remaining effort
 
-A focused proof of concept is approximately one week once both hosts have a
-USB4STREAM-capable kernel: bring-up and baseline testing, mmap-able ring pools,
-a userspace ping-pong tool, and a first ROCm registration experiment. Production
-hardening and upstream-quality interfaces would take longer, especially around
-disconnect handling, synchronization, security, and compatibility.
+The original one-week page-backed proof is complete. The native DMA-BUF variant
+is not a small buffer swap: it first needs lazy path activation, transactional
+bounded import, exact SG tests, no-traffic hardware mapping, and a stale-cache
+ownership gate. Estimate DS4 integration only after those two hardware gates;
+production work remains dominated by disconnect/reset cancellation,
+synchronization, security, and compatibility rather than descriptor creation.

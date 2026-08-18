@@ -93,20 +93,30 @@ exposes one contiguous payload span. There may be one active lease per
 direction:
 
 ```text
-TX: acquire -> GPU copy into mapped slot -> write all TCP control
-    -> mark control visible -> HIP synchronize -> SUBMIT_TX -> release
+TX: acquire -> direct graph output or GPU copy into mapped slot
+    -> write all TCP control -> mark control visible
+    -> HIP synchronize -> SUBMIT_TX -> release
 
-RX: validate event + envelope -> acquire -> GPU copy from mapped slot
+RX: validate event + envelope -> acquire
+    -> direct graph input or GPU copy from mapped slot
     -> HIP synchronize -> POST_RX -> release
 ```
 
-DS4 uses leases only for contiguous 32-bit tensors. The graph tensor is copied
-directly to or from the registered driver slot with HIP—there is no intermediate
-application heap buffer—and the lease transition adds an explicit device-wide
-ownership fence. Reduced-width activation packing and a ring-wrapping payload
-use the CPU-copy NHI path with the same prepared descriptor. The device-pointer
-alias is retained by the API for future kernel-direct tensor I/O; current graph
-kernels are not rebound to execute directly against NHI pages.
+DS4 uses leases only for contiguous 32-bit tensors. The ordinary staged mapped
+path copies directly between the graph tensor and registered driver slot with
+HIP—there is no intermediate application heap buffer. In the separately opt-in
+`DS4_DIST_NHI_DIRECT_SLOTS` mode, `ds4_session_eval_layer_slice_device_io()`
+wraps eligible lease aliases as external ROCm tensors, and graph kernels consume
+the RX alias and/or write hidden-state or logit output directly into the TX
+alias. The 2026-08-06 event profile confirms those direct masks were exercised.
+Reduced-width activation packing, ineligible shapes, and ring-wrapping payloads
+retain their staged or CPU-copy fallback.
+
+These aliases still refer to NHI-owned pages registered with
+`hipHostRegister()`, not native `hipMalloc` storage. Native HIP DMA-BUF pools are
+a separate, unimplemented experiment. They require a bounded NHI DMA-BUF
+importer and a verified system-scope RX acquire; see
+`GPU_TO_GPU_FEASIBILITY.md`.
 
 TX abort is recoverable only before any TCP control write is attempted, and
 only for the immediately outstanding prepared sequence. RX abort, post-control

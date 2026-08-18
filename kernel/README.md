@@ -214,7 +214,9 @@ in-flight frames, but not generation numbers, eventfd/io_uring notification,
 or a production protocol for peer credit negotiation and reconnect recovery.
 Those belong with the DS4 transport integration after the ROCm mapping gate.
 
-The ROCm gate in `../tools/rocm-map/` registers the mapped TX pool and verifies
-GPU writes and reads without handing any frame to the NHI. It passed for the
-full 16 MiB pool on both test hosts, so the DS4 backend may use this mapping
-path without a DMA-BUF fallback.
+The ROCm gate in `../tools/rocm-map/` registers the driver-owned mapped TX pool
+and verifies GPU writes and reads without handing any frame to the NHI. It
+passed for the full 16 MiB pool on both test hosts, so DS4 can use this mapping
+without DMA-BUF for that mode. Native `hipMalloc` DMA-BUF ownership is a
+separate, unimplemented importer/coherency experiment; see
+`../docs/GPU_TO_GPU_FEASIBILITY.md`.

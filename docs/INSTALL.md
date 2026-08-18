@@ -128,12 +128,16 @@ verifies payload geometry and pattern.
 
 ## 6. ROCm mapping gate (optional, GPU hosts)
 
-Confirms the GPU can read/write the mmap-ed DMA pool without a DMA-BUF
-fallback:
+Confirms the GPU can read/write the driver-owned mmap pool without requiring
+DMA-BUF for this gate:
 
 ```sh
 tools/rocm-map/tbstream-hip-map /dev/tbstream0
 ```
+
+This does not exercise the separate native `hipMalloc` DMA-BUF importer
+experiment described in
+[GPU_TO_GPU_FEASIBILITY.md](GPU_TO_GPU_FEASIBILITY.md).
 
 ## 7. DS4 integration
 

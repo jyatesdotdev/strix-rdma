@@ -16,8 +16,9 @@ The full design and rationale live in [docs/PLAN.md](docs/PLAN.md)
 - Soft-RoCE / soft-iWARP are rejected: software RDMA keeps all of that overhead.
 - Target: pre-posted send/receive message passing directly on the NHI DMA
   rings — mmap-able fixed TX/RX slot pools, credit flow control, per-message
-  completions, and (if it works) ROCm mapping of the same pages so tensors go
-  GPU → DMA page → cable → DMA page → GPU.
+  completions, and proven ROCm mapping of the same pages so tensors go
+  GPU → DMA page → cable → DMA page → GPU. Native HIP-owned DMA-BUF pools are
+  the remaining experimental variant.
 - This is *not* one-sided RDMA; the NHI has no rkeys/QPs/atomics and they
   cannot be synthesized in a driver.
 
@@ -70,19 +71,22 @@ the hosts.
    `/dev/tbstreamX` with DS4-sized messages.
 3. Zero-copy UAPI: mmap-able fixed buffer pools + userspace ping-pong test.
    **Complete:** built and measured on both hosts; see `LOG.md` and `bench/results/`.
-4. Prove ROCm/GPU access to the mapped pool (`hipHostRegister()` first,
-   DMA-BUF only if that fails).
-   **Complete:** the full 16 MiB TX pool mapped and passed bidirectional
-   GPU/CPU verification on both hosts; DMA-BUF is not needed for this gate.
-   See `bench/results/2026-08-04-usb4stream-zc-oneway-rocm.md`.
+4. Prove ROCm/GPU access to the mapped pool.
+   **Complete:** the full 16 MiB TX pool registered with `hipHostRegister()` and
+   passed bidirectional GPU/CPU verification on both hosts. Native `hipMalloc`
+   DMA-BUF export is also proven, but NHI import and RX cache ownership are
+   separate, uncompleted performance gates. See
+   `bench/results/2026-08-04-usb4stream-zc-oneway-rocm.md` and
+   `docs/GPU_TO_GPU_FEASIBILITY.md`.
 5. Optional NHI transport backend in DS4.
    Integration contract: `docs/DS4_INTEGRATION.md`.
    **Single-link software path complete:** protocol v3 negotiation and bulk
    descriptors, persistent CPU-copy NHI, mapped 32-bit ROCm slot handoff,
    generation/sequence rejection, and TCP/v2 fallback are implemented. The
    mapped path copies graph tensors directly to/from registered driver slots;
-   kernel-direct use of their GPU aliases and pipelined leases remain tuning
-   work. Zero-copy patches 11 and 12 repair the reproduced lost-MSI-X and
+   eligible opt-in direct-slot runs also bind graph boundary tensors to those
+   GPU aliases. Native DMA-BUF-backed slots remain gated experimental work;
+   pipelined leases remain tuning work. Zero-copy patches 11 and 12 repair the
    fresh-open path-order failures. Both CPU-copy and mapped required-NHI
    full-model runs now pass, but NHI remains non-default pending longer soak
    and active peer-reboot qualification.
