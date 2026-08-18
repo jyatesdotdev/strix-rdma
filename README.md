@@ -43,6 +43,9 @@ kernel/          Kernel-side work: USB4STREAM backport to the hosts' 7.1.5
                  kernel, then the zero-copy UAPI patches on top.
   backport/      Extracted upstream patches for the backport.
 tools/pingpong/  Userspace latency/bandwidth test against /dev/tbstreamX.
+tools/dmabuf-probe/
+                 Privileged no-traffic DMA-BUF import probe runner
+                 (native-pool experiment gate; see kernel/README.md).
 bench/           Benchmark matrix scripts + results (TCP baseline vs stock
                  USB4STREAM vs zero-copy NHI stream).
 linux/           Sparse, blobless checkout of torvalds/linux for reference

@@ -25,3 +25,4 @@ tools/pingpong/pingpong
 tools/ds4-shape/tbstream-ds4-gate
 tools/rocm-map/tbstream-hip-map
 tools/rocm-map/tbstream-hip-zc
+tools/dmabuf-probe/tbstream-dmabuf-probe

@@ -1,6 +1,33 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-17 — Implement the gate-3 no-traffic DMA-BUF import probe
+- **What:** Added zero-copy patch 13 (`TBSTREAM_ZC_DMABUF_PROBE`) with the
+  shared `stream-sg.h` segment-validation/frame-flattening helper, the
+  `tools/dmabuf-probe` userspace runner (inherited fd or CPU-only udmabuf),
+  54 SG geometry unit checks, and series-test coverage for the ABI, privilege
+  gate, transactional rollback, and no-descriptor invariants. Verified the
+  hosts are reachable and unchanged (production TCP v3, tbstream published,
+  IOMMU translated), then compiled the patched module set against the exact
+  7.1.5-101.fc43 tree on `max` without installing anything. Two findings were
+  caught by that exact-tree gate: 7.1.5 wants the quoted
+  `MODULE_IMPORT_NS("DMA_BUF")` form, and the host's `~/src/linux-stable` was
+  a stale mid-series working tree (snapshotted, reset, now tracks the patch
+  series by `git am`). Strict checkpatch is clean apart from the series-wide
+  new-file MAINTAINERS note.
+- **Why:** Gate 3 of the native HIP DMA-BUF experiment: build and validate the
+  probe against the exact kernel tree without deploying it, so a later
+  authorized host run only has to measure, not debug, the import path.
+- **Impact:** Nothing was installed or reconfigured on either host; the loaded
+  modules and production services are untouched. Gate 4 is now unblocked: set
+  `thunderbolt_stream.zc_diagnostic_dmabuf=1`, run `tbstream-dmabuf-probe`
+  for udmabuf first and then coarse/uncached/fine-grain HIP exports in both
+  directions, and compare covered bytes, entry counts, alignment, and largest
+  segment against the flatten rules before any imported-pool mode is written.
+  The macOS case-collision phantom files in `linux/` bit once during patch
+  authoring; the regenerated patch carries only stream.c, stream-sg.h, and
+  the UAPI header.
+
 ## 2026-08-14 — Identify and bound a native HIP DMA-BUF path to the USB4 NHI
 - **What:** Re-audited the NHI, AMDGPU, ROCm, and current DS4 data paths and ran initial read-only topology/memory checks on both Strix hosts. The GPUs have only 512 MiB of BIOS VRAM and about 124 GiB of GTT, so DS4's large native HIP allocations are system/GTT pages. The installed HIP 7.13 runtime exposes DMA-BUF export; a temporary 4 MiB `hipMalloc` gate on `max` exported successfully, and a diagnostic CPU mmap saw the exact GPU-written pattern. A subsequent importer/synchronization audit used only local Linux, ROCm, and DS4 source and did not access either host. The public gfx1151 wheel manifest resolves the exact HIP build to TheRock `6d2136cd12be` and `rocm-systems` `79e85e1468f9`; the apparent `3309c6114a` suffix is a generated package hash, not the public source commit.
 - **Why:** Distinguish physically impossible one-sided RDMA from achievable GPU-addressable DMA message passing, find a way around the measured penalty of NHI-owned `hipHostRegister()` pages, and identify the exact ownership contract before writing a live driver.

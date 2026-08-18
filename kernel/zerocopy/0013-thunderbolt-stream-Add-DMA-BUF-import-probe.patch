@@ -1,0 +1,495 @@
+From b95c943c8233ffd3c988b549d4151a74cfd9b2c1 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <me@jyates.dev>
+Date: Mon, 17 Aug 2026 22:03:42 -0700
+Subject: [PATCH] thunderbolt: stream: Add DMA-BUF import probe diagnostic
+
+Add TBSTREAM_ZC_DMABUF_PROBE, a privileged, default-off, no-traffic
+diagnostic that attaches one DMA-BUF to the stream's NHI DMA device in
+a fixed direction, pins and maps it, validates the mapped SG geometry,
+and tears everything down before reporting aggregate statistics only:
+requested/covered bytes, original and mapped entry counts, tightest
+segment alignment, and largest mapped segment. No ring descriptor is
+programmed, no path state changes, and no DMA address leaves the
+kernel.
+
+The geometry rules live in a new shared header, stream-sg.h, so the
+probe and the future imported-pool mode flatten SG tables through the
+same purely arithmetic code: only for_each_sgtable_dma_sg() entries
+are walked, zero or non-frame-aligned segments are rejected, all
+address and cumulative-length arithmetic is overflow-checked, and
+frame addresses are emitted only from within a single segment. The
+header also compiles in userspace so the series test can exercise the
+geometry rules without hardware.
+
+RX probes reject read-only buffers. Setup is transactional: any
+failure rolls back in strict reverse order. The ioctl requires
+CAP_SYS_RAWIO and the new zc_diagnostic_dmabuf module parameter, and
+refuses configured zero-copy sessions, which own their pools already.
+
+Signed-off-by: Jonathan Yates <me@jyates.dev>
+---
+ drivers/thunderbolt/stream-sg.h         | 161 ++++++++++++++++++++++
+ drivers/thunderbolt/stream.c            | 173 ++++++++++++++++++++++++
+ include/uapi/linux/thunderbolt-stream.h |  46 +++++++
+ 3 files changed, 380 insertions(+)
+ create mode 100644 drivers/thunderbolt/stream-sg.h
+
+diff --git a/drivers/thunderbolt/stream-sg.h b/drivers/thunderbolt/stream-sg.h
+new file mode 100644
+index 000000000..5307e952c
+--- /dev/null
++++ b/drivers/thunderbolt/stream-sg.h
+@@ -0,0 +1,161 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * DMA segment validation and frame flattening for the Thunderbolt
++ * stream DMA-BUF paths.
++ *
++ * The DMA-BUF import probe and the imported-pool mode both describe a
++ * mapped SG table to the NHI as a sequence of fixed 4 KiB frame
++ * addresses. This header holds the shared, purely arithmetic half:
++ * every mapped segment must be frame-aligned in address and length,
++ * all address and length arithmetic must be overflow-free, and frame
++ * addresses are emitted only from within a single segment, never
++ * across a boundary. The kernel glue in stream.c walks
++ * for_each_sgtable_dma_sg() and feeds each segment here; the
++ * userspace series test compiles the same header directly so the
++ * geometry rules are exercised without hardware.
++ */
++#ifndef _TBSTREAM_STREAM_SG_H
++#define _TBSTREAM_STREAM_SG_H
++
++/*
++ * The kernel build provides u64/u32/U32_MAX/U64_MAX through the
++ * usual headers. Non-kernel includers (the userspace series test)
++ * must define them before including this file.
++ */
++#ifdef __KERNEL__
++#include <linux/errno.h>
++#include <linux/limits.h>
++#include <linux/types.h>
++#endif
++
++#define TBSTREAM_SG_FRAME_SIZE	4096
++#define TBSTREAM_SG_FRAME_MASK	(TBSTREAM_SG_FRAME_SIZE - 1)
++
++/**
++ * struct tbstream_sg_query - Frame-flattening state for one SG table
++ * @range_start: First byte of interest (frame-aligned)
++ * @range_end: End of the region of interest (frame-aligned)
++ * @table_bytes: Total mapped bytes seen so far; also the logical
++ *	cursor of the next segment
++ * @covered: Mapped bytes overlapping [@range_start, @range_end)
++ * @largest_segment: Largest segment seen, in bytes
++ * @min_align: Tightest power-of-two alignment of any segment start or
++ *	length, in bytes; %U64_MAX until the first segment
++ * @mapped_entries: DMA-mapped segments seen
++ * @frames: Frames emitted so far (overlap frames only)
++ * @frame_out: Optional destination for frame addresses
++ * @frame_cap: Capacity of @frame_out in frames
++ *
++ * Segments must be fed in table order exactly once each through
++ * tbstream_sg_segment(). Frame emission is optional; a %NULL
++ * @frame_out measures without storing addresses.
++ */
++struct tbstream_sg_query {
++	u64 range_start;
++	u64 range_end;
++	u64 table_bytes;
++	u64 covered;
++	u64 largest_segment;
++	u64 min_align;
++	u32 mapped_entries;
++	u32 frames;
++	u64 *frame_out;
++	u32 frame_cap;
++};
++
++/**
++ * tbstream_sg_query_init - Start a flattening query
++ * @q: Query state to initialize
++ * @offset: First byte of interest, frame-aligned
++ * @length: Bytes of interest, a nonzero frame multiple
++ * @frame_out: Optional frame address destination
++ * @frame_cap: Capacity of @frame_out in frames
++ *
++ * Return: 0 on success, %-EINVAL for bad geometry, %-EOVERFLOW if
++ * @offset + @length wraps.
++ */
++static inline int tbstream_sg_query_init(struct tbstream_sg_query *q,
++					 u64 offset, u64 length,
++					 u64 *frame_out, u32 frame_cap)
++{
++	if (!length || (offset & TBSTREAM_SG_FRAME_MASK) ||
++	    (length & TBSTREAM_SG_FRAME_MASK))
++		return -EINVAL;
++	if (offset > U64_MAX - length)
++		return -EOVERFLOW;
++
++	q->range_start = offset;
++	q->range_end = offset + length;
++	q->table_bytes = 0;
++	q->covered = 0;
++	q->largest_segment = 0;
++	q->min_align = U64_MAX;
++	q->mapped_entries = 0;
++	q->frames = 0;
++	q->frame_out = frame_out;
++	q->frame_cap = frame_cap;
++	return 0;
++}
++
++/**
++ * tbstream_sg_segment - Validate and flatten one DMA-mapped segment
++ * @q: Active query state
++ * @addr: DMA address of the segment (%sg_dma_address)
++ * @len: DMA length of the segment (%sg_dma_len)
++ *
++ * The segment is validated against the whole-table geometry rules:
++ * nonzero frame-aligned address and length, overflow-free address and
++ * cumulative-length arithmetic, and frame addresses emitted only from
++ * within this segment. Only the part overlapping the query range is
++ * measured and flattened.
++ *
++ * Return: 0 on success, %-EINVAL for bad segment geometry,
++ * %-EOVERFLOW for wrapping arithmetic or an excessive frame count,
++ * %-ENOSPC when @frame_out would overflow.
++ */
++static inline int tbstream_sg_segment(struct tbstream_sg_query *q,
++				      u64 addr, u64 len)
++{
++	u64 seg_start = q->table_bytes;
++	u64 seg_align, lo, hi, first, navail;
++	u32 nframes, i;
++
++	if (!len || (addr & TBSTREAM_SG_FRAME_MASK) ||
++	    (len & TBSTREAM_SG_FRAME_MASK))
++		return -EINVAL;
++	if (addr > U64_MAX - len || seg_start > U64_MAX - len)
++		return -EOVERFLOW;
++
++	if (len > q->largest_segment)
++		q->largest_segment = len;
++	seg_align = (addr | len) & (0ULL - (addr | len));
++	if (seg_align < q->min_align)
++		q->min_align = seg_align;
++
++	q->table_bytes = seg_start + len;
++	q->mapped_entries++;
++
++	lo = seg_start > q->range_start ? seg_start : q->range_start;
++	hi = seg_start + len < q->range_end ? seg_start + len : q->range_end;
++	if (lo >= hi)
++		return 0;
++
++	q->covered += hi - lo;
++	navail = (hi - lo) / TBSTREAM_SG_FRAME_SIZE;
++	if (navail > U32_MAX - q->frames)
++		return -EOVERFLOW;
++	nframes = (u32)navail;
++
++	first = addr + (lo - seg_start);
++	if (q->frame_out) {
++		if (nframes > q->frame_cap - q->frames)
++			return -ENOSPC;
++		for (i = 0; i < nframes; i++)
++			q->frame_out[q->frames + i] =
++				first + (u64)i * TBSTREAM_SG_FRAME_SIZE;
++	}
++	q->frames += nframes;
++	return 0;
++}
++
++#endif /* _TBSTREAM_STREAM_SG_H */
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 1f374a3ab..197af36b5 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -11,6 +11,7 @@
+ 
+ #include <linux/capability.h>
+ #include <linux/configfs.h>
++#include <linux/dma-buf.h>
+ #include <linux/file.h>
+ #include <linux/fs.h>
+ #include <linux/idr.h>
+@@ -19,6 +20,7 @@
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/scatterlist.h>
+ #include <linux/spinlock.h>
+ #include <linux/thunderbolt-stream.h>
+ #include <linux/poll.h>
+@@ -29,6 +31,8 @@
+ #include <linux/uuid.h>
+ #include <linux/wait.h>
+ 
++#include "stream-sg.h"
++
+ /*
+  * USB4STREAM - Stream data directly over Thunderbolt/USB4 cable
+  *
+@@ -85,9 +89,15 @@ module_param(zc_diagnostic_kick, bool, 0600);
+ MODULE_PARM_DESC(zc_diagnostic_kick,
+ 		 "allow privileged zero-copy diagnostic ring kicks");
+ 
++static bool zc_diagnostic_dmabuf;
++module_param(zc_diagnostic_dmabuf, bool, 0600);
++MODULE_PARM_DESC(zc_diagnostic_dmabuf,
++		 "allow privileged DMA-BUF import probe diagnostics");
++
+ static_assert(sizeof(struct tbstream_zc_ring_stats) == 128);
+ static_assert(sizeof(struct tbstream_zc_stats) == 528);
+ static_assert(offsetof(struct tbstream_zc_stats, tx) == 272);
++static_assert(sizeof(struct tbstream_zc_dmabuf_probe) == 96);
+ static_assert(offsetof(struct tbstream_zc_stats, rx) == 400);
+ static_assert(sizeof(struct tbstream_zc_kick) == 8);
+ 
+@@ -1712,6 +1722,166 @@ static int tbstream_dev_zc_kick(struct tbstream_dev *sdev, void __user *arg)
+ 	return ret;
+ }
+ 
++static const struct dma_buf_attach_ops tbstream_dmabuf_attach_ops = {
++	.allow_peer2peer = true,
++};
++
++/*
++ * Walk only the DMA-mapped SG entries. The exporter's original table
++ * may differ from what the NHI device mapped, and its entries must
++ * never supply DMA addresses nor be modified.
++ */
++static int tbstream_sg_flatten(struct sg_table *sgt, u64 offset, u64 length,
++			       u64 *frames, u32 frame_cap,
++			       struct tbstream_sg_query *query)
++{
++	struct scatterlist *sg;
++	int ret, i;
++
++	ret = tbstream_sg_query_init(query, offset, length, frames,
++				     frame_cap);
++	if (ret)
++		return ret;
++
++	for_each_sgtable_dma_sg(sgt, sg, i) {
++		ret = tbstream_sg_segment(query, sg_dma_address(sg),
++					  sg_dma_len(sg));
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++/* The probe measures at most 1 GiB per call. */
++#define TBSTREAM_DMABUF_PROBE_MAX	SZ_1G
++
++/*
++ * Privileged no-traffic DMA-BUF import probe. The buffer is attached
++ * to the NHI DMA device, pinned, mapped in the requested direction,
++ * measured, and fully torn down before any result is copied out. No
++ * ring descriptor is programmed, no path state changes, and no DMA
++ * address leaves the kernel.
++ */
++static int tbstream_dev_zc_dmabuf_probe(struct tbstream_dev *sdev,
++					void __user *arg)
++{
++	struct tbstream_zc_dmabuf_probe probe;
++	struct dma_buf_attachment *attach;
++	enum dma_data_direction dir;
++	struct tbstream_sg_query query;
++	struct dma_buf *dmabuf;
++	struct device *dma_dev;
++	struct sg_table *sgt;
++	int ret;
++
++	if (!zc_diagnostic_dmabuf)
++		return -EACCES;
++	if (!capable(CAP_SYS_RAWIO))
++		return -EPERM;
++	if (copy_from_user(&probe, arg, sizeof(probe)))
++		return -EFAULT;
++	if (probe.version != TBSTREAM_ZC_DMABUF_PROBE_VERSION ||
++	    probe.flags || probe.reserved[0] || probe.reserved[1] ||
++	    probe.reserved[2] || probe.reserved[3])
++		return -EINVAL;
++
++	switch (probe.direction) {
++	case TBSTREAM_ZC_DMABUF_TX:
++		dir = DMA_TO_DEVICE;
++		break;
++	case TBSTREAM_ZC_DMABUF_RX:
++		dir = DMA_FROM_DEVICE;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (!IS_ALIGNED(probe.offset, TBSTREAM_ZC_FRAME_SIZE) ||
++	    !IS_ALIGNED(probe.length, TBSTREAM_ZC_FRAME_SIZE) ||
++	    !probe.length || probe.length > TBSTREAM_DMABUF_PROBE_MAX)
++		return -EINVAL;
++
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++
++	ret = tbstream_dev_valid(sdev);
++	if (ret || tbstream_dev_removed(sdev)) {
++		ret = -ENXIO;
++		goto out_unlock;
++	}
++	if (sdev->zc || !sdev->tx_ring.ring || !sdev->rx_ring.ring) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++	dma_dev = tb_ring_dma_device(dir == DMA_TO_DEVICE ?
++				     sdev->tx_ring.ring : sdev->rx_ring.ring);
++
++	dmabuf = dma_buf_get(probe.fd);
++	if (IS_ERR(dmabuf)) {
++		ret = PTR_ERR(dmabuf);
++		goto out_unlock;
++	}
++	/* RX hardware writes the buffer; reject a read-only object. */
++	if (dir == DMA_FROM_DEVICE && !(dmabuf->file->f_mode & FMODE_WRITE)) {
++		ret = -EBADF;
++		goto err_put;
++	}
++	if (probe.offset > dmabuf->size ||
++	    probe.length > dmabuf->size - probe.offset) {
++		ret = -EINVAL;
++		goto err_put;
++	}
++
++	attach = dma_buf_dynamic_attach(dmabuf, dma_dev,
++					&tbstream_dmabuf_attach_ops, NULL);
++	if (IS_ERR(attach)) {
++		ret = PTR_ERR(attach);
++		goto err_put;
++	}
++
++	ret = dma_buf_pin(attach);
++	if (ret)
++		goto err_detach;
++
++	sgt = dma_buf_map_attachment(attach, dir);
++	if (IS_ERR(sgt)) {
++		ret = PTR_ERR(sgt);
++		goto err_unpin;
++	}
++
++	ret = tbstream_sg_flatten(sgt, probe.offset, probe.length, NULL, 0,
++				  &query);
++	if (!ret) {
++		probe.covered = query.covered;
++		probe.min_alignment = query.mapped_entries ? query.min_align : 0;
++		probe.largest_segment = query.largest_segment;
++		probe.orig_entries = sgt->orig_nents;
++		probe.mapped_entries = sgt->nents;
++	}
++
++	dma_buf_unmap_attachment(attach, sgt, dir);
++	dma_buf_unpin(attach);
++	dma_buf_detach(dmabuf, attach);
++	dma_buf_put(dmabuf);
++	mutex_unlock(&sdev->lock);
++
++	if (ret)
++		return ret;
++	if (copy_to_user(arg, &probe, sizeof(probe)))
++		return -EFAULT;
++	return 0;
++
++err_unpin:
++	dma_buf_unpin(attach);
++err_detach:
++	dma_buf_detach(dmabuf, attach);
++err_put:
++	dma_buf_put(dmabuf);
++out_unlock:
++	mutex_unlock(&sdev->lock);
++	return ret;
++}
++
+ static long
+ tbstream_dev_fops_ioctl(struct file *file, unsigned int cmd,
+ 			unsigned long arg)
+@@ -1742,6 +1912,8 @@ tbstream_dev_fops_ioctl(struct file *file, unsigned int cmd,
+ 		return tbstream_dev_zc_get_stats(sdev, uarg);
+ 	case TBSTREAM_ZC_KICK:
+ 		return tbstream_dev_zc_kick(sdev, uarg);
++	case TBSTREAM_ZC_DMABUF_PROBE:
++		return tbstream_dev_zc_dmabuf_probe(sdev, uarg);
+ 	default:
+ 		return -ENOTTY;
+ 	}
+@@ -2773,3 +2945,4 @@ MODULE_AUTHOR("Alan Borzeszkowski <alan.borzeszkowski@linux.intel.com>");
+ MODULE_AUTHOR("Mika Westerberg <mika.westerberg@linux.intel.com>");
+ MODULE_DESCRIPTION("Stream data over Thunderbolt/USB4 cable");
+ MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("DMA_BUF");
+diff --git a/include/uapi/linux/thunderbolt-stream.h b/include/uapi/linux/thunderbolt-stream.h
+index c7a663d49..d4cd9a195 100644
+--- a/include/uapi/linux/thunderbolt-stream.h
++++ b/include/uapi/linux/thunderbolt-stream.h
+@@ -310,6 +310,50 @@ struct tbstream_zc_kick {
+ #define TBSTREAM_ZC_KICK_TX	0x1
+ #define TBSTREAM_ZC_KICK_RX	0x2
+ 
++#define TBSTREAM_ZC_DMABUF_TX	1
++#define TBSTREAM_ZC_DMABUF_RX	2
++
++#define TBSTREAM_ZC_DMABUF_PROBE_VERSION	1
++
++/**
++ * struct tbstream_zc_dmabuf_probe - TBSTREAM_ZC_DMABUF_PROBE argument
++ * @version: Must be %TBSTREAM_ZC_DMABUF_PROBE_VERSION
++ * @flags: Must be 0
++ * @fd: DMA-BUF file descriptor to probe
++ * @direction: %TBSTREAM_ZC_DMABUF_TX or %TBSTREAM_ZC_DMABUF_RX
++ * @offset: First byte to measure, aligned to %TBSTREAM_ZC_FRAME_SIZE
++ * @length: Bytes to measure, a nonzero multiple of %TBSTREAM_ZC_FRAME_SIZE
++ * @covered: Mapped bytes overlapping [@offset, @offset + @length)
++ * @min_alignment: Tightest power-of-two alignment of any mapped segment
++ *	start or length in bytes, or 0 when nothing was mapped
++ * @largest_segment: Largest single DMA-mapped segment in bytes
++ * @orig_entries: SG entries published by the exporter
++ * @mapped_entries: DMA-mapped SG entries for the NHI device
++ * @reserved: Must be 0
++ *
++ * Privileged no-traffic diagnostic. The stream attaches @fd to its NHI
++ * DMA device in @direction, pins and maps it, validates that every
++ * mapped segment is frame-aligned, measures coverage of the requested
++ * range, and tears the mapping down. Aggregate geometry is reported
++ * only after the teardown completes; no ring descriptor is ever
++ * programmed and no DMA address is exposed. Requires CAP_SYS_RAWIO
++ * and the thunderbolt_stream.zc_diagnostic_dmabuf module parameter.
++ */
++struct tbstream_zc_dmabuf_probe {
++	__u32 version;
++	__u32 flags;
++	__s32 fd;
++	__u32 direction;
++	__aligned_u64 offset;
++	__aligned_u64 length;
++	__aligned_u64 covered;
++	__aligned_u64 min_alignment;
++	__aligned_u64 largest_segment;
++	__u32 orig_entries;
++	__u32 mapped_entries;
++	__aligned_u64 reserved[4];
++};
++
+ #define TBSTREAM_ZC_MAGIC	0xb4
+ 
+ #define TBSTREAM_ZC_ENABLE	_IO(TBSTREAM_ZC_MAGIC, 0x00)
+@@ -323,5 +367,7 @@ struct tbstream_zc_kick {
+ 	_IOR(TBSTREAM_ZC_MAGIC, 0x06, struct tbstream_zc_stats)
+ #define TBSTREAM_ZC_KICK \
+ 	_IOW(TBSTREAM_ZC_MAGIC, 0x07, struct tbstream_zc_kick)
++#define TBSTREAM_ZC_DMABUF_PROBE \
++	_IOWR(TBSTREAM_ZC_MAGIC, 0x08, struct tbstream_zc_dmabuf_probe)
+ 
+ #endif /* _UAPI_LINUX_THUNDERBOLT_STREAM_H */
+-- 
+2.50.1 (Apple Git-155)
+

@@ -25,6 +25,7 @@ all: tools
 tools:
 	$(MAKE) -C tools/pingpong
 	$(MAKE) -C tools/ds4-shape
+	$(MAKE) -C tools/dmabuf-probe
 
 rocm:
 	$(MAKE) -C tools/rocm-map
@@ -78,4 +79,5 @@ install-lifecycle:
 clean:
 	$(MAKE) -C tools/pingpong clean
 	$(MAKE) -C tools/ds4-shape clean
+	$(MAKE) -C tools/dmabuf-probe clean
 	$(MAKE) -C tools/rocm-map clean

@@ -165,6 +165,9 @@ backport:
 12. Start both rings and fully prime RX before enabling the XDomain DMA paths,
     matching ThunderboltIP's ordering. This restores reliable close/reopen E2E
     credits and completes partial TX/RX allocation cleanup.
+13. Add `TBSTREAM_ZC_DMABUF_PROBE`, a privileged, default-off, no-traffic
+    DMA-BUF import probe, and the shared `stream-sg.h` segment validation
+    and frame-flattening rules the future imported-pool mode will reuse.
 
 The original five-patch zero-copy implementation was built, deployed, and
 benchmarked on both test hosts; see
@@ -173,7 +176,7 @@ benchmarked on both test hosts; see
 `pingpong` tool provides `zping`/`zpong` for RTT and `ztx`/`zrx` for one-way
 throughput. The complete twelve-patch series was independently reviewed, built
 byte-identically, deployed, embedded in both initramfs images, and booted on the
-two test hosts. The isolated ABI and source-contract suite passes 38/38.
+two test hosts. The isolated ABI and source-contract suite passes 40/40.
 
 The progress counters localized the asymmetric stall to a lost MSI-X
 notification, while the separate fresh-open failure showed zero hardware
@@ -199,9 +202,10 @@ Validate the complete series without changing the local kernel checkout:
 make -C kernel/tests test
 ```
 
-The 38-case test creates an isolated worktree, applies every zero-copy patch in order,
-compares the final UAPI with the userspace mirror, verifies its 32/64-bit ABI,
-and checks the ownership, failure, diagnostic, and teardown invariants.
+The 40-case test creates an isolated worktree, applies every zero-copy patch
+in order, compares the final UAPI with the userspace mirror, verifies its
+32/64-bit ABI, compiles and runs the SG-flatten geometry unit tests, and
+checks the ownership, failure, diagnostic, and teardown invariants.
 
 `TBSTREAM_ZC_ENABLE` is intended to run immediately after opening a fresh
 stream. It returns `EBUSY` if legacy TX is still in flight or any RX frame has
@@ -220,3 +224,32 @@ passed for the full 16 MiB pool on both test hosts, so DS4 can use this mapping
 without DMA-BUF for that mode. Native `hipMalloc` DMA-BUF ownership is a
 separate, unimplemented importer/coherency experiment; see
 `../docs/GPU_TO_GPU_FEASIBILITY.md`.
+
+## DMA-BUF import probe (gate 3 of the native-pool experiment)
+
+Patch 13 adds the first piece of the bounded native-allocation experiment:
+a no-traffic diagnostic that answers "can the NHI DMA device map this
+DMA-BUF, and with what segment geometry?" before any imported-pool mode
+is built. Given one DMA-BUF fd, a direction, and a frame-aligned range,
+it attaches the buffer to the stream ring's DMA device, pins it, maps it,
+validates every mapped segment against the production geometry rules
+(frame-aligned, overflow-free, frame addresses never crossing a segment),
+tears the mapping down, and only then reports aggregate statistics:
+requested/covered bytes, original and mapped SG entry counts, tightest
+segment alignment, and largest mapped segment. It never programs a ring
+descriptor, never changes path state, and never exposes a DMA address.
+
+The probe requires `CAP_SYS_RAWIO` and the default-off
+`thunderbolt_stream.zc_diagnostic_dmabuf=1` module parameter (writable at
+runtime by root), and refuses configured zero-copy sessions. Ranges are
+bounded to 1 GiB per call. `../tools/dmabuf-probe/` runs it from
+userspace, sourcing the DMA-BUF either from an inherited fd (`--fd`, for
+example a HIP export) or from a CPU-only `/dev/udmabuf` allocation
+(`--udmabuf`) that smokes the import path without a GPU.
+
+The SG-flatten rules in `drivers/thunderbolt/stream-sg.h` are pure
+arithmetic shared verbatim with the future imported-pool mode; the series
+test compiles the same header in userspace and exercises one/many/coalesced
+segments, exact boundaries, zero and unaligned segments, short and overlong
+coverage, address and cumulative-length overflow, excessive frame counts,
+and final partial segments.

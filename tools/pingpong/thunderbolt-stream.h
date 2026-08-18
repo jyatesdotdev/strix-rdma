@@ -310,6 +310,50 @@ struct tbstream_zc_kick {
 #define TBSTREAM_ZC_KICK_TX	0x1
 #define TBSTREAM_ZC_KICK_RX	0x2
 
+#define TBSTREAM_ZC_DMABUF_TX	1
+#define TBSTREAM_ZC_DMABUF_RX	2
+
+#define TBSTREAM_ZC_DMABUF_PROBE_VERSION	1
+
+/**
+ * struct tbstream_zc_dmabuf_probe - TBSTREAM_ZC_DMABUF_PROBE argument
+ * @version: Must be %TBSTREAM_ZC_DMABUF_PROBE_VERSION
+ * @flags: Must be 0
+ * @fd: DMA-BUF file descriptor to probe
+ * @direction: %TBSTREAM_ZC_DMABUF_TX or %TBSTREAM_ZC_DMABUF_RX
+ * @offset: First byte to measure, aligned to %TBSTREAM_ZC_FRAME_SIZE
+ * @length: Bytes to measure, a nonzero multiple of %TBSTREAM_ZC_FRAME_SIZE
+ * @covered: Mapped bytes overlapping [@offset, @offset + @length)
+ * @min_alignment: Tightest power-of-two alignment of any mapped segment
+ *	start or length in bytes, or 0 when nothing was mapped
+ * @largest_segment: Largest single DMA-mapped segment in bytes
+ * @orig_entries: SG entries published by the exporter
+ * @mapped_entries: DMA-mapped SG entries for the NHI device
+ * @reserved: Must be 0
+ *
+ * Privileged no-traffic diagnostic. The stream attaches @fd to its NHI
+ * DMA device in @direction, pins and maps it, validates that every
+ * mapped segment is frame-aligned, measures coverage of the requested
+ * range, and tears the mapping down. Aggregate geometry is reported
+ * only after the teardown completes; no ring descriptor is ever
+ * programmed and no DMA address is exposed. Requires CAP_SYS_RAWIO
+ * and the thunderbolt_stream.zc_diagnostic_dmabuf module parameter.
+ */
+struct tbstream_zc_dmabuf_probe {
+	__u32 version;
+	__u32 flags;
+	__s32 fd;
+	__u32 direction;
+	__aligned_u64 offset;
+	__aligned_u64 length;
+	__aligned_u64 covered;
+	__aligned_u64 min_alignment;
+	__aligned_u64 largest_segment;
+	__u32 orig_entries;
+	__u32 mapped_entries;
+	__aligned_u64 reserved[4];
+};
+
 #define TBSTREAM_ZC_MAGIC	0xb4
 
 #define TBSTREAM_ZC_ENABLE	_IO(TBSTREAM_ZC_MAGIC, 0x00)
@@ -323,5 +367,7 @@ struct tbstream_zc_kick {
 	_IOR(TBSTREAM_ZC_MAGIC, 0x06, struct tbstream_zc_stats)
 #define TBSTREAM_ZC_KICK \
 	_IOW(TBSTREAM_ZC_MAGIC, 0x07, struct tbstream_zc_kick)
+#define TBSTREAM_ZC_DMABUF_PROBE \
+	_IOWR(TBSTREAM_ZC_MAGIC, 0x08, struct tbstream_zc_dmabuf_probe)
 
 #endif /* _UAPI_LINUX_THUNDERBOLT_STREAM_H */

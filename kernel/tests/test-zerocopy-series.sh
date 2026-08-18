@@ -522,8 +522,8 @@ diagnostic_uapi=$(body_between_file "$KERNEL_UAPI" \
 	'^struct tbstream_zc_ring_stats' '^#define TBSTREAM_ZC_MAGIC')
 aligned_u64_count=$(grep -Ec \
 	'^[[:space:]]*__aligned_u64[[:space:]]' <<<"$diagnostic_uapi")
-[ "$aligned_u64_count" -eq 31 ] ||
-	fail "diagnostic UAPI has $aligned_u64_count aligned u64 fields, expected 31"
+[ "$aligned_u64_count" -eq 37 ] ||
+	fail "diagnostic UAPI has $aligned_u64_count aligned u64 fields, expected 37"
 if grep -Eq '^[[:space:]]*__u64[[:space:]]' <<<"$diagnostic_uapi"; then
 	fail 'diagnostic UAPI contains a compat-unsafe plain __u64 field'
 fi
@@ -835,5 +835,71 @@ must_order "$release_body" 'CLOSE retry reporting' \
 	'failed to send CLOSE twice:' \
 	'tbstream_dev_stop(sdev);'
 pass 'teardown reports TX progress timeouts and DMA-path disable failures'
+
+"$CC_BIN" -std=c11 -Wall -Wextra -Werror \
+	-I"$TEST_TREE/drivers/thunderbolt" \
+	"$TEST_DIR/test-sg-flatten.c" -o "$TEST_TMP/test-sg-flatten" ||
+	fail 'SG flatten helper test did not compile'
+"$TEST_TMP/test-sg-flatten" >/dev/null ||
+	fail 'SG flatten helper failed its static geometry cases'
+pass 'SG flatten helper validates and flattens every static geometry case'
+
+probe_body=$(body_between '^static int tbstream_dev_zc_dmabuf_probe' \
+	'^tbstream_dev_fops_ioctl')
+must_order "$probe_body" 'DMA-BUF probe gating and transactional teardown' \
+	'if (!zc_diagnostic_dmabuf)' \
+	'return -EACCES;' \
+	'if (!capable(CAP_SYS_RAWIO))' \
+	'return -EPERM;' \
+	'probe.version != TBSTREAM_ZC_DMABUF_PROBE_VERSION ||' \
+	'case TBSTREAM_ZC_DMABUF_RX:' \
+	'mutex_lock_interruptible(&sdev->lock)' \
+	'ret = tbstream_dev_valid(sdev);' \
+	'if (sdev->zc || !sdev->tx_ring.ring || !sdev->rx_ring.ring)' \
+	'dma_dev = tb_ring_dma_device' \
+	'dmabuf = dma_buf_get(probe.fd);' \
+	'!(dmabuf->file->f_mode & FMODE_WRITE)' \
+	'probe.length > dmabuf->size - probe.offset' \
+	'attach = dma_buf_dynamic_attach' \
+	'ret = dma_buf_pin(attach);' \
+	'sgt = dma_buf_map_attachment(attach, dir);' \
+	'ret = tbstream_sg_flatten(' \
+	'dma_buf_unmap_attachment(attach, sgt, dir);' \
+	'dma_buf_unpin(attach);' \
+	'dma_buf_detach(dmabuf, attach);' \
+	'dma_buf_put(dmabuf);' \
+	'mutex_unlock(&sdev->lock);' \
+	'copy_to_user(arg, &probe, sizeof(probe))'
+probe_rollback=$(body_from "$probe_body" 'err_unpin:')
+must_order "$probe_rollback" 'DMA-BUF probe partial-error rollback' \
+	'err_unpin:' \
+	'dma_buf_unpin(attach);' \
+	'err_detach:' \
+	'dma_buf_detach(dmabuf, attach);' \
+	'err_put:' \
+	'dma_buf_put(dmabuf);' \
+	'out_unlock:' \
+	'mutex_unlock(&sdev->lock);'
+must_not_contain "$probe_body" 'tb_ring_enqueue' \
+	'no-traffic probe descriptor safety'
+must_not_contain "$probe_body" 'ring_write' \
+	'no-traffic probe descriptor safety'
+sg_glue=$(body_between '^static int tbstream_sg_flatten' \
+	'^#define TBSTREAM_DMABUF_PROBE_MAX')
+must_contain "$sg_glue" 'for_each_sgtable_dma_sg(sgt, sg, i)' \
+	'DMA-mapped SG walk'
+must_not_contain "$sg_glue" 'for_each_sgtable_sg' \
+	'original SG table is never walked for DMA addresses'
+must_not_contain "$sg_glue" 'sgt->sgl' \
+	'original SG table is never walked for DMA addresses'
+must_contain "$(<"$STREAM")" 'module_param(zc_diagnostic_dmabuf, bool, 0600);' \
+	'DMA-BUF probe opt-in'
+must_contain "$(<"$STREAM")" 'MODULE_IMPORT_NS("DMA_BUF");' \
+	'DMA-BUF namespace import'
+ioctl_body=$(body_between '^tbstream_dev_fops_ioctl' \
+	'^static int tbstream_dev_fops_mmap')
+must_contain "$ioctl_body" 'case TBSTREAM_ZC_DMABUF_PROBE:' \
+	'probe ioctl dispatch'
+pass 'DMA-BUF probe is privileged, no-traffic, and transactional'
 
 printf '1..%d\n' "$PASS_COUNT"
