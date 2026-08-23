@@ -1,6 +1,35 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-23 — Pass gate 6; measure sub-5 µs GPU-polled exchange for TP
+- **What:** Completed gate 6 on the transient patch-14 module set: 17-case
+  import rollback coverage (`tbstream-import-test`), GPU-written imported-TX
+  → imported-RX transfer (`tbstream-gpu-tx`, release event/none arms, 64
+  wraps word-exact), 5/5 close/reopen cycles, a mid-stream SIGKILL with
+  clean CLOSE and recovery after 85,526 verified messages, and zero IOMMU
+  faults across ~460 MiB of imported-pool DMA. Physical cable-pull/reboot
+  and deliberate IOMMU/GPU-reset faults deferred as unsafe on the
+  production pair. Then built `tbstream-tp-pingpong` (both directions
+  imported on both hosts) and measured kernel-notified vs persistent-GPU-
+  wave detection.
+- **Why:** Close the remaining pre-DS4 correctness/fault gates and convert
+  the hybrid tensor-parallel proposal from projection to a measured
+  transport budget.
+- **Impact:** Exchange RTT p50: 4 KiB 20.3 µs reap vs **9.8 µs spin**
+  (~4.9 µs one-way); 32 KiB 57.7 vs **45.3 µs** with jitter collapsed (max
+  88→47 µs); implied burst bandwidth ~1.6 GB/s/direction. Two findings:
+  small `hipMalloc`s share slab BOs (the driver's same-BO rejection caught
+  it; tools now pad to dedicated 16 MiB BOs — DS4 integration must verify
+  dedicated allocations), and gate-5 coherence is dispatch-scoped — a
+  spinning wave never sees NHI writes through GPU L2, so persistent-kernel
+  signaling needs uncached flag words (payload stays coarse). At these
+  numbers ~120 TP exchanges/token cost ≈2 ms, supporting a ~1.8× hybrid-TP
+  decode estimate whose kernel half is now the open question. One polish
+  candidate: skip the final CLOSE toward an already-closed peer to silence
+  benign flush-timeout warnings. Hosts restored to production and
+  smoke-verified. Full evidence:
+  `bench/results/2026-08-23-gate6-tp-exchange-probe.md`.
+
 ## 2026-08-23 — Pass gate 5: imported native GPU pools carry real NHI traffic
 - **What:** Implemented zero-copy patch 14 (`TBSTREAM_ZC_IMPORT`): lazy ring/
   path activation so imports always precede activation, an atomic
