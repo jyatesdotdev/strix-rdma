@@ -1,0 +1,874 @@
+From ebb4db20919d44b4cba9f63c1da48a22273f5cf5 Mon Sep 17 00:00:00 2001
+From: Jordan Yates <jryates@localhost>
+Date: Sun, 23 Aug 2026 10:19:48 -0700
+Subject: [PATCH] thunderbolt: stream: Add imported DMA-BUF frame pools
+
+Allow a zero-copy session to back either or both of its fixed frame
+pools with an imported DMA-BUF instead of kernel pages, so an exporting
+device (for example an integrated GPU allocating GTT pages) becomes the
+payload owner and the NHI transfers directly to and from its memory.
+
+Ring construction and DMA path activation move from first open to the
+first operation that needs them: read, write, poll, the zero-copy
+enable, or the import probe. The new TBSTREAM_ZC_IMPORT ioctl must run
+on an exclusively opened, never-activated device, so a pool import
+always precedes ring construction and no path can carry traffic into a
+partially configured pool. Receive descriptors are still fully primed
+before the XDomain paths are enabled. The import is transactional: the
+buffer is attached to the NHI DMA device, pinned, mapped in its fixed
+direction, and flattened into per-slot frame addresses with the shared
+stream-sg.h validation; on any failure every acquired object is
+released in reverse order and the device is left unchanged.
+
+Imported frames have no CPU page. They are never dma_sync_single_*()
+targets - the exporter owns payload coherency - and mmap() leaves their
+half of the pool mapping as an unpopulated hole. Ordinary read()/write()
+are rejected while an import is configured. Because an imported TX pool
+cannot be written by the kernel, CLOSE packets for such sessions use one
+dedicated page-backed control frame outside the slot pool. Imported
+pools last until the final close of the device, surviving suspend and
+resume with the rings they back.
+
+The ioctl requires CAP_SYS_RAWIO and the zc_diagnostic_dmabuf module
+parameter while the imported-pool mode remains experimental.
+---
+ drivers/thunderbolt/stream.c            | 498 +++++++++++++++++++++---
+ include/uapi/linux/thunderbolt-stream.h |  53 +++
+ 2 files changed, 506 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 197af36b5..efb8d743e 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -92,12 +92,14 @@ MODULE_PARM_DESC(zc_diagnostic_kick,
+ static bool zc_diagnostic_dmabuf;
+ module_param(zc_diagnostic_dmabuf, bool, 0600);
+ MODULE_PARM_DESC(zc_diagnostic_dmabuf,
+-		 "allow privileged DMA-BUF import probe diagnostics");
++		 "allow privileged DMA-BUF import diagnostics (probe and pool import)");
+ 
+ static_assert(sizeof(struct tbstream_zc_ring_stats) == 128);
+ static_assert(sizeof(struct tbstream_zc_stats) == 528);
+ static_assert(offsetof(struct tbstream_zc_stats, tx) == 272);
+ static_assert(sizeof(struct tbstream_zc_dmabuf_probe) == 96);
++static_assert(sizeof(struct tbstream_zc_import_range) == 24);
++static_assert(sizeof(struct tbstream_zc_import) == 88);
+ static_assert(offsetof(struct tbstream_zc_stats, rx) == 400);
+ static_assert(sizeof(struct tbstream_zc_kick) == 8);
+ 
+@@ -132,6 +134,27 @@ struct tbstream_frame {
+ 	struct ring_frame frame;
+ };
+ 
++/**
++ * struct tbstream_zc_import_half - One imported directional frame pool
++ * @dmabuf: Imported DMA-BUF; owns a file reference independent of the
++ *	userspace fd
++ * @attach: Attachment to the NHI DMA device
++ * @sgt: DMA-mapped SG table, pinned for the life of the import
++ * @iovas: One frame-aligned DMA address per pool slot (ring_size
++ *	entries), flattened from @sgt
++ *
++ * Imported frames have no CPU page: the payload owner is the exporting
++ * device, so no dma_sync_single_*() calls are valid on these
++ * addresses. Ownership is transferred through hardware completion and
++ * the exporter's own synchronization primitives.
++ */
++struct tbstream_zc_import_half {
++	struct dma_buf *dmabuf;
++	struct dma_buf_attachment *attach;
++	struct sg_table *sgt;
++	u64 *iovas;
++};
++
+ /**
+  * struct tbstream_ring - Stream RX/TX ring structure
+  * @ring: Pointer to the API ring
+@@ -228,9 +251,14 @@ struct tbstream_dev {
+ 	unsigned int ring_size;
+ 	unsigned int throttling;
+ 	int users;
++	bool started;
+ 	bool closed;
+ 	bool removed;
+ 	bool zc;
++	struct tbstream_zc_import_half *zc_tx_import;
++	struct tbstream_zc_import_half *zc_rx_import;
++	struct tbstream_frame zc_close_frame;
++	bool zc_close_frame_mapped;
+ 	bool zc_failed;
+ 	u32 zc_last_error;
+ 	u32 zc_tx_pending;
+@@ -350,7 +378,8 @@ static void tbstream_ring_free(struct tbstream_ring *ring)
+ 	for (i = 0; i < tb_ring_size(ring->ring); i++) {
+ 		struct tbstream_frame *sf = &ring->frames[i];
+ 
+-		if (sf->frame.buffer_phy)
++		/* Imported frames carry DMA-BUF addresses the pool does not own. */
++		if (sf->page && sf->frame.buffer_phy)
+ 			dma_unmap_page(dma_dev, sf->frame.buffer_phy,
+ 				       TB_MAX_FRAME_SIZE, dir);
+ 		sf->frame.buffer_phy = 0;
+@@ -490,9 +519,10 @@ tbstream_dev_zc_rx(struct tbstream_dev *sdev, struct tbstream_frame *sf)
+ 	bool wake_error = false;
+ 	bool wake = false;
+ 
+-	dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
+-				tb_ring_frame_size(&sf->frame),
+-				DMA_FROM_DEVICE);
++	if (sf->page)
++		dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
++					tb_ring_frame_size(&sf->frame),
++					DMA_FROM_DEVICE);
+ 
+ 	spin_lock_irqsave(&sdev->zc_lock, flags);
+ 	if (sdev->zc_failed) {
+@@ -611,9 +641,10 @@ tbstream_dev_completed_rx(struct tbstream_dev *sdev)
+ 	if (!sf->completed)
+ 		return NULL;
+ 
+-	dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
+-				tb_ring_frame_size(&sf->frame),
+-				DMA_FROM_DEVICE);
++	if (sf->page)
++		dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
++					tb_ring_frame_size(&sf->frame),
++					DMA_FROM_DEVICE);
+ 	return sf;
+ }
+ 
+@@ -636,14 +667,17 @@ static int tbstream_dev_consume_rx(struct tbstream_dev *sdev)
+ 	sf->offset = 0;
+ 	sf->frame.size = 0;
+ 
+-	dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy,
+-				   tb_ring_frame_size(&sf->frame),
+-				   DMA_FROM_DEVICE);
++	if (sf->page)
++		dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy,
++					   tb_ring_frame_size(&sf->frame),
++					   DMA_FROM_DEVICE);
+ 
+ 	ret = tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
+ 	if (ret) {
+-		dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
+-					TB_MAX_FRAME_SIZE, DMA_FROM_DEVICE);
++		if (sf->page)
++			dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
++						TB_MAX_FRAME_SIZE,
++						DMA_FROM_DEVICE);
+ 		sf->offset = frame_offset;
+ 		sf->frame.size = frame_size;
+ 		sf->completed = true;
+@@ -667,6 +701,14 @@ static int tbstream_dev_alloc_rx_buffers(struct tbstream_dev *sdev)
+ 		struct tbstream_frame *sf = &sdev->rx_ring.frames[i];
+ 		dma_addr_t dma_addr;
+ 
++		if (sdev->zc_rx_import) {
++			sf->sdev = sdev;
++			sf->frame.callback = tbstream_dev_rx_callback;
++			sf->frame.buffer_phy = sdev->zc_rx_import->iovas[i];
++			tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
++			continue;
++		}
++
+ 		sf->page = alloc_page(GFP_KERNEL);
+ 		if (!sf->page)
+ 			return -ENOMEM;
+@@ -709,7 +751,7 @@ tbstream_dev_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 	}
+ 
+ 	zc = READ_ONCE(sdev->zc);
+-	if (zc) {
++	if (zc && sf->page) {
+ 		struct device *dma_dev = tb_ring_dma_device(ring);
+ 
+ 		dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
+@@ -785,6 +827,14 @@ static int tbstream_dev_alloc_tx_buffers(struct tbstream_dev *sdev)
+ 		struct tbstream_frame *sf = &sdev->tx_ring.frames[i];
+ 		dma_addr_t dma_addr;
+ 
++		if (sdev->zc_tx_import) {
++			sf->sdev = sdev;
++			sf->frame.callback = tbstream_dev_tx_callback;
++			sf->frame.buffer_phy = sdev->zc_tx_import->iovas[i];
++			sf->frame.sof = TBSTREAM_FRAME_START;
++			continue;
++		}
++
+ 		sf->page = alloc_page(GFP_KERNEL);
+ 		if (!sf->page)
+ 			return -ENOMEM;
+@@ -852,10 +902,79 @@ tbstream_dev_send_data(struct tbstream_dev *sdev, struct iov_iter *from,
+ 	return tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
+ }
+ 
++static void
++tbstream_dev_close_frame_callback(struct tb_ring *ring,
++				  struct ring_frame *frame, bool canceled)
++{
++	/*
++	 * The dedicated CLOSE frame is not part of the slot pool, so its
++	 * completion must not touch pool cursors or zero-copy state.
++	 */
++}
++
++/*
++ * An imported TX pool has no CPU mapping the kernel could write a
++ * CLOSE packet into, so imported-TX sessions carry one dedicated
++ * page-backed control frame outside the slot pool.
++ */
++static int tbstream_dev_alloc_close_frame(struct tbstream_dev *sdev)
++{
++	struct device *dma_dev = tb_ring_dma_device(sdev->tx_ring.ring);
++	struct tbstream_frame *sf = &sdev->zc_close_frame;
++	dma_addr_t dma_addr;
++
++	sf->page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++	if (!sf->page)
++		return -ENOMEM;
++
++	dma_addr = dma_map_page(dma_dev, sf->page, 0, TB_MAX_FRAME_SIZE,
++				DMA_TO_DEVICE);
++	if (dma_mapping_error(dma_dev, dma_addr)) {
++		__free_page(sf->page);
++		sf->page = NULL;
++		return -ENOMEM;
++	}
++
++	sf->sdev = sdev;
++	sf->frame.callback = tbstream_dev_close_frame_callback;
++	sf->frame.buffer_phy = dma_addr;
++	sf->frame.sof = TBSTREAM_FRAME_START;
++	sdev->zc_close_frame_mapped = true;
++	return 0;
++}
++
++/* Safe to call only while the TX ring is still allocated. */
++static void tbstream_dev_free_close_frame(struct tbstream_dev *sdev)
++{
++	struct tbstream_frame *sf = &sdev->zc_close_frame;
++	struct device *dma_dev;
++
++	if (!sdev->zc_close_frame_mapped)
++		return;
++
++	dma_dev = tb_ring_dma_device(sdev->tx_ring.ring);
++	dma_unmap_page(dma_dev, sf->frame.buffer_phy, TB_MAX_FRAME_SIZE,
++		       DMA_TO_DEVICE);
++	__free_page(sf->page);
++	memset(sf, 0, sizeof(*sf));
++	sdev->zc_close_frame_mapped = false;
++}
++
+ static int tbstream_dev_send_close(struct tbstream_dev *sdev)
+ {
+ 	struct tbstream_frame *sf;
+ 
++	if (sdev->zc_tx_import) {
++		sf = &sdev->zc_close_frame;
++
++		if (!sdev->zc_close_frame_mapped)
++			return -ENXIO;
++		sf->frame.size = SZ_256;
++		sf->frame.eof = TBSTREAM_CLOSE;
++		sf->frame.flags = 0;
++		return tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
++	}
++
+ 	sf = tbstream_dev_alloc_tx(sdev, TBSTREAM_CLOSE, NULL, SZ_256);
+ 	if (IS_ERR(sf))
+ 		return PTR_ERR(sf);
+@@ -879,6 +998,12 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	if (ret)
+ 		goto err_free_tx_buffers;
+ 
++	if (sdev->zc_tx_import) {
++		ret = tbstream_dev_alloc_close_frame(sdev);
++		if (ret)
++			goto err_free_tx_buffers;
++	}
++
+ 	e2e_tx_hop = ring->hop;
+ 	sof_mask = BIT(TBSTREAM_FRAME_START);
+ 	eof_mask = BIT(TBSTREAM_DATA) | BIT(TBSTREAM_CLOSE) |
+@@ -925,6 +1050,7 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	tb_ring_free(sdev->rx_ring.ring);
+ 	sdev->rx_ring.ring = NULL;
+ err_free_tx_buffers:
++	tbstream_dev_free_close_frame(sdev);
+ 	tbstream_ring_free(&sdev->tx_ring);
+ 	tb_ring_free(sdev->tx_ring.ring);
+ 	sdev->tx_ring.ring = NULL;
+@@ -972,6 +1098,7 @@ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ 	tbstream_ring_free(&sdev->rx_ring);
+ 	tb_ring_free(sdev->rx_ring.ring);
+ 	sdev->rx_ring.ring = NULL;
++	tbstream_dev_free_close_frame(sdev);
+ 	tbstream_ring_free(&sdev->tx_ring);
+ 	tb_ring_free(sdev->tx_ring.ring);
+ 	sdev->tx_ring.ring = NULL;
+@@ -982,6 +1109,32 @@ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ 	}
+ }
+ 
++/*
++ * Rings and DMA paths are activated lazily by the first operation that
++ * needs them, so a DMA-BUF pool import can precede path activation and
++ * receive descriptors are always primed before the peer can transmit.
++ * sdev->lock must be held.
++ */
++static int tbstream_dev_activate_locked(struct tbstream_dev *sdev)
++{
++	int ret;
++
++	if (sdev->started)
++		return 0;
++	if (!sdev->users || tbstream_dev_removed(sdev))
++		return -ENXIO;
++	ret = tbstream_dev_valid(sdev);
++	if (ret)
++		return ret;
++
++	ret = tbstream_dev_start(sdev);
++	if (ret)
++		return ret;
++	sdev->started = true;
++	sdev->closed = false;
++	return 0;
++}
++
+ static ssize_t
+ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ {
+@@ -998,10 +1151,13 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock))
+ 		return -ERESTARTSYS;
+-	if (sdev->zc) {
++	if (sdev->zc || sdev->zc_tx_import || sdev->zc_rx_import) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
++	ret = tbstream_dev_activate_locked(sdev);
++	if (ret)
++		goto out_unlock;
+ 
+ 	while (!tbstream_ring_available(&sdev->rx_ring)) {
+ 		mutex_unlock(&sdev->lock);
+@@ -1101,10 +1257,13 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock))
+ 		return -ERESTARTSYS;
+-	if (sdev->zc) {
++	if (sdev->zc || sdev->zc_tx_import || sdev->zc_rx_import) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
++	ret = tbstream_dev_activate_locked(sdev);
++	if (ret)
++		goto out_unlock;
+ 
+ 	while (!tbstream_ring_available(&sdev->tx_ring)) {
+ 		mutex_unlock(&sdev->lock);
+@@ -1170,6 +1329,17 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 	guard(mutex)(&sdev->lock);
+ 	if (tbstream_dev_valid(sdev) != 0 || tbstream_dev_removed(sdev)) {
+ 		mask |= EPOLLHUP | EPOLLERR;
++	} else if (!sdev->started) {
++		/*
++		 * An imported device activates only through
++		 * TBSTREAM_ZC_ENABLE; nothing is ready before that.
++		 */
++		if (!sdev->zc_tx_import && !sdev->zc_rx_import) {
++			if (tbstream_dev_activate_locked(sdev))
++				mask |= EPOLLHUP | EPOLLERR;
++			else if (tbstream_ring_available(&sdev->tx_ring))
++				mask |= EPOLLOUT | EPOLLWRNORM;
++		}
+ 	} else if (sdev->zc) {
+ 		bool failed = tbstream_dev_zc_failed(sdev);
+ 
+@@ -1207,7 +1377,7 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 	if (ret)
+ 		goto out_unlock;
+ 
+-	if (!sdev->users || !sdev->tx_ring.ring) {
++	if (!sdev->users) {
+ 		ret = -ENXIO;
+ 		goto out_unlock;
+ 	}
+@@ -1218,6 +1388,10 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 	if (sdev->zc)
+ 		goto out_unlock;
+ 
++	ret = tbstream_dev_activate_locked(sdev);
++	if (ret)
++		goto out_unlock;
++
+ 	size = tb_ring_size(sdev->tx_ring.ring);
+ 	spin_lock_irqsave(&sdev->zc_lock, flags);
+ 	if (sdev->tx_ring.prod - sdev->tx_ring.cons != size - 1) {
+@@ -1245,8 +1419,10 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 	for (i = 0; i < size; i++) {
+ 		struct tbstream_frame *sf = &sdev->tx_ring.frames[i];
+ 
+-		dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
+-					TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);
++		if (sf->page)
++			dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
++						TB_MAX_FRAME_SIZE,
++						DMA_TO_DEVICE);
+ 	}
+ 
+ 	spin_lock_irqsave(&sdev->zc_lock, flags);
+@@ -1255,6 +1431,8 @@ static int tbstream_dev_zc_enable(struct tbstream_dev *sdev)
+ 		for (i = 0; i < size; i++) {
+ 			struct tbstream_frame *sf = &sdev->tx_ring.frames[i];
+ 
++			if (!sf->page)
++				continue;
+ 			dma_sync_single_for_device(dma_dev,
+ 						   sf->frame.buffer_phy,
+ 						   TB_MAX_FRAME_SIZE,
+@@ -1655,6 +1833,10 @@ static int tbstream_dev_zc_get_stats(struct tbstream_dev *sdev,
+ 
+ 	if (tbstream_dev_removed(sdev))
+ 		stats.flags |= TBSTREAM_ZC_STATS_F_REMOVED;
++	if (sdev->zc_tx_import)
++		stats.flags |= TBSTREAM_ZC_STATS_F_TX_IMPORTED;
++	if (sdev->zc_rx_import)
++		stats.flags |= TBSTREAM_ZC_STATS_F_RX_IMPORTED;
+ 	stats.in_hopid = sdev->in_hopid;
+ 	stats.out_hopid = sdev->out_hopid;
+ 	stats.throttling = sdev->throttling;
+@@ -1809,10 +1991,13 @@ static int tbstream_dev_zc_dmabuf_probe(struct tbstream_dev *sdev,
+ 		ret = -ENXIO;
+ 		goto out_unlock;
+ 	}
+-	if (sdev->zc || !sdev->tx_ring.ring || !sdev->rx_ring.ring) {
++	if (sdev->zc || sdev->zc_tx_import || sdev->zc_rx_import) {
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+ 	}
++	ret = tbstream_dev_activate_locked(sdev);
++	if (ret)
++		goto out_unlock;
+ 	dma_dev = tb_ring_dma_device(dir == DMA_TO_DEVICE ?
+ 				     sdev->tx_ring.ring : sdev->rx_ring.ring);
+ 
+@@ -1882,6 +2067,216 @@ static int tbstream_dev_zc_dmabuf_probe(struct tbstream_dev *sdev,
+ 	return ret;
+ }
+ 
++static void
++tbstream_dev_zc_import_half_release(struct tbstream_zc_import_half *half,
++				    enum dma_data_direction dir)
++{
++	if (!half)
++		return;
++	kvfree(half->iovas);
++	dma_buf_unmap_attachment(half->attach, half->sgt, dir);
++	dma_buf_unpin(half->attach);
++	dma_buf_detach(half->dmabuf, half->attach);
++	dma_buf_put(half->dmabuf);
++	kfree(half);
++}
++
++/* sdev->lock must be held and the rings must not be running. */
++static void tbstream_dev_zc_import_release(struct tbstream_dev *sdev)
++{
++	tbstream_dev_zc_import_half_release(sdev->zc_tx_import, DMA_TO_DEVICE);
++	sdev->zc_tx_import = NULL;
++	tbstream_dev_zc_import_half_release(sdev->zc_rx_import,
++					    DMA_FROM_DEVICE);
++	sdev->zc_rx_import = NULL;
++}
++
++/*
++ * Import one directional pool. Every acquired object is released in
++ * reverse order on any failure, leaving the device unchanged.
++ */
++static struct tbstream_zc_import_half *
++tbstream_dev_zc_import_half(struct tbstream_dev *sdev,
++			    const struct tbstream_zc_import_range *range,
++			    enum dma_data_direction dir, u64 pool_bytes,
++			    struct device *dma_dev)
++{
++	struct tbstream_zc_import_half *half;
++	struct tbstream_sg_query query;
++	int ret;
++
++	if (range->flags)
++		return ERR_PTR(-EINVAL);
++	if (!IS_ALIGNED(range->offset, TBSTREAM_ZC_FRAME_SIZE) ||
++	    range->length != pool_bytes)
++		return ERR_PTR(-EINVAL);
++
++	half = kzalloc_obj(*half);
++	if (!half)
++		return ERR_PTR(-ENOMEM);
++
++	half->dmabuf = dma_buf_get(range->fd);
++	if (IS_ERR(half->dmabuf)) {
++		ret = PTR_ERR(half->dmabuf);
++		goto err_free;
++	}
++	/* RX hardware writes the buffer; reject a read-only object. */
++	if (dir == DMA_FROM_DEVICE &&
++	    !(half->dmabuf->file->f_mode & FMODE_WRITE)) {
++		ret = -EBADF;
++		goto err_put;
++	}
++	if (range->offset > half->dmabuf->size ||
++	    range->length > half->dmabuf->size - range->offset) {
++		ret = -EINVAL;
++		goto err_put;
++	}
++
++	half->attach = dma_buf_dynamic_attach(half->dmabuf, dma_dev,
++					      &tbstream_dmabuf_attach_ops,
++					      NULL);
++	if (IS_ERR(half->attach)) {
++		ret = PTR_ERR(half->attach);
++		goto err_put;
++	}
++
++	ret = dma_buf_pin(half->attach);
++	if (ret)
++		goto err_detach;
++
++	half->sgt = dma_buf_map_attachment(half->attach, dir);
++	if (IS_ERR(half->sgt)) {
++		ret = PTR_ERR(half->sgt);
++		goto err_unpin;
++	}
++
++	half->iovas = kvcalloc(sdev->ring_size, sizeof(*half->iovas),
++			       GFP_KERNEL);
++	if (!half->iovas) {
++		ret = -ENOMEM;
++		goto err_unmap;
++	}
++
++	ret = tbstream_sg_flatten(half->sgt, range->offset, range->length,
++				  half->iovas, sdev->ring_size, &query);
++	if (ret)
++		goto err_free_iovas;
++	if (query.covered != range->length ||
++	    query.frames != sdev->ring_size) {
++		ret = -EINVAL;
++		goto err_free_iovas;
++	}
++	return half;
++
++err_free_iovas:
++	kvfree(half->iovas);
++err_unmap:
++	dma_buf_unmap_attachment(half->attach, half->sgt, dir);
++err_unpin:
++	dma_buf_unpin(half->attach);
++err_detach:
++	dma_buf_detach(half->dmabuf, half->attach);
++err_put:
++	dma_buf_put(half->dmabuf);
++err_free:
++	kfree(half);
++	return ERR_PTR(ret);
++}
++
++/*
++ * Atomically select DMA-BUF backed frame pools for the zero-copy
++ * session a following TBSTREAM_ZC_ENABLE will start. Must run on an
++ * exclusively opened, never-activated device so no path can carry
++ * traffic into or out of a partially configured pool.
++ */
++static int tbstream_dev_zc_import(struct tbstream_dev *sdev,
++				  void __user *arg)
++{
++	struct tbstream_zc_import_half *tx_half = NULL, *rx_half = NULL;
++	struct tbstream_zc_import imp;
++	struct device *dma_dev;
++	struct tb_xdomain *xd;
++	u64 pool_bytes;
++	int ret;
++
++	if (!zc_diagnostic_dmabuf)
++		return -EACCES;
++	if (!capable(CAP_SYS_RAWIO))
++		return -EPERM;
++	if (copy_from_user(&imp, arg, sizeof(imp)))
++		return -EFAULT;
++	if (imp.version != TBSTREAM_ZC_IMPORT_VERSION || imp.flags ||
++	    imp.reserved[0] || imp.reserved[1] || imp.reserved[2] ||
++	    imp.reserved[3])
++		return -EINVAL;
++	if (imp.tx.fd < 0 && (imp.tx.flags || imp.tx.offset || imp.tx.length))
++		return -EINVAL;
++	if (imp.rx.fd < 0 && (imp.rx.flags || imp.rx.offset || imp.rx.length))
++		return -EINVAL;
++	if (imp.tx.fd < 0 && imp.rx.fd < 0)
++		return -EINVAL;
++
++	if (mutex_lock_interruptible(&sdev->lock))
++		return -ERESTARTSYS;
++
++	ret = tbstream_dev_valid(sdev);
++	if (ret || tbstream_dev_removed(sdev)) {
++		ret = -ENXIO;
++		goto out_unlock;
++	}
++	if (sdev->users != 1) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++	/* Import must precede ring construction and path activation. */
++	if (sdev->started || sdev->zc || sdev->zc_tx_import ||
++	    sdev->zc_rx_import) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	pool_bytes = (u64)sdev->ring_size * TBSTREAM_ZC_FRAME_SIZE;
++	xd = tbstream_dev_xdomain(sdev);
++	dma_dev = &xd->tb->nhi->pdev->dev;
++
++	if (imp.tx.fd >= 0) {
++		tx_half = tbstream_dev_zc_import_half(sdev, &imp.tx,
++						      DMA_TO_DEVICE,
++						      pool_bytes, dma_dev);
++		if (IS_ERR(tx_half)) {
++			ret = PTR_ERR(tx_half);
++			goto out_unlock;
++		}
++	}
++	if (imp.rx.fd >= 0) {
++		rx_half = tbstream_dev_zc_import_half(sdev, &imp.rx,
++						      DMA_FROM_DEVICE,
++						      pool_bytes, dma_dev);
++		if (IS_ERR(rx_half)) {
++			ret = PTR_ERR(rx_half);
++			goto err_release_tx;
++		}
++	}
++	/* One buffer must not be DMA-mapped in both directions at once. */
++	if (tx_half && rx_half && tx_half->dmabuf == rx_half->dmabuf) {
++		ret = -EINVAL;
++		goto err_release_rx;
++	}
++
++	sdev->zc_tx_import = tx_half;
++	sdev->zc_rx_import = rx_half;
++	mutex_unlock(&sdev->lock);
++	return 0;
++
++err_release_rx:
++	tbstream_dev_zc_import_half_release(rx_half, DMA_FROM_DEVICE);
++err_release_tx:
++	tbstream_dev_zc_import_half_release(tx_half, DMA_TO_DEVICE);
++out_unlock:
++	mutex_unlock(&sdev->lock);
++	return ret;
++}
++
+ static long
+ tbstream_dev_fops_ioctl(struct file *file, unsigned int cmd,
+ 			unsigned long arg)
+@@ -1914,6 +2309,8 @@ tbstream_dev_fops_ioctl(struct file *file, unsigned int cmd,
+ 		return tbstream_dev_zc_kick(sdev, uarg);
+ 	case TBSTREAM_ZC_DMABUF_PROBE:
+ 		return tbstream_dev_zc_dmabuf_probe(sdev, uarg);
++	case TBSTREAM_ZC_IMPORT:
++		return tbstream_dev_zc_import(sdev, uarg);
+ 	default:
+ 		return -ENOTTY;
+ 	}
+@@ -1944,13 +2341,22 @@ static int tbstream_dev_fops_mmap(struct file *file,
+ 
+ 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+ 
++	/*
++	 * Imported pools have no CPU pages; their half of the mapping is
++	 * left as an unpopulated hole. The payload owner for those slots
++	 * is the exporting device, not the CPU.
++	 */
+ 	addr = vma->vm_start;
+ 	for (i = 0; i < ring_size; i++, addr += PAGE_SIZE) {
++		if (!sdev->tx_ring.frames[i].page)
++			continue;
+ 		ret = vm_insert_page(vma, addr, sdev->tx_ring.frames[i].page);
+ 		if (ret)
+ 			goto out_unlock;
+ 	}
+ 	for (i = 0; i < ring_size; i++, addr += PAGE_SIZE) {
++		if (!sdev->rx_ring.frames[i].page)
++			continue;
+ 		ret = vm_insert_page(vma, addr, sdev->rx_ring.frames[i].page);
+ 		if (ret)
+ 			goto out_unlock;
+@@ -2001,20 +2407,17 @@ static int tbstream_dev_fops_open(struct inode *inode, struct file *file)
+ 	}
+ 
+ 	/* Zero-copy pool ownership is device-wide and must stay exclusive. */
+-	if (sdev->zc) {
++	if (sdev->zc || sdev->zc_tx_import || sdev->zc_rx_import) {
+ 		ret = -EBUSY;
+ 		goto err_unlock;
+ 	}
+ 
+-	/* Only on first open we allocate rings and enable paths */
+-	if (!sdev->users++) {
+-		ret = tbstream_dev_start(sdev);
+-		if (ret) {
+-			sdev->users--;
+-			goto err_unlock;
+-		}
+-		sdev->closed = false;
+-	}
++	/*
++	 * Ring construction and DMA path activation are deferred to the
++	 * first operation that needs them so that a DMA-BUF pool import
++	 * can run before any path is active.
++	 */
++	sdev->users++;
+ 
+ 	mutex_unlock(&sdev->lock);
+ 	return 0;
+@@ -2034,20 +2437,25 @@ static int tbstream_dev_fops_release(struct inode *inode, struct file *file)
+ 
+ 	mutex_lock(&sdev->lock);
+ 	if (--sdev->users == 0) {
+-		/*
+-		 * Send CLOSE tunneled packet to notify the other end
+-		 * that we are closing the file. We do this twice if the
+-		 * first one fails.
+-		 */
+-		ret = tbstream_dev_send_close(sdev);
+-		if (ret) {
+-			int retry = tbstream_dev_send_close(sdev);
++		if (sdev->started) {
++			/*
++			 * Send CLOSE tunneled packet to notify the other
++			 * end that we are closing the file. We do this
++			 * twice if the first one fails.
++			 */
++			ret = tbstream_dev_send_close(sdev);
++			if (ret) {
++				int retry = tbstream_dev_send_close(sdev);
+ 
+-			if (retry)
+-				pr_warn("device %d failed to send CLOSE twice: %d, %d\n",
+-					sdev->index, ret, retry);
++				if (retry)
++					pr_warn("device %d failed to send CLOSE twice: %d, %d\n",
++						sdev->index, ret, retry);
++			}
++			tbstream_dev_stop(sdev);
++			sdev->started = false;
+ 		}
+-		tbstream_dev_stop(sdev);
++		/* Imported pools last exactly as long as the final open. */
++		tbstream_dev_zc_import_release(sdev);
+ 	}
+ 	mutex_unlock(&sdev->lock);
+ 
+@@ -2833,8 +3241,8 @@ static int __maybe_unused tbstream_suspend(struct device *dev)
+ 
+ 	list_for_each_entry_reverse(sdev, &sg->dev_list, list) {
+ 		tbstream_dev_get(sdev);
+-		/* Stop the stream (if it was open) */
+-		if (sdev->users)
++		/* Stop the stream (if it was open and activated) */
++		if (sdev->users && sdev->started)
+ 			tbstream_dev_stop(sdev);
+ 		tbstream_dev_put(sdev);
+ 	}
+@@ -2856,7 +3264,7 @@ static int __maybe_unused tbstream_resume(struct device *dev)
+ 
+ 	list_for_each_entry(sdev, &sg->dev_list, list) {
+ 		tbstream_dev_get(sdev);
+-		if (sdev->users) {
++		if (sdev->users && sdev->started) {
+ 			int ret;
+ 
+ 			ret = tbstream_dev_start(sdev);
+diff --git a/include/uapi/linux/thunderbolt-stream.h b/include/uapi/linux/thunderbolt-stream.h
+index d4cd9a195..e59a982a3 100644
+--- a/include/uapi/linux/thunderbolt-stream.h
++++ b/include/uapi/linux/thunderbolt-stream.h
+@@ -286,6 +286,8 @@ struct tbstream_zc_stats {
+ #define TBSTREAM_ZC_STATS_F_FAILED	0x1
+ #define TBSTREAM_ZC_STATS_F_CLOSED	0x2
+ #define TBSTREAM_ZC_STATS_F_REMOVED	0x4
++#define TBSTREAM_ZC_STATS_F_TX_IMPORTED	0x8
++#define TBSTREAM_ZC_STATS_F_RX_IMPORTED	0x10
+ 
+ #define TBSTREAM_ZC_ERROR_NONE		0
+ #define TBSTREAM_ZC_ERROR_RX_CRC	1
+@@ -354,6 +356,55 @@ struct tbstream_zc_dmabuf_probe {
+ 	__aligned_u64 reserved[4];
+ };
+ 
++/**
++ * struct tbstream_zc_import_range - One directional pool import range
++ * @fd: DMA-BUF file descriptor, or -1 to keep the kernel page-backed
++ *	pool for this direction
++ * @flags: Must be 0
++ * @offset: First byte of the pool inside the DMA-BUF, aligned to
++ *	%TBSTREAM_ZC_FRAME_SIZE; must be 0 when @fd is -1
++ * @length: Pool bytes; must equal ring_size * %TBSTREAM_ZC_FRAME_SIZE
++ *	exactly, or 0 when @fd is -1
++ */
++struct tbstream_zc_import_range {
++	__s32 fd;
++	__u32 flags;
++	__aligned_u64 offset;
++	__aligned_u64 length;
++};
++
++#define TBSTREAM_ZC_IMPORT_VERSION	1
++
++/**
++ * struct tbstream_zc_import - TBSTREAM_ZC_IMPORT argument
++ * @version: Must be %TBSTREAM_ZC_IMPORT_VERSION
++ * @flags: Must be 0
++ * @tx: TX pool source
++ * @rx: RX pool source
++ * @reserved: Must be 0
++ *
++ * Atomically selects DMA-BUF backed frame pools for the zero-copy
++ * session that a following TBSTREAM_ZC_ENABLE will start. The ioctl
++ * must run on an exclusively opened, not yet activated stream: before
++ * any read, write, poll, mmap or enable has started the rings or
++ * enabled the DMA paths. Each imported pool is attached to the NHI DMA
++ * device, pinned, mapped in its fixed direction, and validated to
++ * cover the whole pool with frame-aligned segments; on any failure
++ * every acquired object is released in reverse order and the device is
++ * left unchanged. Imported pools have no CPU mapping: mmap() leaves
++ * holes for imported halves and ordinary read()/write() are rejected
++ * while an import is configured. The import lasts until the final
++ * close of the device. Requires CAP_SYS_RAWIO and the
++ * thunderbolt_stream.zc_diagnostic_dmabuf module parameter.
++ */
++struct tbstream_zc_import {
++	__u32 version;
++	__u32 flags;
++	struct tbstream_zc_import_range tx;
++	struct tbstream_zc_import_range rx;
++	__aligned_u64 reserved[4];
++};
++
+ #define TBSTREAM_ZC_MAGIC	0xb4
+ 
+ #define TBSTREAM_ZC_ENABLE	_IO(TBSTREAM_ZC_MAGIC, 0x00)
+@@ -369,5 +420,7 @@ struct tbstream_zc_dmabuf_probe {
+ 	_IOW(TBSTREAM_ZC_MAGIC, 0x07, struct tbstream_zc_kick)
+ #define TBSTREAM_ZC_DMABUF_PROBE \
+ 	_IOWR(TBSTREAM_ZC_MAGIC, 0x08, struct tbstream_zc_dmabuf_probe)
++#define TBSTREAM_ZC_IMPORT \
++	_IOW(TBSTREAM_ZC_MAGIC, 0x09, struct tbstream_zc_import)
+ 
+ #endif /* _UAPI_LINUX_THUNDERBOLT_STREAM_H */
+-- 
+2.55.0
+

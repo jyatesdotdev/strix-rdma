@@ -1,6 +1,37 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-23 — Pass gate 5: imported native GPU pools carry real NHI traffic
+- **What:** Implemented zero-copy patch 14 (`TBSTREAM_ZC_IMPORT`): lazy ring/
+  path activation so imports always precede activation, an atomic
+  transactional DMA-BUF pool import for either or both directions with
+  reverse rollback, guarded (never-synced) imported frames with mmap holes
+  and rejected legacy read/write, and a dedicated page-backed CLOSE control
+  frame for imported-TX sessions. Strict checkpatch/W=1 clean against the
+  exact 7.1.5 tree. Built the `tools/stale-cache` two-host harness (CPU
+  sender with generation-stamped patterns; HIP receiver importing a poisoned
+  native pool as the live RX ring and verifying every message with GPU
+  digest kernels), live-swapped the patch-14 module transiently on both
+  hosts (max2's Secure Boot is now disabled — byte-identical module reuse,
+  no signing), and ran the full matrix at ring 256 (L2-resident pool) and
+  ring 4096 (production geometry).
+- **Why:** Gate 5 of the native HIP DMA-BUF experiment: prove NHI DMA into
+  reused hot native-GPU RX slots is correct under alternating generations
+  before any DS4 integration, and characterize which acquire mechanism is
+  actually required.
+- **Impact:** First-ever real stream traffic into native `hipMalloc` memory
+  with zero CPU copies: 6,656 messages / 448 MiB / 448 pool wraps across
+  seven arms (coarse/uncached × event-acquire/none, adversarial prewarm,
+  production geometry) — all word-exact with zero event drops or failures.
+  No stale-cache failure was producible even with slots deliberately
+  cache-resident during DMA writes and no acquire — strong evidence of
+  I/O-coherent NHI writes on Strix Halo — but the explicit timing-enabled
+  `hipEventReleaseToSystem` acquire remains the production contract. Both
+  hosts were restored to the production module set and smoke-verified.
+  Gate 6 (imported TX→RX plus fault/rollback coverage) is unblocked;
+  gate 7 touches DS4/live inference and awaits explicit operator go-ahead.
+  Full evidence: `bench/results/2026-08-23-dmabuf-imported-pool-stale-cache.md`.
+
 ## 2026-08-23 — Pass gate 4: live DMA-BUF import probe on the real NHI
 - **What:** Wrote the `tbstream-hip-export` companion (dedicated coarse/
   uncached/fine-grain HIP allocation, base/full-range check, GPU fill,

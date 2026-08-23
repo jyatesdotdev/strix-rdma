@@ -286,6 +286,8 @@ struct tbstream_zc_stats {
 #define TBSTREAM_ZC_STATS_F_FAILED	0x1
 #define TBSTREAM_ZC_STATS_F_CLOSED	0x2
 #define TBSTREAM_ZC_STATS_F_REMOVED	0x4
+#define TBSTREAM_ZC_STATS_F_TX_IMPORTED	0x8
+#define TBSTREAM_ZC_STATS_F_RX_IMPORTED	0x10
 
 #define TBSTREAM_ZC_ERROR_NONE		0
 #define TBSTREAM_ZC_ERROR_RX_CRC	1
@@ -354,6 +356,55 @@ struct tbstream_zc_dmabuf_probe {
 	__aligned_u64 reserved[4];
 };
 
+/**
+ * struct tbstream_zc_import_range - One directional pool import range
+ * @fd: DMA-BUF file descriptor, or -1 to keep the kernel page-backed
+ *	pool for this direction
+ * @flags: Must be 0
+ * @offset: First byte of the pool inside the DMA-BUF, aligned to
+ *	%TBSTREAM_ZC_FRAME_SIZE; must be 0 when @fd is -1
+ * @length: Pool bytes; must equal ring_size * %TBSTREAM_ZC_FRAME_SIZE
+ *	exactly, or 0 when @fd is -1
+ */
+struct tbstream_zc_import_range {
+	__s32 fd;
+	__u32 flags;
+	__aligned_u64 offset;
+	__aligned_u64 length;
+};
+
+#define TBSTREAM_ZC_IMPORT_VERSION	1
+
+/**
+ * struct tbstream_zc_import - TBSTREAM_ZC_IMPORT argument
+ * @version: Must be %TBSTREAM_ZC_IMPORT_VERSION
+ * @flags: Must be 0
+ * @tx: TX pool source
+ * @rx: RX pool source
+ * @reserved: Must be 0
+ *
+ * Atomically selects DMA-BUF backed frame pools for the zero-copy
+ * session that a following TBSTREAM_ZC_ENABLE will start. The ioctl
+ * must run on an exclusively opened, not yet activated stream: before
+ * any read, write, poll, mmap or enable has started the rings or
+ * enabled the DMA paths. Each imported pool is attached to the NHI DMA
+ * device, pinned, mapped in its fixed direction, and validated to
+ * cover the whole pool with frame-aligned segments; on any failure
+ * every acquired object is released in reverse order and the device is
+ * left unchanged. Imported pools have no CPU mapping: mmap() leaves
+ * holes for imported halves and ordinary read()/write() are rejected
+ * while an import is configured. The import lasts until the final
+ * close of the device. Requires CAP_SYS_RAWIO and the
+ * thunderbolt_stream.zc_diagnostic_dmabuf module parameter.
+ */
+struct tbstream_zc_import {
+	__u32 version;
+	__u32 flags;
+	struct tbstream_zc_import_range tx;
+	struct tbstream_zc_import_range rx;
+	__aligned_u64 reserved[4];
+};
+
 #define TBSTREAM_ZC_MAGIC	0xb4
 
 #define TBSTREAM_ZC_ENABLE	_IO(TBSTREAM_ZC_MAGIC, 0x00)
@@ -369,5 +420,7 @@ struct tbstream_zc_dmabuf_probe {
 	_IOW(TBSTREAM_ZC_MAGIC, 0x07, struct tbstream_zc_kick)
 #define TBSTREAM_ZC_DMABUF_PROBE \
 	_IOWR(TBSTREAM_ZC_MAGIC, 0x08, struct tbstream_zc_dmabuf_probe)
+#define TBSTREAM_ZC_IMPORT \
+	_IOW(TBSTREAM_ZC_MAGIC, 0x09, struct tbstream_zc_import)
 
 #endif /* _UAPI_LINUX_THUNDERBOLT_STREAM_H */
