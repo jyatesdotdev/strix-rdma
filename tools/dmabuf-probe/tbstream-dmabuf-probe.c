@@ -34,19 +34,30 @@
 
 #include "thunderbolt-stream.h"
 
-#ifndef UDMABUF_CREATE
+#if __has_include(<linux/udmabuf.h>)
+#include <linux/udmabuf.h>
+#else
 struct udmabuf_create {
 	uint32_t memfd;
 	uint32_t flags;
 	uint64_t offset;
 	uint64_t size;
 };
-#define UDMABUF_CREATE		_IOWR('u', 0x42, struct udmabuf_create)
+#define UDMABUF_CREATE		_IOW('u', 0x42, struct udmabuf_create)
 #define UDMABUF_FLAGS_CLOEXEC	0x01
 #endif
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC		0x0001U
+#endif
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING	0x0002U
+#endif
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS		1033
+#endif
+#ifndef F_SEAL_SHRINK
+#define F_SEAL_SHRINK		0x0002
 #endif
 
 static void usage(FILE *out)
@@ -102,13 +113,18 @@ static int create_udmabuf(uint64_t size)
 		exit(2);
 	}
 
-	memfd = memfd_create("tbstream-probe", MFD_CLOEXEC);
+	memfd = memfd_create("tbstream-probe", MFD_CLOEXEC | MFD_ALLOW_SEALING);
 	if (memfd < 0) {
 		perror("memfd_create");
 		exit(1);
 	}
 	if (ftruncate(memfd, (off_t)size)) {
 		perror("ftruncate");
+		exit(1);
+	}
+	/* udmabuf requires the backing memfd to be sealed against shrinking. */
+	if (fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK)) {
+		perror("F_ADD_SEALS");
 		exit(1);
 	}
 	udma = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);

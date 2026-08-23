@@ -1,6 +1,31 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-23 — Pass gate 4: live DMA-BUF import probe on the real NHI
+- **What:** Wrote the `tbstream-hip-export` companion (dedicated coarse/
+  uncached/fine-grain HIP allocation, base/full-range check, GPU fill,
+  device quiesce, DMA-BUF export, fork/exec of the probe with an inherited
+  fd), fixed the probe's udmabuf fallback (`_IOW` ioctl, `F_SEAL_SHRINK`
+  seal), and ran the gate-4 matrix on `max` via a transient live swap of the
+  gate-3 13-patch `thunderbolt_stream.ko` with `zc_diagnostic_dmabuf=1`.
+  Nothing was installed; the production module was restored, the 9/9 endpoint
+  republished, and a live chat completion verified the untouched TCP-v3
+  production path. `max2` was never touched.
+- **Why:** Gate 4 of the native HIP DMA-BUF experiment: measure real import/
+  map geometry against the NHI DMA device before writing any imported-pool
+  mode.
+- **Impact:** Coarse and uncached native HIP pools map through the enabled
+  IOMMU as a **single fully-covering, frame-aligned DMA segment** at 16 MiB
+  and 256 MiB in both directions (udmabuf control: uniform 64 KiB segments,
+  full coverage) — ideal geometry for the slot flattener. The fine-grain arm
+  is unavailable on this platform: the allocation reports coarse-grain
+  coherency and XNACK is hard-disabled (`HSA_XNACK=1` has no effect), so
+  gate 5 must use coarse+explicit-acquire vs. uncached as its arms. Gate 5
+  (stale-cache ownership with real traffic and a GPU payload digest) is now
+  unblocked; it needs a MOK-signed two-host deployment, which also covers the
+  deferred `max2` replication. Full evidence:
+  `bench/results/2026-08-23-dmabuf-import-probe.md`.
+
 ## 2026-08-17 — Implement the gate-3 no-traffic DMA-BUF import probe
 - **What:** Added zero-copy patch 13 (`TBSTREAM_ZC_DMABUF_PROBE`) with the
   shared `stream-sg.h` segment-validation/frame-flattening helper, the
