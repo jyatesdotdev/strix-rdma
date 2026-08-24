@@ -1,6 +1,32 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-24 — Gate 7: imported native pools run live DS4 inference bit-exact
+- **What:** Window B with the ds4 session: layered an opt-in imported-pool
+  mode (`DS4_DIST_NHI_IMPORTED=1`, worker-only) onto their freshly ported
+  NHI transport (their `winb-imported-pool` @ 46ea98e). The worker exports a
+  dedicated 16 MiB native HIP pool as a DMA-BUF, imports it as the TX pool
+  before ring activation, and the output head writes logits straight into
+  memory the NHI reads — no hipHostRegister, no CPU touch. Three-arm A/B
+  under the acceptance gate: v3-TCP 14.29 t/s, mapped NHI 13.33, imported
+  NHI 13.33, all bit-exact (sha df07199e5a292872), 21k prefill 245.85 /
+  246.84 (imported best-of-day, all within noise). Kernel stats clean
+  (0 failures/drops/CRC). Mid-window the TB-IP link wedged both directions
+  with silent dmesg; module reloads didn't heal it, authorized reboot did.
+  Window protocol hardened (never both devices closed with the reconcile
+  timer stopped); boot-order and tmpfs-/tmp staging footguns found and
+  disarmed; loud-failure design validated by an accidental boot flap.
+- **Why:** Prove the native DMA-BUF path under real inference and close out
+  the 0.065 ms host-registered penalty question.
+- **Impact:** Gate 7 passes: bit-exact + wall parity; the penalty removal is
+  real but below gate granularity, so the mode's value is structural — the
+  zero-CPU-touch substrate for TP exchanges (already measured at 9.8 µs RTT
+  / 4 KiB) and the end of host round trips in the result path. Follow-ups
+  queued: suppress terminal CLOSE toward a dead peer (2 s retry noise under
+  keep-open protocol), earlier+flushed stats logging for SIGTERM teardown.
+  Evidence: `bench/results/2026-08-24-gate7-imported-pool-live-inference.md`.
+  Both hosts restored to production and re-gated.
+
 ## 2026-08-24 — Window A: patch 14 is transparent to real DS4 inference
 - **What:** First coordinated test window with the ds4 session (prod stopped,
   restorable, acceptance-gated). Scripted the transient module swap
