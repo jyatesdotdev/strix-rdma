@@ -1,6 +1,30 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-24 — Window A: patch 14 is transparent to real DS4 inference
+- **What:** First coordinated test window with the ds4 session (prod stopped,
+  restorable, acceptance-gated). Scripted the transient module swap
+  (`tools/scripts/p14-swap.sh on|off`: holder-refusal, param verification,
+  prod endpoint recreation) and ran the patch-14 module set on both nodes
+  under the campaign-lineage DS4 binaries in both existing NHI modes
+  (CPU-copy and mapped hipHostRegister), full production config including
+  MTP.
+- **Why:** Compat prerequisite for gate 7 / Window B: prove patch-14's lazy
+  activation is invisible to the deployed open→ZC_ENABLE→GET_INFO→mmap
+  transport sequence under real inference load before layering the
+  imported-pool mode on it.
+- **Impact:** Both arms bit-exact against the production reference sha
+  (df07199e5a292872, 200 tok), wall parity (15.38 tok/s gate; 244.96/245.08
+  tok/s 21k prefill vs 245.2–245.7 TCP band), dmesg completely clean on both
+  nodes, clean teardown, production module+timer restored and verified by
+  script. DS4-side code confirmations: single open site, ENABLE immediately
+  after open, dispatcher polls only post-mmap. Window B plan agreed: ds4
+  session ports the NHI transport onto the live perf-prefill-decode lineage
+  (TCP-gated first); I layer the imported-pool worker-logits mode on the
+  ported file with an AmbientCapabilities=CAP_SYS_RAWIO drop-in, kernel gate
+  kept strict, and transport-shutdown ZC_GET_STATS logging added for gate
+  artifacts.
+
 ## 2026-08-23 — Pass gate 6; measure sub-5 µs GPU-polled exchange for TP
 - **What:** Completed gate 6 on the transient patch-14 module set: 17-case
   import rollback coverage (`tbstream-import-test`), GPU-written imported-TX
