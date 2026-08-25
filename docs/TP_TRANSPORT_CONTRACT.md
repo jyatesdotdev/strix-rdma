@@ -66,8 +66,10 @@ module set (`tools/scripts/p14-swap.sh on /tmp/thunderbolt_stream-p15.ko`).
    `slot(n) = (n % (ring/frames)) × frames`. Both peers must submit in
    the same order — the receive side has no addressing, only arrival
    order. `tbstream_zc_tx.first` is kernel output, not a requested slot:
-   assert after every submit that it equals the expected frame index,
-   and likewise assert every RX event's `first`, `nframes`, and `bytes`.
+   assert after every submit that it equals the expected frame index.
+   Validate completion geometry too: RX has the expected `first`,
+   `nframes`, and wire `bytes`; TX_DONE has the expected `first` and
+   `nframes` but **`bytes == 0`** (the field is RX-only).
 10. Message geometry: `frames` per message, wire cost is
     `frames × 4096` regardless of payload bytes; ring % frames == 0
     keeps messages contiguous (28 KiB payload → 8 frames; a 7-frame
@@ -111,6 +113,11 @@ module set (`tools/scripts/p14-swap.sh on /tmp/thunderbolt_stream-p15.ko`).
     show TX_IMPORTED|RX_IMPORTED and zero
     failures/event_drops/crc/overrun); flush stderr before teardown so
     systemd stops don't eat the line.
+17. Root-run test binaries must not share the production service user's
+    `/tmp/ds4.lock`: Fedora `fs.protected_regular` rejects opening the
+    other user's mode-0600 file in sticky `/tmp`, even for this root-run
+    path. Set `DS4_LOCK_FILE=/run/ds4-stage3.lock` per host, or remove a
+    confirmed-stale lock only after proving no DS4 process remains.
 
 ## Performance envelope (measured, ring 4096, 28 KiB payload)
 

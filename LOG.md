@@ -1,6 +1,29 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-25 — DS4 Stage-3 preflight: hardened transport passes; engine arm held safely
+- **What:** Reviewed DS4's ROCm/NHI Stage-3 implementation through three
+  fixups (`e4266a5..8fb6977`), catching before wire time: TX_DONE's zero-byte
+  ABI, TX-slot overwrite before wrap credit, healthy-shutdown ownership
+  loss, and gate-construction/CLOSE races. Under transient p15, the hardened
+  S2 arm then passed 4000 bit-exact full-duplex exchanges (~8 wraps) both
+  ranks with exact quiesce, TX 32000/32000, zero failures/drops/CRC/overrun,
+  93.4–94.1 µs/exchange, and spotless dmesg. The bounded one-token engine
+  arm did **not** run: worker failed before connect/NHI on Fedora's protected
+  stale `/tmp/ds4.lock`, and while coordinator was still only waiting on
+  TCP the DS4 session found a rank-1 compact-head offset bug. Urgent hold
+  honored; no retry and no Stage-3 stream traffic.
+- **Why:** Establish the engine gate only after both software ownership and
+  model semantics are correct; prevent a false result or an unopened-peer
+  wedge during first integration.
+- **Impact:** DS4's hardened transport is independently wire-approved; the
+  engine result remains explicitly open pending review/build of semantic
+  fix `0ce04c5` and a fresh one-token window. Root tests must use
+  `DS4_LOCK_FILE=/run/ds4-stage3.lock`, not the service user's default
+  `/tmp/ds4.lock`. Production modules/timers/services restored, API
+  inference-smoked, final dmesg clean. Evidence:
+  `bench/results/2026-08-25-ds4-stage3-preflight-window.md`.
+
 ## 2026-08-25 — TP exchange probe: 3.2 ms/token — tensor parallelism clears the bar
 - **What:** Built `tbstream-tp-exchange` (full-duplex simultaneous 28 KiB
   partial-sum exchanges through imported pools both directions, TCP start
