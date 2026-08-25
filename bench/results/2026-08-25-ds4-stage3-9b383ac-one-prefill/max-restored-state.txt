@@ -1,0 +1,30 @@
+HOST=max NOW=2026-08-24T23:33:20,020504656-07:00 KERNEL=7.1.5-101.fc43.x86_64
+==services==
+Id=ds4-mxfp4-worker.service
+ActiveState=active
+SubState=running
+MainPID=129764
+Id=ds4-tbstream-reconcile.timer
+ActiveState=active
+SubState=waiting
+==module==
+ccd946330a5612ffe7674246ac387b39d4a2e71562ed585cfc65d8d58e2650e7  /lib/modules/7.1.5-101.fc43.x86_64/updates/thunderbolt_stream.ko
+diag_param_absent
+==endpoint==
+/dev/tbstream0
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/in_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/out_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/ring_size=4096
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/throttling=0
+==holders-test-locks==
+clean
+==production-lock==
+fd3=39:3071
+path=39:3071
+lock:	1: FLOCK  ADVISORY  WRITE 129764 00:27:3071 0 EOF
+==ping==
+3 packets transmitted, 3 received, 0% packet loss, time 2041ms
+rtt min/avg/max/mdev = 0.196/0.198/0.203/0.003 ms
+==dmesg-since-marker==
+[Mon Aug 24 23:29:06 2026] STAGE3_9B383AC_P15_ARM_MAX_1787639344
+RESTORE_PASS

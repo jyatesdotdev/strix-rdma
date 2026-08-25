@@ -1,0 +1,48 @@
+HOST=max2 NOW=2026-08-24T23:25:39,943404413-07:00 KERNEL=7.1.5-101.fc43.x86_64
+==services==
+Id=ds4-mxfp4-server.service
+ActiveState=active
+SubState=running
+MainPID=111045
+PrivateTmp=yes
+Id=ds4-exporter.service
+ActiveState=active
+SubState=running
+MainPID=111054
+PrivateTmp=yes
+Id=ds4-tbstream-reconcile.timer
+ActiveState=active
+SubState=waiting
+==production-process==
+/opt/ds4-perf-nhi-20260824/ds4-server
+/opt/ds4-perf-nhi-20260824/ds4-server --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 -n 32768 --prefill-chunk 4096 --power 100 --role coordinator --layers 0:21 --listen 10.99.0.2 9000 --dist-prefill-chunk 1024 --dist-prefill-window 3 --dist-activation-bits 32 --host 0.0.0.0 --port 8080 --dist-transport auto 
+==production-lock==
+/tmp/ds4.lock
+fd3=41:1017
+rootpath=41:1017
+lock:	1: FLOCK  ADVISORY  WRITE 111045 00:29:1017 0 EOF
+==module==
+ccd946330a5612ffe7674246ac387b39d4a2e71562ed585cfc65d8d58e2650e7  /lib/modules/7.1.5-101.fc43.x86_64/updates/thunderbolt_stream.ko
+diag_param_absent
+==endpoint==
+/dev/tbstream0
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/in_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/out_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/ring_size=4096
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/throttling=0
+==holders-locks-staged-processes==
+clean
+==artifacts==
+4c20e8117765f912ece00d0e68dd3a22ce91631a8b905a537d542a22848210d7  /home/jryates/ds4-stage3-build/ds4
+4251387ba9804180ee7c867d069ea14ff23ba02d05d5be02a8a8eec3f366e431  /home/jryates/ds4-stage3-build/ds4_rocm.o
+bfae461b279ba4a294cbc61107b525785abb43c157c8ab17e116e24a10569a06  /home/jryates/ds4-stage3-build/ds4_rocm_unavailable.o
+d72d393ed93842bcdb9f2540dc8b57e6691ba0dc839b3efac58b8c932481c553  /home/jryates/ds4-stage3-build/ds4_transport_nhi.o
+cda5203f15e34612a0dd86a3043277581564fd2e0070297b284ca5155354b48c  /home/jryates/ds4-stage3-build/tests/test_tp_combine_rocm
+c61188161b945c4e82f558e004681b1e1e2ce7f0a9432bc6f019e8b0707780ae  /home/jryates/ds4-stage3-build/tests/test_tp_nhi_live
+8a80396bb27cd3403182ff1b5aef32325bd4f142530151345398d7d07db321e0  /tmp/thunderbolt_stream-p15.ko
+==model==
+155976458848 /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+==ping==
+3 packets transmitted, 3 received, 0% packet loss, time 2069ms
+rtt min/avg/max/mdev = 0.117/0.147/0.204/0.040 ms
+PREWINDOW_STATE_PASS

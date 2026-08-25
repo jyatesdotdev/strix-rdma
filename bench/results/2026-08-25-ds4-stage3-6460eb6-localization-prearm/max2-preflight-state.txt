@@ -1,0 +1,54 @@
+HOST=max2 NOW=2026-08-25T00:14:32,242515491-07:00 KERNEL=7.1.5-101.fc43.x86_64
+==services==
+Id=ds4-mxfp4-server.service
+ActiveState=active
+SubState=running
+MainPID=128892
+PrivateTmp=yes
+
+Id=ds4-exporter.service
+ActiveState=active
+SubState=running
+MainPID=128901
+PrivateTmp=yes
+Id=ds4-tbstream-reconcile.timer
+ActiveState=active
+SubState=waiting
+==production-process-lock==
+pid=128892 exe=/opt/ds4-perf-nhi-20260824/ds4-server
+/opt/ds4-perf-nhi-20260824/ds4-server --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 -n 32768 --prefill-chunk 4096 --power 100 --role coordinator --layers 0:21 --listen 10.99.0.2 9000 --dist-prefill-chunk 1024 --dist-prefill-window 3 --dist-activation-bits 32 --host 0.0.0.0 --port 8080 --dist-transport auto 
+fd3=41:1292 rootpath=41:1292
+3: FLOCK  ADVISORY  WRITE 128892 00:29:1292 0 EOF
+==module==
+ccd946330a5612ffe7674246ac387b39d4a2e71562ed585cfc65d8d58e2650e7  /lib/modules/7.1.5-101.fc43.x86_64/updates/thunderbolt_stream.ko
+diag_param_absent
+2
+==endpoint==
+/dev/tbstream0
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/in_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/out_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/ring_size=4096
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/throttling=0
+==holders==
+==timers-locks-staged==
+ABSENT:/run/ds4-stage3-localize-single.lock
+ABSENT:/run/ds4-stage3-localize-tp.lock
+ABSENT:/run/ds4-stage3.lock
+ABSENT:/tmp/ds4.lock
+==artifacts==
+4c20e8117765f912ece00d0e68dd3a22ce91631a8b905a537d542a22848210d7  /home/jryates/ds4-stage3-build/ds4
+7d487f0419e53a1f6bbf65f2c708a99265d8aaf9fdeb07dd45bff4565a44a649  /home/jryates/ds4-stage3-build/ds4.o
+4251387ba9804180ee7c867d069ea14ff23ba02d05d5be02a8a8eec3f366e431  /home/jryates/ds4-stage3-build/ds4_rocm.o
+bfae461b279ba4a294cbc61107b525785abb43c157c8ab17e116e24a10569a06  /home/jryates/ds4-stage3-build/ds4_rocm_unavailable.o
+d72d393ed93842bcdb9f2540dc8b57e6691ba0dc839b3efac58b8c932481c553  /home/jryates/ds4-stage3-build/ds4_transport_nhi.o
+8a80396bb27cd3403182ff1b5aef32325bd4f142530151345398d7d07db321e0  /tmp/thunderbolt_stream-p15.ko
+==source-provenance==
+4b3bd1b290582dee77b98ff112da57fa6370f1a3ef9449af4f91bc8a4189a9ff  /tmp/ds4-stage3-6460eb6.tar
+6f01a72e52d4fd69f9cb0f64105edf5e851ace1f06298850cc2c9830e9a4bb95  /tmp/ds4-stage3-6460eb6-source.sha256
+f87d3e0112c1ba74d4443ed854186196be6079ec19d48d59be6dd72af082b7c2  /tmp/ds4-stage3-6460eb6-max2-linked.sha256
+e8f8ac136fcfc5c941b759caaebef6bf7ac2d922e34d25fa6281db7126ff6c57  /tmp/ds4-stage3-6460eb6-max2-build.log
+source_check=./tests/test_transport.c: OK
+build_tail=make[1]: Leaving directory '/home/jryates/ds4-stage3-build'
+==disk==
+tmpfs          67148496896 116912128 67031584768       1% /tmp
+PREFLIGHT_END

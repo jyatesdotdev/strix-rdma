@@ -1,0 +1,19 @@
+HOST=max NOW=2026-08-24T22:39:24,592717756-07:00
+==services==
+inactive
+inactive
+==processes==
+==holders==
+==locks==
+ls: cannot access '/run/ds4-stage3.lock': No such file or directory
+ls: cannot access '/tmp/ds4.lock': No such file or directory
+==module==
+Y
+thunderbolt_stream     69632  2
+==endpoint==
+/dev/tbstream0
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/in_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/out_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/ring_size=4096
+==dmesg-since-marker==
+[Mon Aug 24 22:37:28 2026] STAGE3_2F17834_P15_MAX_1787636247

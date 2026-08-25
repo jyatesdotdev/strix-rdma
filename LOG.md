@@ -1,6 +1,116 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-25 — `6460eb6` Arm A proves broad dumps perturb the standalone oracle
+- **What:** In a wholly separate v5 window, fresh bilateral TheRock
+  `test-rocm` passed rollback TP 9/9, production-prequant 1/1 with all 4,096
+  outputs finite, CLI 49/0, and full MXFP4. Immutable Arm A then ran once
+  under the production module and exited 0 with the exact 173-file,
+  6,155,280-byte all-layer inventory, all 1,538,562 f32 values finite, 43
+  valid top-k vectors, exact dump chronology, and no dump errors. Its output
+  SHA was `3eeab08a…666d`, not frozen `21afe05c…05ae`, so the integrated guard
+  made the runner exit 1 and publish no success/commit marker.
+- **Why:** An exact standalone guard was required before exposing the same
+  all-layer filter to TP; intermediate dump synchronization can alter command
+  boundaries and therefore had to prove invariance rather than be assumed.
+- **Impact:** **Arm A FAIL; Stage 3 remains NO-GO.** p15 was never loaded and
+  Arm B/NHI never ran. The perturbation is material despite retaining argmax
+  5: versus frozen output, all 129,280 values differ, relative RMSE is
+  0.17364 and cosine is 0.98563. This is instrumentation evidence, not TP or
+  production correctness evidence. Production module remained loaded and
+  full restoration passed (timers/services/private FLOCKs/endpoints/TB-IP/
+  API/exporter/marker-only dmesg). Evidence:
+  `bench/results/2026-08-25-ds4-stage3-6460eb6-localization-arm-a-window.md`.
+
+## 2026-08-25 — `6460eb6` localization window fails closed before either arm
+- **What:** Reviewed and staged exact test-only `6460eb6` with bilateral
+  1,488-file provenance and an unchanged `4c20e811…` runtime, then opened the
+  separately authorized localization window. Production preflight and
+  worker-first quiescence passed, but the mandatory fresh bilateral
+  `make test-rocm` invocation omitted TheRock's build-time `ROCM_HOME`/HIPCC
+  override. Make selected absent `/opt/rocm/bin/hipcc` and exited 2 on both
+  hosts before any ROCm executable or test ran. Full MXFP4 was skipped; no
+  retry or follow-on occurred.
+- **Why:** Standalone all-layer dumps were intended to guard a single TP/NHI
+  all-layer localization arm, but both validation and final independent
+  script review were strict prerequisites. A late independent HOLD also
+  identified additional bounded-cleanup defects for a future runbook.
+- **Impact:** **PRE-ARM FAIL-CLOSED; Stage 3 remains NO-GO.** Arm A was never
+  launched, p15 was never loaded, Arm B was never launched, and there were no
+  dumps or NHI frames. The production module remained loaded throughout.
+  Timers/services were restored, with exact module/endpoints/private FLOCKs,
+  no diagnostic lock/process/holder, unchanged staged hashes, TB-IP, exporter,
+  fresh API inference, and marker-only dmesg all passing. Evidence:
+  `bench/results/2026-08-25-ds4-stage3-6460eb6-localization-prearm-window.md`.
+
+## 2026-08-25 — Exact `9b383ac` completes all TP gates but produces wrong logits
+- **What:** Independently matched all 1,488 archived source files and staged
+  artifacts on both hosts, reviewed the typed ROCm shared-down dispatcher,
+  and ran one separately authorized raw-prefill arm under p15. Both ranks
+  exited 0 after all 86 TP gates (688/688 TX frames each); failures, event
+  drops, CRC, overruns, timeouts, and marked dmesg messages were all zero.
+  The coordinator wrote finite 4,096-value norm and 129,280-value output
+  dumps. The worker cleanly exited on `leader finished` without executing or
+  dumping the output head. No retry or follow-on occurred.
+- **Why:** `9b383ac` repaired the unconditional ROCm generic K-slice stub and
+  needed one bounded end-to-end gate before any decode or performance work.
+  Full logits and rank agreement remain the required correctness oracle.
+- **Impact:** **Stage 3 model correctness remains NO-GO.** Execution and NHI
+  transport now complete, but coordinator logits are substantively wrong:
+  argmax 201 versus frozen standalone argmax 5, zero top-five overlap,
+  max absolute error 18.5687, RMSE 2.49725, relative RMSE 0.7203, and cosine
+  0.77824. Worker dump absence separately leaves rank equality unproven.
+  A future separately reviewed diagnostic should expose a tensor both ranks
+  necessarily execute, such as final-layer `hc_ffn_post`; another arm of the
+  current binary is not justified. Production module/endpoints/timers/
+  services/private locks were fully restored, with TB-IP, exporter, fresh API
+  inference, and marked dmesg checks passing. Evidence:
+  `bench/results/2026-08-25-ds4-stage3-9b383ac-one-prefill-window.md`.
+
+## 2026-08-25 — Exact `2f17834` TP arm reaches shared-down ROCm stub
+- **What:** Revalidated all 1,488 tracked files and the bilateral `dafe4d4…`
+  binary, then ran one separately authorized warmed raw-prefill arm under
+  transient p15 with `-n 1`, speculative evaluation disabled, and dual
+  final-state/logit dump filters. Both ranks connected, completed the first
+  8-frame ATTN gate, and exited 1 with the new bilateral label:
+  `TP decode failed layer=0 pos=0 stage=shared_down`. No dump was produced
+  and no retry or follow-on occurred.
+- **Why:** The previous generic failure interval needed first-failure
+  localization, and Stage 3 still requires a clean full-logit one-token
+  oracle before any decode or performance work.
+- **Impact:** **Stage 3/full decode remain NO-GO.** The exact source root is
+  now identified: the live graph calls generic
+  `ds4_gpu_matmul_quant_kslice_tensor`, but ROCm still resolves that symbol
+  to the unconditional unavailable stub; only the Q8-specific K-slice API
+  is implemented. The focused shared-slice test missed the seam by calling
+  the specific API directly. Transport was clean (TX 8/8 each, zero
+  failures/drops/CRC/overrun, coordinator CLOSED), marked dmesg spotless,
+  and production fully restored with API/TB-IP/private-lock checks. The
+  rank-local routed-MoE repair was not reached live. Evidence:
+  `bench/results/2026-08-25-ds4-stage3-2f17834-one-token-window.md`.
+
+## 2026-08-25 — Exact `2f17834` Stage-3 window stops at CLI validation
+- **What:** Corrected a staging-provenance defect before wire time, then
+  independently verified all 1,488 tracked files on both build hosts against
+  DS4 `2f17834` (canonical manifest SHA `3603d185…`) and obtained a
+  bit-identical `dafe4d4…` ROCm binary. Fresh bilateral ROCm TP 9/9, CLI
+  49/0, and full MXFP4 strict cached-half suites passed. After a clean
+  production preflight and transient p15 swap, the single allowed rank-0
+  invocation exited 2 immediately: `ds4: invalid value for -n: 0`.
+  Rank 1 was never launched and no retry was attempted.
+- **Why:** The intended arm was one raw prompt prefill and zero evaluated
+  decode tokens. `2f17834` parses `-n` with a positive-only helper, so the
+  reviewed zero cap was not a valid CLI command.
+- **Impact:** **No engine arm and no NHI traffic occurred; Stage 3/full decode
+  remain NO-GO.** There was no test lock, model load, TCP listen, device
+  holder, or dump. Source review after restoration confirms a future
+  separately authorized arm can use existing CLI `-n 1` plus
+  `DS4_MTP_SPEC_DISABLE=1`: it performs the prefill, samples one token, and
+  exits before evaluating that token. Production module/endpoints/timers/
+  services/private locks were fully restored; TB-IP, models, exporter, fresh
+  API inference, and marked dmesg all passed. Evidence:
+  `bench/results/2026-08-25-ds4-stage3-2f17834-prearm-window.md`.
+
 ## 2026-08-25 — Stage-3 one-token engine arm fails after first clean gate
 - **What:** Reviewed DS4 through stable tip `0a2cf21`, including the rank-1
   compact-head fix, poison regression, cross-UID lock hardening, and restored

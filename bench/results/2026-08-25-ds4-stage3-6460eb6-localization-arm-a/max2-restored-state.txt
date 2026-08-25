@@ -1,0 +1,27 @@
+HOST=max2 NOW=2026-08-25T01:11:06,700641348-07:00
+Id=ds4-mxfp4-server.service
+ActiveState=active
+SubState=running
+MainPID=171568
+PrivateTmp=yes
+
+Id=ds4-exporter.service
+ActiveState=active
+SubState=running
+MainPID=171606
+PrivateTmp=yes
+Id=ds4-tbstream-reconcile.timer
+ActiveState=active
+SubState=waiting
+pid=171568 fd3=41:1818 root=41:1818
+2: FLOCK  ADVISORY  WRITE 171568 00:29:1818 0 EOF
+in_hopid=9
+out_hopid=9
+ring_size=4096
+throttling=0
+4c20e8117765f912ece00d0e68dd3a22ce91631a8b905a537d542a22848210d7  /home/jryates/ds4-stage3-build/ds4
+7d487f0419e53a1f6bbf65f2c708a99265d8aaf9fdeb07dd45bff4565a44a649  /home/jryates/ds4-stage3-build/ds4.o
+4251387ba9804180ee7c867d069ea14ff23ba02d05d5be02a8a8eec3f366e431  /home/jryates/ds4-stage3-build/ds4_rocm.o
+bfae461b279ba4a294cbc61107b525785abb43c157c8ab17e116e24a10569a06  /home/jryates/ds4-stage3-build/ds4_rocm_unavailable.o
+d72d393ed93842bcdb9f2540dc8b57e6691ba0dc839b3efac58b8c932481c553  /home/jryates/ds4-stage3-build/ds4_transport_nhi.o
+RESTORED_STATE_PASS

@@ -1,0 +1,37 @@
+VERDICT: ARM A GUARD FAIL; P15/B NOT RUN; STAGE 3 REMAINS NO-GO
+
+Fresh read-only production and exclusion preflight passed. Production was
+stopped worker-first; coordinator/exporter and both reconcile timers followed.
+Both hosts were quiescent and holder-free under the exact production module.
+
+The exact one-shot bilateral TheRock validation gate passed fully:
+- make test-rocm rc0/log rc0;
+- TP rollback 9/9;
+- production prequant 1/1, finite=4096/4096;
+- CLI PASS=49 FAIL=0;
+- make test-mxfp4-rocm rc0/log rc0 and full routed-MoE PASS;
+- runtime remained exact 4c20e811...10d7;
+- no process, lock, holder, or marked kernel error remained.
+
+Immutable Arm A ran exactly once under p14. The standalone process and SSH both
+exited 0 and emitted '#'. The integrated checker found exactly 173 files,
+6,155,280 bytes, 1,538,562/1,538,562 finite f32 values, 43 valid top-k vectors,
+and exact dump chronology with no synchronize/resume error. Its output SHA was
+3eeab08a43fb795d52f6b5d41191eccdc531bd5daf1be41574ed79b07591666d,
+not frozen 21afe05ce62438777bfdd73708338c85e3a62a832336b17ac2c1f89792bc05ae.
+The Arm A runner therefore exited 1 and published no success/commit marker.
+
+Per the no-retry contract, p15 was never loaded and Arm B was never run. A
+first in-window tar-capture command also failed because its wildcard expanded
+before tar's -C; it was not corrected in-window. Production restoration began
+immediately. Untouched artifacts were captured only after restoration PASS.
+
+Production module was never swapped. Timers/services were restored worker
+first, then coordinator/exporter. Exact module/endpoints/private FLOCKs,
+absence of diagnostic owner/lock/process/holder, unchanged runtime/key objects,
+TB-IP, models, fresh API inference, exporter, and marker-only dmesg all passed.
+
+Post-restoration comparison classifies 3eea as instrumentation perturbation:
+versus frozen standalone, all 129,280 f32 values differ, RMSE=0.6019846,
+relative RMSE=0.1736367, cosine=0.9856274. Argmax remains token 5, but top-five
+membership/order changes. This is not TP/model correctness evidence.

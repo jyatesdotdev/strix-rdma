@@ -1,0 +1,15 @@
+Arm A workload status: ssh=0, ds4=0
+Integrated inventory: 173 files, 6,155,280 bytes, 1,538,562/1,538,562 finite f32, 43 valid top-k vectors
+Dump chronology: exact 173-line expected order; zero synchronize/resume errors
+Observed output SHA256: 3eeab08a43fb795d52f6b5d41191eccdc531bd5daf1be41574ed79b07591666d
+Required frozen SHA256: 21afe05ce62438777bfdd73708338c85e3a62a832336b17ac2c1f89792bc05ae
+Runner status: 1
+Success marker: absent
+Commit marker: absent
+p15: not loaded
+Arm B: not run
+
+The runner's failure trap released its owner token and local mutex. Its
+/proc/*/environ scan emitted benign disappearance-race diagnostics for short-
+lived PIDs; final lifecycle audits proved no owner token, diagnostic process,
+lock, or holder remained.

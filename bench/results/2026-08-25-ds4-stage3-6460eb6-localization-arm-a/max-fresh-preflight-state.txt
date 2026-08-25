@@ -1,0 +1,19 @@
+HOST=max NOW=2026-08-25T01:01:37,828100763-07:00 KERNEL=7.1.5-101.fc43.x86_64
+Id=ds4-mxfp4-worker.service
+ActiveState=active
+SubState=running
+MainPID=148577
+PrivateTmp=yes
+Id=ds4-tbstream-reconcile.timer
+ActiveState=active
+SubState=waiting
+1: FLOCK  ADVISORY  WRITE 148577 00:27:3570 0 EOF
+ccd946330a5612ffe7674246ac387b39d4a2e71562ed585cfc65d8d58e2650e7  /lib/modules/7.1.5-101.fc43.x86_64/updates/thunderbolt_stream.ko
+4c20e8117765f912ece00d0e68dd3a22ce91631a8b905a537d542a22848210d7  /home/jryates/ds4-stage3-build/ds4
+7d487f0419e53a1f6bbf65f2c708a99265d8aaf9fdeb07dd45bff4565a44a649  /home/jryates/ds4-stage3-build/ds4.o
+4251387ba9804180ee7c867d069ea14ff23ba02d05d5be02a8a8eec3f366e431  /home/jryates/ds4-stage3-build/ds4_rocm.o
+bfae461b279ba4a294cbc61107b525785abb43c157c8ab17e116e24a10569a06  /home/jryates/ds4-stage3-build/ds4_rocm_unavailable.o
+d72d393ed93842bcdb9f2540dc8b57e6691ba0dc839b3efac58b8c932481c553  /home/jryates/ds4-stage3-build/ds4_transport_nhi.o
+8a80396bb27cd3403182ff1b5aef32325bd4f142530151345398d7d07db321e0  /tmp/thunderbolt_stream-p15.ko
+tmpfs          67148492800 115994624 67032498176       1% /tmp
+FRESH_PREFLIGHT_PASS

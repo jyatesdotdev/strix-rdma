@@ -1,0 +1,210 @@
+make -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
+	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+	tests/test_tp_combine_rocm ds4 ds4-server ds4-bench ds4-agent \
+	CORE_OBJS="ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
+	TEST_HOOK_GPU_OBJS="ds4_rocm.o" \
+	CFLAGS="-O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD" \
+	DS4_LINK="/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151" \
+	DS4_LINK_LIBS="-lm -pthread -lhipblas -lhipblaslt"
+make[1]: Entering directory '/home/jryates/ds4-stage3-build'
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -Wno-unused-function -c -o ds4_test.o tests/ds4_test.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_help.o ds4_help.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_kvstore.o ds4_kvstore.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o rax.o rax.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4.o ds4.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_distributed.o ds4_distributed.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_dist_v3.o ds4_dist_v3.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_transport.o ds4_transport.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_transport_nhi.o ds4_transport_nhi.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_tp.o ds4_tp.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_tp_nhi.o ds4_tp_nhi.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_ssd.o ds4_ssd.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -c -o ds4_rocm.o ds4_rocm.cu
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -c -o ds4_rocm_compat.o ds4_rocm_compat.cu
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -c -o ds4_rocm_unavailable.o ds4_rocm_unavailable.cu
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD   -c -o ds4_layer_pack.o ds4_layer_pack.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4_test ds4_test.o ds4_help.o ds4_kvstore.o rax.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -Wno-unused-function -c -o ds4_agent_test.o tests/ds4_agent_test.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_web.o ds4_web.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o linenoise.o linenoise.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4_agent_test ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_eval.o ds4_eval.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4-eval ds4_eval.o ds4_help.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
+./tests/test_q4k_dot
+Q4_K unit tests:
+  block sizes: Q4_K=144 (expect 144), Q8_K=292 (expect 292): PASS
+  scale extraction: PASS
+  dot known: result=2048.0 expected=2048.0: PASS
+  dot vs reference (50 random blocks): PASS
+
+4/4 tests passed
+cc -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
+./tests/test_mxfp4_dot
+MXFP4 unit tests:
+  block size: 17 (expect 17): PASS
+  E8M0 scale conversion: PASS
+  nibble order: -32.0 (expect -32.0): PASS
+  dot vs independent reference: PASS
+
+4/4 tests passed
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -I. -c -o tests/test_layer_pack.o tests/test_layer_pack.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -o tests/test_layer_pack tests/test_layer_pack.o ds4_layer_pack.o -lm -pthread
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -I. -c -o tests/test_engine_mgpu_placement.o tests/test_engine_mgpu_placement.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o ds4_cpu_test_hooks.o ds4.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o tests/test_engine_mgpu_placement tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_rocm.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -I. -DDS4_NO_GPU -c -o tests/test_gpu_args.o tests/test_gpu_args.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -DDS4_NO_GPU -c -o ds4_gpu_args_cpu.o ds4_gpu_args.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -o tests/test_gpu_args tests/test_gpu_args.o ds4_gpu_args_cpu.o -lm -pthread
+cc -O3 -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -fPIC -DDS4_ROCM_BUILD -I. -c -o tests/test_tp_combine_rocm.o tests/test_tp_combine_rocm.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o tests/test_tp_combine_rocm tests/test_tp_combine_rocm.o ds4_rocm.o ds4_rocm_unavailable.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_cli.o ds4_cli.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_gpu_args.o ds4_gpu_args.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4 ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_server.o ds4_server.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4-server ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_bench.o ds4_bench.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4-bench ds4_bench.o ds4_help.o ds4_gpu_args.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_agent.o ds4_agent.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4-agent ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+make[1]: Leaving directory '/home/jryates/ds4-stage3-build'
+./ds4-eval --self-test-extractors
+ds4-eval: answer extractor self-tests passed
+./ds4_agent_test
+ds4-agent tests: ok
+./ds4_test --server
+server:
+server: OK
+ds4 tests: ok
+./tests/test_layer_pack
+RUN: test_all_fit_n1
+  ok
+RUN: test_all_fit_n2
+  ok
+RUN: test_partial_spill_n2
+  ok
+RUN: test_zero_budget_one_gpu_n2
+  ok
+RUN: test_oversized_entry_n2
+  ok
+RUN: test_mixed_n8
+  ok
+RUN: test_n16_stress
+  ok
+RUN: test_pseudo_layers
+  ok
+RUN: test_null_inputs
+  ok
+RUN: test_print_golden
+  ok
+
+test_layer_pack: 97/97 checks passed (0 failed)
+./tests/test_engine_mgpu_placement
+RUN: test_tensor_to_entry
+RUN: test_null_config
+RUN: test_forced_two_tier_no_spill
+RUN: test_cpu_spill
+RUN: test_zero_budget_guard
+ds4: ds4_gpu_config has n_gpus=2 but every vram_bytes[d]==0; caller must populate explicit budgets (auto-detect is the CLI's job, not the engine's)
+RUN: test_placement_ctx_hint_scales
+RUN: test_pertier_overhead_pushes_to_spill
+RUN: test_no_per_layer_scratch_double_count
+RUN: test_glm_per_layer_cache_accounting
+RUN: test_glm_session_count_accounting
+RUN: test_cuda_tp_prefill_default_accounting
+RUN: test_cuda_tp_output_head_moves_to_lower_half
+
+test_engine_mgpu_placement: 101/101 checks passed (0 failed)
+./tests/test_gpu_args
+ok parse 40,12 returns 0
+ok parse 40 → 1 device
+ok parse 0 → skip_cuda=true
+ok parse auto rejects on CPU/Metal build
+ok parse 40,12,40 with devs 0,2 errors on count
+ok parse abc errors
+ok parse 40,12 + devices 0,2
+ok parse 0 + devices errors
+ok parse 40, (trailing comma) errors
+ok parse huge vram rejected (overflow guard)
+ok parse huge device index rejected
+ok format_gpu_layout_line
+test_gpu_args: all tests passed
+./tests/test_tp_combine_rocm
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm chunk-copying 0.02 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.035s (0.02 GiB tensors)
+ROCm TP shared-half parity max_abs=2.23517e-08 rmse=2.23517e-08 finite=4096/4096 prequant=off
+ds4: ROCm chunk-copying 0.00 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.000s (0.00 GiB tensors)
+ROCm TP combine 7168 (hidden) bitexact               PASS
+ROCm TP combine 8191 (odd) bitexact                  PASS
+ROCm TP combine 256 bitexact                         PASS
+ROCm TP spin-combine kernel-writer plain pool        PASS
+ROCm TP spin-combine kernel-writer uncached pool     PASS
+ROCm TP spin-combine host-stamp uncached pool        PASS
+ROCm TP TP folded HC expand-add matches explicit combine PASS
+ROCm TP Flash shared-expert halves recombine         PASS
+ROCm TP rank1 compact-head Q8 attention/K-slice      PASS
+test_tp_combine_rocm: 9/9 checks passed (0 failed)
+DS4_TEST_TP_PREQUANT=1 ./tests/test_tp_combine_rocm
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm chunk-copying 0.02 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.042s (0.02 GiB tensors)
+ROCm TP shared-half parity max_abs=7.45058e-09 rmse=7.45058e-09 finite=4096/4096 prequant=on
+ROCm TP production-prequant shared halves recombine  PASS
+test_tp_combine_rocm: 1/1 checks passed (0 failed)
+DS4_TEST_ROCM=1 ./tests/test_gpu_args_cli.sh
+ok ds4 --help advertises the ROCm backend
+ok ds4 --help runtime mentions --mtp-exact-sampling
+ok ds4 --help distributed mentions --tensor-parallel-token-prefill
+ok ds4 --help distributed omits old --tp spellings
+ok ds4 --help distributed mentions --transport
+ok ds4 --help distributed mentions --nhi-device
+ok ds4-server --help advertises the ROCm backend
+ok ds4-server --help runtime mentions --mtp-exact-sampling
+ok ds4-bench --help advertises the ROCm backend
+ok ds4-agent --help advertises the ROCm backend
+ok ds4-agent --help runtime mentions --mtp-exact-sampling
+ok ds4 parses --mtp-exact-sampling
+ok ds4-server parses --mtp-exact-sampling
+ok ds4-agent parses --mtp-exact-sampling
+ok ds4 rejects provisional --dspark-exact-sampling
+ok ds4-server rejects provisional --dspark-exact-sampling
+ok ds4-agent rejects provisional --dspark-exact-sampling
+ok ds4 --gpu-vram abc exits non-zero (2)
+ok ds4 --gpu-vram abc reaches shared parser
+ok ds4-server --gpu-vram abc exits non-zero (2)
+ok ds4-server --gpu-vram abc reaches shared parser
+ok ds4-bench --gpu-vram abc exits non-zero (2)
+ok ds4-bench --gpu-vram abc reaches shared parser
+ok ds4-agent --gpu-vram abc exits non-zero (2)
+ok ds4-agent --gpu-vram abc reaches shared parser
+ok ds4 count-mismatch reaches shared parser (2)
+ok ds4-server count-mismatch reaches shared parser (2)
+ok ds4-bench count-mismatch reaches shared parser (2)
+ok ds4-agent count-mismatch reaches shared parser (2)
+ok ds4 --cuda --help still prints help
+ok ds4-server --cuda --help still prints help
+ok ds4-bench --cuda --help still prints help
+ok ds4-agent --cuda --help still prints help
+ok ds4 --gpu-vram 0 exits non-zero (expected: model-load fail)
+ok ds4 --gpu-vram 0 does not print GPU layout (short-circuit reached)
+ok tensor parallel rejects explicit layer slices
+ok tensor-parallel worker requires coordinator address
+ok tensor-parallel common options reach model loading
+ok obsolete --tp-coordinator is rejected
+ok obsolete --tp-lead is rejected
+ok obsolete --tp-coordinator-host is rejected
+ok obsolete --tp-lead-host is rejected
+ok obsolete --tp-worker is rejected
+ok obsolete --tp-transport is rejected
+ok obsolete --tp-debug-hash is rejected
+ok obsolete --tp-token-prefill is rejected
+ok ds4 --gpu-vram 40,12 prints expected layout line
+ok ds4 lock rejects a symlink without truncating its target
+ok ds4 lock rejects a multiply-linked file without truncation
+
+test_gpu_args_cli: PASS=49 FAIL=0

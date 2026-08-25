@@ -1,0 +1,24 @@
+HOST=max2 NOW=2026-08-24T22:59:29,361172577-07:00
+==services==
+inactive
+inactive
+inactive
+==processes==
+==holders==
+==locks==
+-rw------- root:root 7 29:11841 /run/ds4-stage3.lock
+107961
+ABSENT:/tmp/ds4.lock
+==artifacts==
+-rw-r--r--. 1 jryates jryates 15913 Aug 24 22:58 /tmp/stage3-2f17834-tp-r0.log
+-rw-r--r--. 1 jryates jryates     2 Aug 24 22:58 /tmp/stage3-2f17834-tp-r0.rc
+==module==
+Y
+thunderbolt_stream     69632  2
+==endpoint==
+/dev/tbstream0
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/in_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/out_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/ring_size=4096
+==dmesg-since-marker==
+[Mon Aug 24 22:57:21 2026] STAGE3_2F17834_P15_ARM_MAX2_1787637440

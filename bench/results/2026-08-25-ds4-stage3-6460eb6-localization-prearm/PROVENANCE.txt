@@ -1,0 +1,19 @@
+DS4 commit: 6460eb6a1704080da44fc6af9ace8d80f8c6a400
+Parent: 20182c95e33458e3c50059bb58004c94d700e249
+Runtime production-source parent: 9b383ac47a26df8a18fdaf78aa33ca96cd42a8d2
+Clean archive SHA256: 4b3bd1b290582dee77b98ff112da57fa6370f1a3ef9449af4f91bc8a4189a9ff
+Canonical 1,488-file source manifest SHA256: 6f01a72e52d4fd69f9cb0f64105edf5e851ace1f06298850cc2c9830e9a4bb95
+Bilateral linked manifest SHA256: f87d3e0112c1ba74d4443ed854186196be6079ec19d48d59be6dd72af082b7c2
+Bilateral compile-only build log SHA256: e8f8ac136fcfc5c941b759caaebef6bf7ac2d922e34d25fa6281db7126ff6c57
+Staged runtime binary SHA256: 4c20e8117765f912ece00d0e68dd3a22ce91631a8b905a537d542a22848210d7
+Production module SHA256: ccd946330a5612ffe7674246ac387b39d4a2e71562ed585cfc65d8d58e2650e7
+p15 SHA256 (verified but never loaded): 8a80396bb27cd3403182ff1b5aef32325bd4f142530151345398d7d07db321e0
+Frozen standalone output SHA256 (not regenerated): 21afe05ce62438777bfdd73708338c85e3a62a832336b17ac2c1f89792bc05ae
+Final reviewed-but-unexecuted A script SHA256: a7de7c6b74c0cb7da7774a27eb428243f17050069b6c2ba3f7a23babf2c65334
+Final reviewed-but-unexecuted B script SHA256: e62a24de997deabee5c0086169f4ec07d4da63e758f640fc1bfb8e859cb129de
+Checker SHA256: ca40f332d00bc681e7cce10bbf113f56f0b433bacb6e8f9b9013eb52c82eb202
+Hosts: max, max2
+Kernel: 7.1.5-101.fc43.x86_64
+ROCm: TheRock /opt/rocm-therock
+Window open UTC: 2026-08-25T07:17:36.543578000Z
+Window closed UTC: 2026-08-25T07:21:50.021604000Z

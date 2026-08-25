@@ -1,0 +1,25 @@
+log_sha256=d4229f3205f819d16f7b3ba59edeb535a2aaa0b25efb303f4da9b3bff8e06b16
+dump_lines=173 expected=173 exact_order=True
+failed to synchronize before dumping=0
+failed to resume Metal command batch after dumping=0
+prefill_token_1_of_1=1
+emitted_hash_token=True
+first8:
+  hc_attn_post layer=0 pos=0
+  ffn_moe_topk layer=0 pos=0
+  ffn_moe_weights_scaled layer=0 pos=0
+  hc_ffn_post layer=0 pos=0
+  hc_attn_post layer=1 pos=0
+  ffn_moe_topk layer=1 pos=0
+  ffn_moe_weights_scaled layer=1 pos=0
+  hc_ffn_post layer=1 pos=0
+last9:
+  hc_attn_post layer=41 pos=0
+  ffn_moe_topk layer=41 pos=0
+  ffn_moe_weights_scaled layer=41 pos=0
+  hc_ffn_post layer=41 pos=0
+  hc_attn_post layer=42 pos=0
+  ffn_moe_topk layer=42 pos=0
+  ffn_moe_weights_scaled layer=42 pos=0
+  hc_ffn_post layer=42 pos=0
+  result_output layer=43 pos=0

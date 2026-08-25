@@ -1,0 +1,10 @@
+After Arm A failed its output-SHA guard, the first in-window tar capture used:
+
+  sudo tar -C /tmp -cf - stage3-6460eb6-single-dump_* ...
+
+The caller shell expanded the relative wildcard before tar applied -C /tmp,
+so tar returned 2 (`Cannot stat`). Under the no-correction rule it was not
+retried in-window; production restoration began immediately. The untouched
+remote artifacts were captured successfully only after restoration PASS via a
+root shell that changed directory before wildcard expansion. The partial tar
+from the failed command is retained as `failed-inwindow-artifact-capture.tar`.

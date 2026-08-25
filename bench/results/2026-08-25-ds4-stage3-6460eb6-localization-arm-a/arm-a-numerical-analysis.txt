@@ -1,0 +1,20 @@
+v5_broad_dump_standalone: path=/tmp/stage3-6460eb6-localize-v5-capture/arm-a-result-output.f32
+  bytes=517120 values=129280 finite=129280 sha256=3eeab08a43fb795d52f6b5d41191eccdc531bd5daf1be41574ed79b07591666d
+  min=-35.3875389099 max=13.9688711166 mean=1.41270473328 rms=3.55625020849
+  top5=5:13.9688711 372:13.7302523 13989:13.4593458 795:13.4179049 201:13.2760906
+frozen_output_only_standalone: path=/Users/jyates/Repositories/strix-rdma/bench/results/2026-08-25-ds4-stage3-9b383ac-one-prefill/standalone-reference.f32
+  bytes=517120 values=129280 finite=129280 sha256=21afe05ce62438777bfdd73708338c85e3a62a832336b17ac2c1f89792bc05ae
+  min=-33.1210098267 max=13.9951410294 mean=1.37847298425 rms=3.46691963987
+  top5=5:13.995141 110704:13.2166653 795:12.9917479 372:12.9820995 7519:12.8689537
+prior_bad_tp: path=/Users/jyates/Repositories/strix-rdma/bench/results/2026-08-25-ds4-stage3-9b383ac-one-prefill/rank0-result_output.f32
+  bytes=517120 values=129280 finite=129280 sha256=325a161c354876dac279a90bb8fef680acd6522ed7b211dbc94a24d4569ceae4
+  min=-42.4187164307 max=20.5046806335 mean=1.05296030712 rms=3.92140552112
+  top5=201:20.5046806 271:16.7026997 539:15.80264 18439:14.919754 818:14.6042156
+compare v5_broad_dump_standalone vs frozen_output_only_standalone:
+  byte_identical=False nonzero_f32=129280/129280
+  max_abs=4.12795591354 mae=0.47618539515 rmse=0.60198455748 relative_rmse=0.173636720782
+  cosine=0.985627433716 p50=0.398643016815 p99=1.58539104462
+compare v5_broad_dump_standalone vs prior_bad_tp:
+  byte_identical=False nonzero_f32=129280/129280
+  max_abs=16.0630779266 mae=1.94017215182 rmse=2.49341879495 relative_rmse=0.635848238985
+  cosine=0.78187231606 p50=1.59960901737 p99=6.93058156967

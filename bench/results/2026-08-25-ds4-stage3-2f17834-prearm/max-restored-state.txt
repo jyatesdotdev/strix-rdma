@@ -1,0 +1,37 @@
+HOST=max NOW=2026-08-24T22:40:52,039180480-07:00 KERNEL=7.1.5-101.fc43.x86_64
+==services==
+Id=ds4-mxfp4-worker.service
+ActiveState=active
+SubState=running
+MainPID=101622
+Id=ds4-tbstream-reconcile.timer
+ActiveState=active
+SubState=waiting
+==module==
+ccd946330a5612ffe7674246ac387b39d4a2e71562ed585cfc65d8d58e2650e7  /lib/modules/7.1.5-101.fc43.x86_64/updates/thunderbolt_stream.ko
+diag_param_absent
+thunderbolt_stream     53248  2
+==endpoint==
+/dev/tbstream0
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/in_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/out_hopid=9
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/ring_size=4096
+/sys/kernel/config/thunderbolt/stream/1-2.0/ds4/throttling=0
+==holders==
+fuser_rc=1
+==test-artifacts==
+ls: cannot access '/run/ds4-stage3.lock': No such file or directory
+ls: cannot access '/tmp/ds4.lock': No such file or directory
+ls: cannot access '/tmp/stage3-2f17834-tp-r1.log': No such file or directory
+ls: cannot access '/tmp/stage3-2f17834-tp-r1.rc': No such file or directory
+ls: cannot access '/tmp/stage3-2f17834-tp-r1_result_output-43_pos0.bin': No such file or directory
+==production-lock==
+/tmp/ds4.lock
+fd3=39:2403
+path=39:2403
+lock:	1: FLOCK  ADVISORY  WRITE 101622 00:27:2403 0 EOF
+==ping==
+3 packets transmitted, 3 received, 0% packet loss, time 2066ms
+rtt min/avg/max/mdev = 0.188/0.215/0.252/0.026 ms
+==dmesg-since-marker==
+[Mon Aug 24 22:37:28 2026] STAGE3_2F17834_P15_MAX_1787636247

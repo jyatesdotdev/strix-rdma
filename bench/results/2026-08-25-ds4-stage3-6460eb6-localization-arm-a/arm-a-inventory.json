@@ -1,0 +1,20 @@
+{
+  "byte_count": 6155280,
+  "expected_byte_count": 6155280,
+  "expected_file_count": 173,
+  "failures": [
+    "output SHA 3eeab08a43fb795d52f6b5d41191eccdc531bd5daf1be41574ed79b07591666d != 21afe05ce62438777bfdd73708338c85e3a62a832336b17ac2c1f89792bc05ae"
+  ],
+  "file_count": 173,
+  "finite_f32": 1538562,
+  "log": "/tmp/stage3-6460eb6-single.log",
+  "log_sha256": "d4229f3205f819d16f7b3ba59edeb535a2aaa0b25efb303f4da9b3bff8e06b16",
+  "missing": [],
+  "mode": "standalone",
+  "ok": false,
+  "output_sha256": "3eeab08a43fb795d52f6b5d41191eccdc531bd5daf1be41574ed79b07591666d",
+  "prefix": "/tmp/stage3-6460eb6-single-dump",
+  "total_f32": 1538562,
+  "unexpected": [],
+  "valid_topk_layers": 43
+}

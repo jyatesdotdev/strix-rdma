@@ -1,0 +1,4 @@
+cc -O3 -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -I. -c -o tests/test_mxfp4_rocm.o tests/test_mxfp4_rocm.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o tests/test_mxfp4_rocm tests/test_mxfp4_rocm.o ds4_rocm.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -I. -c -o tests/test_tp_nhi_live.o tests/test_tp_nhi_live.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o tests/test_tp_nhi_live tests/test_tp_nhi_live.o ds4_tp_nhi.o ds4_rocm.o -lm -pthread -lhipblas -lhipblaslt

@@ -1,0 +1,18 @@
+==max->max2==
+PING 10.99.0.2 (10.99.0.2) 56(84) bytes of data.
+64 bytes from 10.99.0.2: icmp_seq=1 ttl=64 time=0.211 ms
+64 bytes from 10.99.0.2: icmp_seq=2 ttl=64 time=0.445 ms
+64 bytes from 10.99.0.2: icmp_seq=3 ttl=64 time=0.185 ms
+
+--- 10.99.0.2 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2069ms
+rtt min/avg/max/mdev = 0.185/0.280/0.445/0.116 ms
+==max2->max==
+PING 10.99.0.1 (10.99.0.1) 56(84) bytes of data.
+64 bytes from 10.99.0.1: icmp_seq=1 ttl=64 time=0.151 ms
+64 bytes from 10.99.0.1: icmp_seq=2 ttl=64 time=0.115 ms
+64 bytes from 10.99.0.1: icmp_seq=3 ttl=64 time=0.118 ms
+
+--- 10.99.0.1 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2038ms
+rtt min/avg/max/mdev = 0.115/0.128/0.151/0.016 ms

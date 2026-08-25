@@ -1,0 +1,8 @@
+4c20e8117765f912ece00d0e68dd3a22ce91631a8b905a537d542a22848210d7  /home/jryates/ds4-stage3-build/ds4
+7d487f0419e53a1f6bbf65f2c708a99265d8aaf9fdeb07dd45bff4565a44a649  /home/jryates/ds4-stage3-build/ds4.o
+4251387ba9804180ee7c867d069ea14ff23ba02d05d5be02a8a8eec3f366e431  /home/jryates/ds4-stage3-build/ds4_rocm.o
+bfae461b279ba4a294cbc61107b525785abb43c157c8ab17e116e24a10569a06  /home/jryates/ds4-stage3-build/ds4_rocm_unavailable.o
+d72d393ed93842bcdb9f2540dc8b57e6691ba0dc839b3efac58b8c932481c553  /home/jryates/ds4-stage3-build/ds4_transport_nhi.o
+f6b0b87fc01fc36aa1329c5da6510eae938338f9124fe4b39e9963a59ec5e372  /home/jryates/ds4-stage3-build/tests/test_tp_combine_rocm
+a731b080d73feae4200fdd66b69a75a5024b12915c1af47776ce501ab24af2c4  /home/jryates/ds4-stage3-build/tests/test_mxfp4_rocm
+HOST=max POSTVALIDATION_PASS

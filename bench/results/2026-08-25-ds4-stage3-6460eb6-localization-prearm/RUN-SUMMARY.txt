@@ -1,0 +1,26 @@
+VERDICT: PRE-ARM FAIL-CLOSED; A/B NOT RUN; STAGE 3 REMAINS NO-GO
+
+Production preflight passed bilaterally. Production was stopped worker-first,
+then coordinator/exporter; reconcile timers were stopped. Both hosts were
+quiescent, holder-free, on the exact production module and 9/9 ring-4096
+endpoint, with bilateral TB-IP healthy.
+
+The mandatory fresh make test-rocm gate failed identically on both hosts before
+any ROCm executable ran. The lifecycle invocation supplied TheRock's runtime
+LD_LIBRARY_PATH but omitted its build-time ROCM_HOME/HIPCC override. Make
+therefore expanded HIPCC as absent /opt/rocm/bin/hipcc and exited 2 while trying
+to rebuild ds4_rocm.o. The full MXFP4 build/run was skipped (wrapper status
+125). There was no retry or follow-on.
+
+Arm A was never launched. p15 was never loaded. Arm B was never launched. No
+diagnostic dump or NHI traffic was produced. A late independent script-review
+HOLD also arrived during restoration and is recorded as a separate future
+runbook input; none of the reviewed scripts was executed.
+
+Production module was never swapped. Timers and production services were
+restored; worker started before coordinator, then exporter. Final audits passed:
+exact production module and endpoint, diagnostic parameter absent, active
+services/timers, live PrivateTmp FLOCKs, no diagnostic lock/staged process/
+device holder, unchanged staged runtime and key objects, TB-IP zero loss,
+/v1/models, fresh API inference, exporter scrape, and marked dmesg containing
+only the explicit BEGIN/END markers.

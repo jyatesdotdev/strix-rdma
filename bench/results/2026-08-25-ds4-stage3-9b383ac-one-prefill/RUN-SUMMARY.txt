@@ -1,0 +1,29 @@
+VERDICT: Stage 3 model correctness FAIL / NO-GO
+
+Execution:
+- rank0 coordinator rc=0; rank1 worker rc=0
+- exactly one mirrored raw-prompt prefill, -n 1, DS4_MTP_SPEC_DISABLE=1
+- no retry, follow-on, batch, sampled-token EVAL, or speculative EVAL
+- 86 TP gates completed: 688/688 TX frames on each rank
+- rank0 stats: flags=0x1a TX_IMPORTED RX_IMPORTED, failures=0, event_drops=0, crc=0, overrun=0, tx=688/688, rx=4784/689
+- rank1 stats: flags=0x18 TX_IMPORTED RX_IMPORTED, failures=0, event_drops=0, crc=0, overrun=0, tx=688/688, rx=4783/688
+- marked dmesg contained only the explicit markers
+
+Dump capture:
+- coordinator result_norm: 4096 finite float32, SHA256 8ae3f3ce9cf430a7041d7d512eedce217cce01c6a6a3963b9674748fcdc51065
+- coordinator result_output: 129280 finite float32, SHA256 325a161c354876dac279a90bb8fef680acd6522ed7b211dbc94a24d4569ceae4
+- worker produced no result_norm or result_output dump; bilateral identity is unproven
+
+Coordinator correctness:
+- actual argmax 201; expected standalone argmax 5
+- actual and standalone top-5 sets have zero overlap
+- versus frozen standalone: max_abs=18.5687013, MAE=1.93182607, RMSE=2.49725025, rel_RMSE=0.720308085, cosine=0.77824149922
+- full distribution is in numerical-analysis.txt
+
+Restoration:
+- production module hash restored; diagnostic parameter absent
+- exact 9/9 ring-4096 throttling-0 endpoints and active timers
+- worker/server/exporter active with correct private FLOCKs
+- no stream holder or test lock
+- TB-IP zero loss; fresh models/API smoke passed; exporter active_requests=0
+- marked dmesg spotless
