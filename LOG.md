@@ -1,6 +1,30 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-24 — Patch 15 validated; the TB link wedge is reproducible
+- **What:** Wrote and validated patch 15 (`0015-...Skip-CLOSE-toward-an-
+  already-closed-peer.patch`, host tree a48b0ee1f): release skips sending
+  CLOSE when the peer's CLOSE already arrived (its RX path is gone; our
+  frame could never complete), and the TX flush-timeout warning is
+  ratelimited. En route, root-caused the Window-B link wedge to a reliable
+  repro: stream TX toward a peer with no active device stalls on zero E2E
+  credits and wedges the whole XDomain connection on teardown (TB-IP
+  included; config-space timeouts; survives tbnet reload, service rebind,
+  and NHI PCI rebind; only reboot heals). New ops rules adopted on both
+  sides: never transmit toward an unopened peer, never leave both devices
+  closed with the timer stopped, worker-first stop order for future NHI
+  prod.
+- **Why:** The 78-warning dmesg flood in Window B and the two link wedges
+  were the week's only kernel-side blemishes.
+- **Impact:** All close-ordering scenarios now exit with zero warnings
+  (normal, SIGKILL mid-stream with CLOSE still delivered from the killed
+  side, imported-TX dedicated CLOSE frame), dmesg spotless, prod ds4
+  served TCP untouched throughout. The flood/ratelimit arm was skipped
+  deliberately — generating uncompletable CLOSEs IS the wedge trigger.
+  Follow-ups: TX-credit watchdog + firmware-vs-driver wedge
+  investigation. Evidence:
+  `bench/results/2026-08-24-patch15-close-suppression-and-wedge-repro.md`.
+
 ## 2026-08-24 — Gate 7: imported native pools run live DS4 inference bit-exact
 - **What:** Window B with the ds4 session: layered an opt-in imported-pool
   mode (`DS4_DIST_NHI_IMPORTED=1`, worker-only) onto their freshly ported
