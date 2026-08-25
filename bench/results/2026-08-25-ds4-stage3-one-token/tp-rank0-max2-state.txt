@@ -1,0 +1,98 @@
+HOST=max2 NOW=2026-08-24T21:48:06,620046287-07:00
+==rc-pids-holders==
+1
+    PID    PPID USER     STAT COMMAND
+==artifacts==
+-rw-------. 1 root    root        6 Aug 24 21:45 /run/ds4-stage3.lock
+-rw-r--r--. 1 jryates jryates 15852 Aug 24 21:47 /tmp/stage3-tp-r0.log
+-rw-r--r--. 1 jryates jryates     2 Aug 24 21:47 /tmp/stage3-tp-r0.rc
+-rw-r--r--. 1 jryates jryates     6 Aug 24 21:45 /tmp/stage3-tp-r0.shellpid
+==lock==
+size=6 owner=root:root mode=600 nlink=1
+77036
+==log-tail==
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.111s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.111s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.111s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.111s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.113s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.111s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.111s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.112s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.110s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 0.53 GiB model image
+ds4: ROCm model chunk copy complete in 0.111s (0.53 GiB tensors)
+ds4: ROCm chunk-copying 8.19 GiB model image
+ds4: ROCm model chunk copy complete in 1.660s (8.19 GiB tensors)
+ds4: warming sharded tensor pages (rank 0): 76.73 of 145.26 GiB
+ds4: sharded warm done in 12.3s (checksum=2387568774)
+ds4: ROCm preparing model tensor mappings
+ds4: ROCm startup model preparation covered 8.20 GiB of tensor spans in 0.815s
+ds4: rocm backend initialized for graph diagnostics
+ds4: memory: KV 0.46 GiB (raw 0.36 + compressed 0.11) + buffers 0.06 GiB + resident model 76.73 GiB = 77.25 GiB planned
+ds4: memory detail: ctx=8192 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=2050 backend=rocm
+ds4-tp: waiting for worker on 10.99.0.2:5601 ...
+ds4-tp: worker connected, transport=nhi
+tensor parallelism bound: rank 0, 50/50 expert split, nhi transportds4: memory: KV 0.46 GiB (raw 0.36 + compressed 0.11) + buffers 0.06 GiB = 0.53 GiB context
+ds4: memory detail: ctx=8192 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=2050 backend=rocm
+ds4: prompt processing failed: tp: worker prefill sync failed (session 1, status 1)
+ds4: tp: worker failed during session destroy
+ds4: TP NHI stats /run/ds4-tbstream/device: flags=0x1a TX_IMPORTED RX_IMPORTED failures=0 event_drops=0 crc=0 overrun=0 tx=8/8 rx=4104/9
+==kernel==
+2026-08-24T21:45:34-07:00 max2 unknown: STAGE3_0A2CF21_P15_READY_MAX2_1787633134
+==ping==
+3 packets transmitted, 3 received, 0% packet loss, time 2073ms
+rtt min/avg/max/mdev = 0.103/0.124/0.144/0.016 ms

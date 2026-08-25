@@ -1,6 +1,30 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-25 — Stage-3 one-token engine arm fails after first clean gate
+- **What:** Reviewed DS4 through stable tip `0a2cf21`, including the rank-1
+  compact-head fix, poison regression, cross-UID lock hardening, and restored
+  ROCm target. In a bounded p15 window, first froze a standalone one-token
+  ROCm oracle (129,280 finite logits, SHA `21afe05c…bc05ae`, argmax 5 / `#`).
+  The TP NHI arm then connected and completed exactly one 8-frame ATTN
+  exchange before both ranks exited 1: worker `rocm prefill failed`, leader
+  `worker prefill sync failed`. No TP logit dump was produced and no retry was
+  attempted.
+- **Why:** The contract requires a bit-exact, clean one-token engine reference
+  before any full decode or performance run; a visible token alone is not a
+  sufficient math oracle.
+- **Impact:** **Stage 3 remains NO-GO and full decode remains blocked.** The
+  one completed exchange was transport-clean (TX 8/8 both, zero
+  failures/drops/CRC/overrun, ordered worker CLOSE observed by coordinator,
+  spotless dmesg). Complete logs localize the silent engine return to layer 0
+  after the ATTN gate and before the FFN gate. A post-window exact-size HC
+  expand-add oracle passed bit-for-bit, so the real-graph interaction or a
+  later stage still needs first-failure diagnostics before another window.
+  Production modules/endpoints/timers/services were fully restored, API
+  inference and TB-IP passed, production-private locks were inode/FLOCK
+  verified, and final dmesg was clean. Evidence:
+  `bench/results/2026-08-25-ds4-stage3-one-token-window.md`.
+
 ## 2026-08-25 — DS4 Stage-3 preflight: hardened transport passes; engine arm held safely
 - **What:** Reviewed DS4's ROCm/NHI Stage-3 implementation through three
   fixups (`e4266a5..8fb6977`), catching before wire time: TX_DONE's zero-byte
