@@ -14,7 +14,7 @@ HIPLDFLAGS ?= -Wl,-rpath,$(ROCM_ROOT)/lib
 all: tbstream-stale-tx tbstream-import-test
 
 hip: tbstream-stale-rx tbstream-gpu-tx tbstream-tp-pingpong \
-	tbstream-tp-exchange
+	tbstream-tp-exchange hip-event-before-spin
 
 tbstream-stale-tx: tbstream-stale-tx.c stale-pattern.h ../pingpong/thunderbolt-stream.h
 	$(CC) $(CFLAGS) -o $@ $<
@@ -34,8 +34,12 @@ tbstream-tp-pingpong: tbstream-tp-pingpong.cu ../pingpong/thunderbolt-stream.h
 tbstream-tp-exchange: tbstream-tp-exchange.cu ../pingpong/thunderbolt-stream.h
 	$(HIPCC) $(HIPFLAGS) $(HIPLDFLAGS) -o $@ $<
 
+hip-event-before-spin: hip-event-before-spin.cu
+	$(HIPCC) $(HIPFLAGS) $(HIPLDFLAGS) -pthread -o $@ $<
+
 clean:
 	rm -f tbstream-stale-tx tbstream-stale-rx tbstream-gpu-tx \
-		tbstream-import-test tbstream-tp-pingpong tbstream-tp-exchange
+		tbstream-import-test tbstream-tp-pingpong tbstream-tp-exchange \
+		hip-event-before-spin
 
 .PHONY: all hip clean

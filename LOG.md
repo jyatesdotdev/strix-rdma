@@ -10,17 +10,22 @@ Running log of noteworthy work; newest first.
   pair: spin 29.0 µs/exchange (2.61 ms/90-exchange token), spin+reduce
   35.2 µs (3.17 ms), reap 52.3 µs (4.71 ms), reap+reduce 75.6 µs
   (6.80 ms). Zero drops, dmesg spotless, reduce sums bit-exact, prod
-  served TCP untouched throughout.
+  served TCP untouched throughout. Follow-up `hip-event-before-spin`
+  verified on both gfx1151 hosts that a service-thread event sync returns
+  while a later same-default-stream one-CU spin remains active — the
+  exact deadlock-sensitive Stage-3 enqueue shape.
 - **Why:** The ds4 session's go/no-go criterion for building TP mode was
   sustained sync ≤ 5 ms/token at the real exchange shape.
 - **Impact:** **TP clears the bar with 1.8 ms of margin** in the realistic
   spin+reduce arm → projected ~27 t/s vs today's 14.3 (≈1.9×). Full
   duplex costs ~2 µs over half-RTT (rings don't contend); reap loses to
   per-exchange dispatch+sync, not interrupts; the single-workgroup
-  UC-payload reduce is conservative. Fidelity note recorded: in-band
+  UC-payload reduce is conservative. Fidelity notes recorded: in-band
   stamps force whole-pool UC in spin mode (one MTYPE per imported pool)
-  at no cost for streaming payloads. Ball now in ds4's court (ROCm gate
-  ops + NHI TP backend). Evidence:
+  at no cost for streaming payloads; RX repost requires both the driver
+  event and completion of the final GPU slot reader; and Stage 3 must
+  event-sync, never stream-sync, before host submission. Ball now in ds4's
+  court (ROCm gate ops + NHI TP backend). Evidence:
   `bench/results/2026-08-25-tp-exchange-probe.md`.
 
 ## 2026-08-24 — Patch 15 validated; the TB link wedge is reproducible

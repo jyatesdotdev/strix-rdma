@@ -49,6 +49,29 @@ dmesg spotless; zero event drops anywhere.
   split would require two pools per direction, which the import ABI
   (one pool per direction) does not support.
 
+## Stage-3 literal event-ordering gate
+
+The engine design records a TX-ready event and then eagerly enqueues the
+RX spin-combine in the same default stream. Its service thread must be
+able to synchronize the earlier event without waiting for the later spin;
+a stream-tail wait would bilaterally deadlock before either host submitted.
+`hip-event-before-spin` tests that literal chain:
+
+```text
+producer -> hipEventRecord(hipEventReleaseToSystem) -> one-CU spin
+                   |
+                   +-> service-thread hipEventSynchronize
+
+max:  event_sync_while_later_spin_active=PASS rc=0 producer=0x51a9c0de
+max2: event_sync_while_later_spin_active=PASS rc=0 producer=0x51a9c0de
+```
+
+Both runs used exact HIP 7.13/gfx1151 alongside serving production. The
+spin kernel signaled that it was actively blocked before the check; the
+event waiter returned while it remained blocked. Thus Stage 3 may safely
+use event synchronization, but **must never substitute
+`hipStreamSynchronize` or `hipDeviceSynchronize`** on that path.
+
 ## Verdict
 
 The transport leg of hybrid tensor parallelism is measured and

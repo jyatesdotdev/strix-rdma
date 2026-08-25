@@ -50,28 +50,44 @@ module set (`tools/scripts/p14-swap.sh on /tmp/thunderbolt_stream-p15.ko`).
 8. TX visibility to the NHI needs a release: for persistent-kernel
    senders on UC pools the stamp store suffices; for dispatch-per-send
    designs a stream synchronize after the fill kernel is the release
-   (gate 6c). Host-mediated signals (hipHostMalloc control blocks) work
-   in both directions with plain CPU stores / system-scope GPU atomics.
+   (gate 6c). Production TP uses a timing-enabled
+   `hipEventReleaseToSystem` recorded after the producer/stamp and a
+   service-thread `hipEventSynchronize()` before submit. An event recorded
+   before a later same-stream one-CU spin was verified on both gfx1151
+   hosts to synchronize while that spin remained active
+   (`hip-event-before-spin`) — **never substitute a stream/device sync**,
+   which would wait for the RX spin and bilaterally deadlock. Host-mediated
+   signals (hipHostMalloc control blocks) also work in both directions
+   with plain CPU stores / system-scope GPU atomics.
 
 ## Ring protocol
 
 9. Slots advance strictly in order on both sides:
    `slot(n) = (n % (ring/frames)) × frames`. Both peers must submit in
    the same order — the receive side has no addressing, only arrival
-   order.
+   order. `tbstream_zc_tx.first` is kernel output, not a requested slot:
+   assert after every submit that it equals the expected frame index,
+   and likewise assert every RX event's `first`, `nframes`, and `bytes`.
 10. Message geometry: `frames` per message, wire cost is
     `frames × 4096` regardless of payload bytes; ring % frames == 0
     keeps messages contiguous (28 KiB payload → 8 frames; a 7-frame
     variant would need wrap-tolerant slot math).
-11. Repost cadence: reap driver events off the critical path
-    (`TBSTREAM_ZC_REAP` nonblocking each iteration) and `POST_RX` in
-    consumption order. Slot reuse distance is `ring/frames` messages
-    (512 at production geometry) — a detection-time reader has that
-    much slack before the slot is overwritten.
-12. TX submission is host-only (ioctl). Budget one thread that submits
-    on GPU signal (`tx_ready` style); measured host cost ≈ 1–2 µs per
-    submit. At most `ring - 1` frames in flight; lockstep exchange
-    keeps occupancy at 1–2 messages.
+11. Reap driver events off the critical path. `POST_RX` is safe only
+    after **both** (a) the complete eight-frame RX event has arrived and
+    (b) the GPU's final reader of that slot has completed. Stamp detection
+    can precede the host callback; posting then may return `EINVAL`. If a
+    spin kernel only gates later readers, its completion is not consumption:
+    record an event after the last downstream slot reader. Repost strictly
+    in sequence order once both conditions hold; small batches are fine.
+    Slot reuse distance is `ring/frames` messages (512 at production
+    geometry, only 5.95 DS4 tokens), so this is slack, not permission to
+    leave credits outstanding indefinitely.
+12. TX submission is host-only (ioctl): exactly one submit per gate/message.
+    Budget one service thread that event-synchronizes the GPU release then
+    submits; measured ioctl cost ≈ 1–2 µs. At most `ring - 1` frames may be
+    in flight. Before a producer overwrites slot `n % 512`, it must know the
+    old `n - 512` TX completion returned that slot; reap/retry `ENOBUFS`
+    without violating this producer-side ownership.
 
 ## Lifecycle and the wedge rules (operational, hard-won)
 
@@ -84,10 +100,13 @@ module set (`tools/scripts/p14-swap.sh on /tmp/thunderbolt_stream-p15.ko`).
 14. Keep one side's device open across restarts of the other, or keep
     the reconcile timer running; never leave both closed with the timer
     stopped during a session gap.
-15. Stop order for paired teardown: receiver-last is benign under
-    patch 15 (a side that received the peer's CLOSE skips its own);
-    worker-first-then-coordinator with a minimal gap is the production
-    rule.
+15. Stop order for paired teardown: first quiesce GPU slot users and
+    submission, then drain ownership events. Close rank 1/worker while
+    rank 0/coordinator keeps its device open; after rank 0 observes the
+    CLOSE (or a post-close control acknowledgment), it closes and patch 15
+    skips the impossible reciprocal CLOSE. A simultaneous teardown barrier
+    passed the probes but is not the production ordering. Keep the survivor
+    open across a peer restart.
 16. Log `TBSTREAM_ZC_GET_STATS` at close on both sides (flags should
     show TX_IMPORTED|RX_IMPORTED and zero
     failures/event_drops/crc/overrun); flush stderr before teardown so
