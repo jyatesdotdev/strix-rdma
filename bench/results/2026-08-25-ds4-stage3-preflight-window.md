@@ -64,8 +64,9 @@ The first process attempt never reached NHI open/READY or any TP gate:
 1. max2 coordinator loaded the model and stopped at
    `waiting for worker on 10.99.0.2:5601`;
 2. max worker exited immediately, before connect/model/NHI, because the
-   root-run test encountered a jryates-owned mode-0600 `/tmp/ds4.lock`
-   under Fedora's sticky-directory `fs.protected_regular` policy;
+   root-run test encountered a jryates-owned mode-0600 host-namespace
+   `/tmp/ds4.lock` left by an earlier manual run under Fedora's
+   sticky-directory `fs.protected_regular` policy;
 3. while the coordinator was still only waiting on TCP, the DS4 session
    found a semantic rank-1 attention bug: compact owned heads live at
    offset zero, but the Q8 TP path shifted the head input by `group0`;
@@ -79,14 +80,22 @@ was not part of this window and requires review/build testing before a new
 one-token arm.
 
 Future root-run windows must set, for example,
-`DS4_LOCK_FILE=/run/ds4-stage3.lock` on each host rather than sharing the
-production service user's default `/tmp/ds4.lock`.
+`DS4_LOCK_FILE=/run/ds4-stage3.lock` on each host instead of reusing a
+host `/tmp` path. Follow-up audit showed production itself was healthy:
+both systemd units have `PrivateTmp=yes`, and each service's namespace
+path device/inode exactly matched fd 3 with a live kernel FLOCK. Those
+private locks cannot exclude a manual process in the host mount namespace,
+so the operational prod-stop + process audit remains mandatory. A future
+shared `/run` lock configured in both systemd and manual runs would make
+the singleton guard global.
 
 ## Restoration audit
 
 After the hold:
 
-- stale lock files removed only after confirming no DS4 test process;
+- stale host-namespace test locks removed only after confirming no DS4
+  test process; post-start inode audit verified both production-private
+  lock paths remained present and locked inside their mount namespaces;
 - production modules restored both hosts; diagnostic DMA-BUF parameter
   absent; endpoints `/dev/tbstream0` republished;
 - reconcile timers active both;

@@ -113,11 +113,17 @@ module set (`tools/scripts/p14-swap.sh on /tmp/thunderbolt_stream-p15.ko`).
     show TX_IMPORTED|RX_IMPORTED and zero
     failures/event_drops/crc/overrun); flush stderr before teardown so
     systemd stops don't eat the line.
-17. Root-run test binaries must not share the production service user's
+17. Root-run test binaries must not reuse a non-root manual run's
     `/tmp/ds4.lock`: Fedora `fs.protected_regular` rejects opening the
-    other user's mode-0600 file in sticky `/tmp`, even for this root-run
-    path. Set `DS4_LOCK_FILE=/run/ds4-stage3.lock` per host, or remove a
-    confirmed-stale lock only after proving no DS4 process remains.
+    other user's mode-0600 file in sticky `/tmp`. Set
+    `DS4_LOCK_FILE=/run/ds4-stage3.lock` per host, or remove a
+    confirmed-stale host-namespace lock only after proving no DS4 process
+    remains. Production units currently use `PrivateTmp=yes`: their
+    `/tmp/ds4.lock` files and flocks are healthy but live in private mount
+    namespaces, so they **cannot** exclude a manual host-namespace process.
+    Stopping production and auditing processes remains mandatory. The
+    durable singleton fix is one shared lock under a writable `/run`
+    RuntimeDirectory for both systemd and manual runs.
 
 ## Performance envelope (measured, ring 4096, 28 KiB payload)
 

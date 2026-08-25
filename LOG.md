@@ -10,8 +10,9 @@ Running log of noteworthy work; newest first.
   ranks with exact quiesce, TX 32000/32000, zero failures/drops/CRC/overrun,
   93.4–94.1 µs/exchange, and spotless dmesg. The bounded one-token engine
   arm did **not** run: worker failed before connect/NHI on Fedora's protected
-  stale `/tmp/ds4.lock`, and while coordinator was still only waiting on
-  TCP the DS4 session found a rank-1 compact-head offset bug. Urgent hold
+  stale host `/tmp/ds4.lock` left by a non-root manual run, and while
+  coordinator was still only waiting on TCP the DS4 session found a rank-1
+  compact-head offset bug. Urgent hold
   honored; no retry and no Stage-3 stream traffic.
 - **Why:** Establish the engine gate only after both software ownership and
   model semantics are correct; prevent a false result or an unopened-peer
@@ -19,8 +20,11 @@ Running log of noteworthy work; newest first.
 - **Impact:** DS4's hardened transport is independently wire-approved; the
   engine result remains explicitly open pending review/build of semantic
   fix `0ce04c5` and a fresh one-token window. Root tests must use
-  `DS4_LOCK_FILE=/run/ds4-stage3.lock`, not the service user's default
-  `/tmp/ds4.lock`. Production modules/timers/services restored, API
+  `DS4_LOCK_FILE=/run/ds4-stage3.lock`, not a stale host `/tmp` lock.
+  Follow-up inode audit proved production's `PrivateTmp=yes` locks intact
+  (namespace path == fd inode plus live kernel FLOCK) but also showed they
+  cannot exclude host-namespace manual runs; prod stop+process audit stays
+  mandatory. Production modules/timers/services restored, API
   inference-smoked, final dmesg clean. Evidence:
   `bench/results/2026-08-25-ds4-stage3-preflight-window.md`.
 
