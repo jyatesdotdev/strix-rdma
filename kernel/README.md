@@ -113,8 +113,11 @@ publishes `0660 root:tbstream` devices through
 
 ## Zero-copy UAPI (step 3 of the plan)
 
-`zerocopy/` contains the twelve-patch follow-on series to apply after the v7.1
-backport:
+`zerocopy/` contains the fifteen-patch follow-on series to apply after the
+v7.1 backport. Patches 1–12 are the production module set deployed on the
+`max`/`max2` pair; patches 13–15 are validated (through live DS4 inference,
+Window B) but deployed only transiently via
+`../tools/scripts/p14-swap.sh on <module.ko>`:
 
 1. Add `RING_FRAME_NO_INTERRUPT` so a ring client can suppress completion
    interrupts for non-final frames.
@@ -168,6 +171,13 @@ backport:
 13. Add `TBSTREAM_ZC_DMABUF_PROBE`, a privileged, default-off, no-traffic
     DMA-BUF import probe, and the shared `stream-sg.h` segment validation
     and frame-flattening rules the future imported-pool mode will reuse.
+14. Add `TBSTREAM_ZC_IMPORT`: DMA-BUF backed frame pools with lazy
+    ring/path activation, transactional per-direction import, sync-free
+    imported frames without CPU mappings, and a dedicated page-backed
+    CLOSE control frame for imported-TX devices.
+15. Skip the CLOSE toward a peer that already closed (its receive path
+    returns no E2E credits, so the frame could never complete) and
+    ratelimit the TX flush-timeout warning.
 
 The original five-patch zero-copy implementation was built, deployed, and
 benchmarked on both test hosts; see
@@ -202,10 +212,14 @@ Validate the complete series without changing the local kernel checkout:
 make -C kernel/tests test
 ```
 
-The 40-case test creates an isolated worktree, applies every zero-copy patch
+The 44-case test creates an isolated worktree, applies every zero-copy patch
 in order, compares the final UAPI with the userspace mirror, verifies its
 32/64-bit ABI, compiles and runs the SG-flatten geometry unit tests, and
-checks the ownership, failure, diagnostic, and teardown invariants.
+checks the ownership, failure, diagnostic, and teardown invariants, plus
+the patch-14/15 contracts: gated pre-activation transactional import,
+reverse-order failure release, peer-close CLOSE suppression, ratelimited
+flush warnings, the dedicated imported-TX CLOSE frame, and mmap holes for
+imported halves.
 
 `TBSTREAM_ZC_ENABLE` is intended to run immediately after opening a fresh
 stream. It returns `EBUSY` if legacy TX is still in flight or any RX frame has
@@ -248,8 +262,55 @@ example a HIP export) or from a CPU-only `/dev/udmabuf` allocation
 (`--udmabuf`) that smokes the import path without a GPU.
 
 The SG-flatten rules in `drivers/thunderbolt/stream-sg.h` are pure
-arithmetic shared verbatim with the future imported-pool mode; the series
+arithmetic shared verbatim with the imported-pool mode; the series
 test compiles the same header in userspace and exercises one/many/coalesced
 segments, exact boundaries, zero and unaligned segments, short and overlong
 coverage, address and cumulative-length overflow, excessive frame counts,
 and final partial segments.
+
+## Imported DMA-BUF frame pools (patch 14)
+
+`TBSTREAM_ZC_IMPORT` replaces either or both page-backed frame pools with
+caller-supplied DMA-BUFs (in practice: dedicated native `hipMalloc`
+allocations exported with `hipMemGetHandleForAddressRange`), so the NHI
+DMAs directly to and from GPU memory. Ring construction and path
+activation move from first open to the first operation that needs them,
+letting the import run on an exclusively opened, never-activated device;
+the import is transactional (any failure releases every acquired object
+in reverse order) and lasts until final close. Imported halves have no
+CPU mapping — `mmap()` leaves holes and legacy `read()`/`write()` are
+rejected — and an imported-TX device sends CLOSE from a dedicated
+page-backed control frame. Gated by `CAP_SYS_RAWIO` +
+`zc_diagnostic_dmabuf=1` while experimental.
+
+Validation: gates 4–7 of `../docs/GPU_TO_GPU_FEASIBILITY.md` — import
+geometry (single fully-covering segment for dedicated 16/256 MiB
+allocations), 448 MiB of word-exact traffic through imported RX pools
+with adversarial stale-cache pressure, full GPU→GPU imported TX→RX with
+rollback/lifecycle/SIGKILL coverage and zero IOMMU faults, and
+bit-exact live DS4 inference through an imported worker TX pool
+(`../bench/results/2026-08-24-gate7-imported-pool-live-inference.md`).
+Ownership contract: coarse pools + a device synchronize before submit
+(dispatch-boundary coherence), or MTYPE_UC pools with in-band
+system-scope stamps for persistent-wave designs — see
+`../docs/TP_TRANSPORT_CONTRACT.md`.
+
+## Close-ordering polish (patch 15)
+
+A side whose peer already sent CLOSE skips sending its own (the peer's
+receive path no longer returns E2E credits, so the frame could never
+complete and only stalled the teardown flush), and the TX flush-timeout
+warning is ratelimited against userspace connection churn toward a dead
+peer. Validated across normal, SIGKILL, and imported-TX close orderings
+with zero warnings and spotless dmesg
+(`../bench/results/2026-08-24-patch15-close-suppression-and-wedge-repro.md`).
+
+**Known platform hazard (unfixed, rules-based mitigation):** stream TX
+toward a peer whose device is not open+enabled stalls on zero E2E
+credits and can wedge the entire XDomain connection — ThunderboltIP
+included — with reboot as the only recovery (tbnet reload, service
+rebind, and NHI PCI rebind all fail; the NHI bind probe hangs). Follow
+the lifecycle rules in `../docs/TP_TRANSPORT_CONTRACT.md`: barrier
+before first submit, keep one device open across peer restarts, never
+both closed with the reconcile timer stopped. A TX-credit watchdog and
+a firmware-vs-driver root-cause investigation are open follow-ups.

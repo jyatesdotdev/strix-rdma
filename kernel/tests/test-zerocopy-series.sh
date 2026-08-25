@@ -417,9 +417,12 @@ must_order "$enable_body" 'zero-copy enable ownership' \
 	'kfifo_alloc(&sdev->zc_events' \
 	'dma_sync_single_for_cpu' \
 	'WRITE_ONCE(sdev->zc, true);'
-must_contain "$enable_body" 'TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);' \
-	'zero-copy enable ownership'
-pass 'enable requires idle TX and hands the full pool to CPU before publication'
+must_order "$enable_body" 'zero-copy enable ownership' \
+	'if (sf->page)' \
+	'dma_sync_single_for_cpu' \
+	'TB_MAX_FRAME_SIZE,' \
+	'DMA_TO_DEVICE);'
+pass 'enable requires idle TX and hands page-backed frames to CPU before publication'
 
 must_order "$enable_body" 'zero-copy cursor transition' \
 	'spin_lock_irqsave(&sdev->zc_lock, flags);' \
@@ -464,16 +467,20 @@ must_order "$consume_rx" 'failed RX repost ownership rollback' \
 pass 'failed RX repost restores frame offset, size, completion, and cursor'
 
 read_body=$(body_between '^tbstream_dev_fops_read_iter' '^static ssize_t$')
-[ "$(grep -Fc 'if (sdev->zc)' <<<"$read_body")" -ge 2 ] ||
+must_contain "$read_body" 'if (sdev->zc || sdev->zc_tx_import || sdev->zc_rx_import) {' \
+	'legacy read import/zero-copy entry gate'
+[ "$(grep -Fc 'if (sdev->zc)' <<<"$read_body")" -ge 1 ] ||
 	fail 'legacy read lacks post-lock zero-copy rechecks'
 must_contain "$read_body" 'READ_ONCE(sdev->zc) ||' 'legacy read transition'
-pass 'legacy reads recheck zero-copy after initial and wait-loop locking'
+pass 'legacy reads reject imports and recheck zero-copy after wait-loop locking'
 
 write_body=$(body_between '^tbstream_dev_fops_write_iter' '^static __poll_t$')
-[ "$(grep -Fc 'if (sdev->zc)' <<<"$write_body")" -ge 2 ] ||
+must_contain "$write_body" 'if (sdev->zc || sdev->zc_tx_import || sdev->zc_rx_import) {' \
+	'legacy write import/zero-copy entry gate'
+[ "$(grep -Fc 'if (sdev->zc)' <<<"$write_body")" -ge 1 ] ||
 	fail 'legacy write lacks post-lock zero-copy rechecks'
 must_contain "$write_body" 'READ_ONCE(sdev->zc) ||' 'legacy write transition'
-pass 'legacy writes recheck zero-copy after initial and wait-loop locking'
+pass 'legacy writes reject imports and recheck zero-copy after wait-loop locking'
 
 submit_body=$(body_between '^static int tbstream_dev_zc_submit_tx' '^static int tbstream_dev_zc_post_rx')
 must_order "$submit_body" 'TX submission ownership' \
@@ -522,8 +529,8 @@ diagnostic_uapi=$(body_between_file "$KERNEL_UAPI" \
 	'^struct tbstream_zc_ring_stats' '^#define TBSTREAM_ZC_MAGIC')
 aligned_u64_count=$(grep -Ec \
 	'^[[:space:]]*__aligned_u64[[:space:]]' <<<"$diagnostic_uapi")
-[ "$aligned_u64_count" -eq 37 ] ||
-	fail "diagnostic UAPI has $aligned_u64_count aligned u64 fields, expected 37"
+[ "$aligned_u64_count" -eq 40 ] ||
+	fail "diagnostic UAPI has $aligned_u64_count aligned u64 fields, expected 40"
 if grep -Eq '^[[:space:]]*__u64[[:space:]]' <<<"$diagnostic_uapi"; then
 	fail 'diagnostic UAPI contains a compat-unsafe plain __u64 field'
 fi
@@ -855,7 +862,8 @@ must_order "$probe_body" 'DMA-BUF probe gating and transactional teardown' \
 	'case TBSTREAM_ZC_DMABUF_RX:' \
 	'mutex_lock_interruptible(&sdev->lock)' \
 	'ret = tbstream_dev_valid(sdev);' \
-	'if (sdev->zc || !sdev->tx_ring.ring || !sdev->rx_ring.ring)' \
+	'if (sdev->zc || sdev->zc_tx_import || sdev->zc_rx_import)' \
+	'ret = tbstream_dev_activate_locked(sdev);' \
 	'dma_dev = tb_ring_dma_device' \
 	'dmabuf = dma_buf_get(probe.fd);' \
 	'!(dmabuf->file->f_mode & FMODE_WRITE)' \
@@ -901,5 +909,61 @@ ioctl_body=$(body_between '^tbstream_dev_fops_ioctl' \
 must_contain "$ioctl_body" 'case TBSTREAM_ZC_DMABUF_PROBE:' \
 	'probe ioctl dispatch'
 pass 'DMA-BUF probe is privileged, no-traffic, and transactional'
+
+import_body=$(body_between '^static int tbstream_dev_zc_import' \
+	'^static long$')
+must_order "$import_body" 'import gating and pre-activation exclusivity' \
+	'if (!zc_diagnostic_dmabuf)' \
+	'return -EACCES;' \
+	'if (!capable(CAP_SYS_RAWIO))' \
+	'return -EPERM;' \
+	'imp.version != TBSTREAM_ZC_IMPORT_VERSION' \
+	'if (sdev->users != 1)' \
+	'if (sdev->started || sdev->zc || sdev->zc_tx_import ||' \
+	'tx_half = tbstream_dev_zc_import_half(sdev, &imp.tx,' \
+	'rx_half = tbstream_dev_zc_import_half(sdev, &imp.rx,' \
+	'tx_half->dmabuf == rx_half->dmabuf' \
+	'sdev->zc_tx_import = tx_half;' \
+	'sdev->zc_rx_import = rx_half;'
+must_order "$import_body" 'import failure releases in reverse order' \
+	'err_release_rx:' \
+	'tbstream_dev_zc_import_half_release(rx_half, DMA_FROM_DEVICE);' \
+	'err_release_tx:' \
+	'tbstream_dev_zc_import_half_release(tx_half, DMA_TO_DEVICE);'
+pass 'pool import is gated, exclusive, pre-activation, and transactional'
+
+release_body=$(body_between '^static int tbstream_dev_fops_release' \
+	'^static const struct file_operations tbstream_dev_fops')
+must_order "$release_body" 'release ordering with peer-close suppression' \
+	'if (--sdev->users == 0)' \
+	'if (sdev->started)' \
+	'if (!sdev->closed)' \
+	'ret = tbstream_dev_send_close(sdev);' \
+	'tbstream_dev_stop(sdev);' \
+	'sdev->started = false;' \
+	'tbstream_dev_zc_import_release(sdev);'
+pass 'release skips CLOSE toward a closed peer and frees imports last'
+
+stop_body=$(body_between '^static void tbstream_dev_stop' \
+	'^static int tbstream_dev_activate_locked')
+must_contain "$stop_body" 'pr_warn_ratelimited(' \
+	'flush timeout warning is ratelimited'
+pass 'TX flush timeout warning cannot flood the log'
+
+send_close_body=$(body_between '^static int tbstream_dev_send_close' \
+	'^static int tbstream_dev_start')
+must_order "$send_close_body" 'imported-TX close frame' \
+	'if (sdev->zc_tx_import) {' \
+	'sf = &sdev->zc_close_frame;' \
+	'if (!sdev->zc_close_frame_mapped)' \
+	'sf->frame.eof = TBSTREAM_CLOSE;' \
+	'tb_ring_tx(sdev->tx_ring.ring, &sf->frame);'
+mmap_body=$(body_between '^static int tbstream_dev_fops_mmap' \
+	'^static const struct file_operations')
+must_contain "$mmap_body" 'if (!sdev->tx_ring.frames[i].page)' \
+	'imported halves mmap as holes'
+must_contain "$mmap_body" 'if (!sdev->rx_ring.frames[i].page)' \
+	'imported halves mmap as holes'
+pass 'imported-TX CLOSE uses the dedicated frame and imports mmap as holes'
 
 printf '1..%d\n' "$PASS_COUNT"
