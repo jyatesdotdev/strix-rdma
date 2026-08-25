@@ -1,6 +1,28 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-25 — TP exchange probe: 3.2 ms/token — tensor parallelism clears the bar
+- **What:** Built `tbstream-tp-exchange` (full-duplex simultaneous 28 KiB
+  partial-sum exchanges through imported pools both directions, TCP start
+  barrier honoring the never-transmit-toward-inactive-peer rule, in-wave
+  float reduce with exact analytic verification) and ran the {spin, reap}
+  × {transport-only, +reduce} matrix at sustained cadence on the node
+  pair: spin 29.0 µs/exchange (2.61 ms/90-exchange token), spin+reduce
+  35.2 µs (3.17 ms), reap 52.3 µs (4.71 ms), reap+reduce 75.6 µs
+  (6.80 ms). Zero drops, dmesg spotless, reduce sums bit-exact, prod
+  served TCP untouched throughout.
+- **Why:** The ds4 session's go/no-go criterion for building TP mode was
+  sustained sync ≤ 5 ms/token at the real exchange shape.
+- **Impact:** **TP clears the bar with 1.8 ms of margin** in the realistic
+  spin+reduce arm → projected ~27 t/s vs today's 14.3 (≈1.9×). Full
+  duplex costs ~2 µs over half-RTT (rings don't contend); reap loses to
+  per-exchange dispatch+sync, not interrupts; the single-workgroup
+  UC-payload reduce is conservative. Fidelity note recorded: in-band
+  stamps force whole-pool UC in spin mode (one MTYPE per imported pool)
+  at no cost for streaming payloads. Ball now in ds4's court (ROCm gate
+  ops + NHI TP backend). Evidence:
+  `bench/results/2026-08-25-tp-exchange-probe.md`.
+
 ## 2026-08-24 — Patch 15 validated; the TB link wedge is reproducible
 - **What:** Wrote and validated patch 15 (`0015-...Skip-CLOSE-toward-an-
   already-closed-peer.patch`, host tree a48b0ee1f): release skips sending
