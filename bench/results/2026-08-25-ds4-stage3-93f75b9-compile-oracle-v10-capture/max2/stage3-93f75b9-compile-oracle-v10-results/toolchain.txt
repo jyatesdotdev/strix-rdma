@@ -1,0 +1,27 @@
+PATH=/opt/rocm-therock/bin:/usr/local/bin:/usr/bin:/bin
+LD_LIBRARY_PATH=/opt/rocm-therock/lib
+ROCM_HOME=/opt/rocm-therock
+HIPCC=/opt/rocm-therock/bin/hipcc
+HIPCC_RESOLVED=/opt/rocm-therock/bin/hipcc
+CC_RESOLVED=/usr/bin/gcc
+HOST=max2
+KERNEL=7.1.5-101.fc43.x86_64
+--- hipcc --version ---
+HIP version: 7.13.99004-3309c6114a
+AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 43215c73116c407735c85a180d174f718798c328+PATCHED:2506c552d8428e2cc1778bef048b20f818e06bb3)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-therock/lib/llvm/bin
+--- cc --version ---
+cc (GCC) 15.2.1 20260123 (Red Hat 15.2.1-7)
+Copyright (C) 2025 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+--- make --version ---
+GNU Make 4.4.1
+Built for x86_64-redhat-linux-gnu
+Copyright (C) 1988-2023 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.

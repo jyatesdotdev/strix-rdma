@@ -1,0 +1,4 @@
+ATTEMPT=1 REMAINING_BEFORE=210
+SYSTEMD_FENCE_RAW_JSON={"mode":"stopped","monotonic_ns":74357970851705,"units":{"ds4-exporter.service":{"ActiveState":"inactive","Id":"ds4-exporter.service","Job":"","LoadState":"loaded","SubState":"dead"},"ds4-mxfp4-server.service":{"ActiveState":"inactive","Id":"ds4-mxfp4-server.service","Job":"","LoadState":"loaded","SubState":"dead"}}}
+SYSTEMD_FENCE=PASS
+ATTEMPT_RC=0

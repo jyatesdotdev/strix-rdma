@@ -1,0 +1,10 @@
+HOME=/home/jryates
+LANG=C.UTF-8
+LC_ALL=C.UTF-8
+LOGNAME=jryates
+PATH=/usr/local/bin:/usr/bin:/bin
+PWD=/home/jryates
+SHLVL=1
+STAGE3_COMPILE_NONCE=34cc83dd6e4c3896d83ca13ad0fff39a
+USER=jryates
+_=/usr/bin/env

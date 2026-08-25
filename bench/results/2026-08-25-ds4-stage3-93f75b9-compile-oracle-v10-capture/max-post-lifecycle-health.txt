@@ -1,0 +1,5 @@
+LIFECYCLE_RAW_JSON={"attempt":1,"monotonic_ns":74583647701594,"reconcile":{"ActiveEnterTimestampMonotonic":"0","ActiveState":"inactive","ExecMainCode":"1","ExecMainExitTimestampMonotonic":"77176976","ExecMainStartTimestampMonotonic":"72810743","ExecMainStatus":"0","InactiveEnterTimestampMonotonic":"77177150","LoadState":"loaded","MainPID":"0","Result":"success","SubState":"dead"},"timer":{"ActiveState":"active","LastTriggerUSecMonotonic":"20h 42min 56.580968s","LoadState":"loaded","NextElapseUSecMonotonic":"20h 43min 7.625190s","SubState":"waiting","UnitFileState":"enabled"},"watchdog":{"ActiveEnterTimestampMonotonic":"0","ActiveState":"inactive","ExecMainCode":"1","ExecMainExitTimestampMonotonic":"74576636997","ExecMainStartTimestampMonotonic":"74576582630","ExecMainStatus":"0","InactiveEnterTimestampMonotonic":"74576637075","LoadState":"loaded","MainPID":"0","Result":"success","SubState":"dead"}}
+LIFECYCLE_HEALTH=PASS
+TIMER_STATE=loaded/active/waiting/enabled
+RECONCILE_STATE=loaded/inactive/dead/result-success/code-exited/status-0
+WATCHDOG_STATE=loaded/inactive/dead/result-success/code-exited/status-0-or-75

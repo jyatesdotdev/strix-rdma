@@ -1,0 +1,13 @@
+{
+  "actual_files": 1490,
+  "allow_extra": false,
+  "expected_files": 1490,
+  "extras": [],
+  "failures": [],
+  "kind": "extract",
+  "manifest": "/run/stage3-93f75b9-compile-oracle-v10-input/source-93f75b9.manifest",
+  "manifest_sha256": "5bdea6ff306961d198f341815082d72c9903f25349cd679fb9bb768fa8d83bf2",
+  "missing": [],
+  "ok": true,
+  "root": "/home/jryates/ds4-stage3-93f75b9-build-v10.partial"
+}

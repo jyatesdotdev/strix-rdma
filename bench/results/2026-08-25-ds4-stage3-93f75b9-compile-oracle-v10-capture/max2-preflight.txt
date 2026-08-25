@@ -1,0 +1,1 @@
+host=max2 kernel=7.1.5-101.fc43.x86_64 global_tmp_lock=ABSENT stale_paths=ABSENT

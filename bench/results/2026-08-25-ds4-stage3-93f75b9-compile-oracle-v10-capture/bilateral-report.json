@@ -1,0 +1,44 @@
+{
+  "commit": "93f75b98bcfcb6a44ca739754472bf767f5433dc",
+  "compared": {
+    "CHECKER-SHA256.txt": {
+      "same": true,
+      "sha256": "e2ce4ec84d6f824ea84b113d4559fffbe77df86742d58de72b91ea74f6ae8904"
+    },
+    "RUNNER-SHA256.txt": {
+      "same": true,
+      "sha256": "72563f4931e86a26a49ee55782dd7b2b011daaba4d898fac8d92872a3a024658"
+    },
+    "command-environment.txt": {
+      "same": true,
+      "sha256": "f9f6d4389a700156b162d1908f2a2fe1916f49122dbd9c122ea06d7262bf3497"
+    },
+    "production-binaries-after.sha256": {
+      "same": true,
+      "sha256": "20db25833cb0416579783ed59137deb5c1841c747e17ecadc747e908e32b2d1f"
+    },
+    "production-binaries.sha256": {
+      "same": true,
+      "sha256": "20db25833cb0416579783ed59137deb5c1841c747e17ecadc747e908e32b2d1f"
+    },
+    "runtime-library-identities.sha256": {
+      "same": true,
+      "sha256": "f711680c79d65819c60ca7c86f318c0ff79dad72b56b2281d1ea95b7c2b40100"
+    },
+    "test-binaries.sha256": {
+      "same": true,
+      "sha256": "bc33bc703e19d97d3c9542986c175b290addaf25c12813ab6d0fa938f8f3f638"
+    },
+    "toolchain-identities.sha256": {
+      "same": true,
+      "sha256": "7e2b2d9b23b6136bce0b27e19b9d929e6c40373357a4a879f6d0e4de34c16271"
+    }
+  },
+  "failures": [],
+  "kind": "bilateral",
+  "max2_result": "/tmp/stage3-93f75b9-compile-oracle-v10-capture/max2/stage3-93f75b9-compile-oracle-v10-results",
+  "max_result": "/tmp/stage3-93f75b9-compile-oracle-v10-capture/max/stage3-93f75b9-compile-oracle-v10-results",
+  "ok": true,
+  "source_manifest_sha256": "5bdea6ff306961d198f341815082d72c9903f25349cd679fb9bb768fa8d83bf2",
+  "tree": "1da8f8f1d776b455d46a679a3a6a6e06e06acc70"
+}

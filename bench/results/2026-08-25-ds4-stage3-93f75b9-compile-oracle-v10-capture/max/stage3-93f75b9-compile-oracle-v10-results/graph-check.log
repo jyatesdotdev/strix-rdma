@@ -1,0 +1,26 @@
+{
+  "armed_lines": [
+    "ds4: deferred graph layer-state dump armed entries=8 bytes=262240 layers=10:12",
+    "ds4: deferred graph layer-state dump armed entries=172 bytes=5638160 layers=0:43"
+  ],
+  "control_lines": [
+    "ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=2 pos=0 gpus=1 layers=0:43/43)",
+    "ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=1 pos=1 gpus=1 layers=0:43/43)",
+    "ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=1 pos=0 gpus=2 layers=0:43/43)",
+    "ds4: deferred graph layer-state dump armed entries=8 bytes=262240 layers=10:12",
+    "ds4: deferred graph layer-state dump armed entries=172 bytes=5638160 layers=0:43"
+  ],
+  "deferred_dump_logs": 172,
+  "failures": [],
+  "full_line_count": 1,
+  "kind": "graph-log",
+  "log": "/home/jryates/stage3-93f75b9-compile-oracle-v10-results/graph.log",
+  "log_sha256": "32db19e525d3775a4593a72c37aff6c9211e4fdfae43bc67876d360e223f96a8",
+  "missing": [],
+  "ok": true,
+  "pass_line_count": 1,
+  "plan_lines": [],
+  "subset_line_count": 1,
+  "unexpected": [],
+  "unique_deferred_dump_logs": 172
+}

@@ -1,0 +1,396 @@
+HOST=max
+===UNIT:ds4-mxfp4-worker.service:SHOW===
+FragmentPath=/etc/systemd/system/ds4-mxfp4-worker.service
+DropInPaths=/usr/lib/systemd/system/service.d/10-timeout-abort.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/20-optimal-20260807.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/30-optimal-20260809.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/40-optimal-20260809-r2.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/50-optimal-20260811-r4.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/60-optimal-20260812-r5.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/65-mtp-spec-env.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/70-optimal-20260813-r6.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/80-optimal-20260815-r7.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/90-optimal-20260815-r8.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/91-optimal-20260815-r9.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/93-optimal-20260816-r11.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/94-optimal-20260816-r11-adopt.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/95-metrics-main-20260823.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/96-perf-20260823.conf /etc/systemd/system/ds4-mxfp4-worker.service.d/96-perf-nhi-20260824.conf
+UnitFileState=enabled
+Environment=LD_LIBRARY_PATH=/opt/rocm-therock/lib DS4_DIST_NHI_MAPPED=0 DS4_DIST_SPEC_KROW=1 DS4_ROCM_ENABLE_MXFP4_TILE4=1 DS4_ROCM_MXFP4_DOWN_RGROUP=4
+WorkingDirectory=/opt/ds4-perf-nhi-20260824
+User=jryates
+Group=jryates
+SupplementaryGroups=tbstream
+===UNIT:ds4-mxfp4-worker.service:EXECSTART===
+EXECSTART_RAW={ path=/opt/ds4-perf-nhi-20260824/ds4 ; argv[]=/opt/ds4-perf-nhi-20260824/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto ; ignore_errors=no ; start_time=[Tue 2026-08-25 01:10:03 PDT] ; stop_time=[n/a] ; pid=167422 ; code=(null) ; status=0/0 }
+EXECSTART_CONFIG_JSON=[{"argv[]":"/opt/ds4-perf-nhi-20260824/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto","flags":"ABSENT","ignore_errors":"no","path":"/opt/ds4-perf-nhi-20260824/ds4"}]
+===UNIT:ds4-mxfp4-worker.service:ENVIRONMENT-FILES===
+===UNIT:ds4-mxfp4-worker.service:CAT===
+# /etc/systemd/system/ds4-mxfp4-worker.service
+[Unit]
+Description=DS4 DeepSeek V4 Flash MXFP4 distributed worker
+Wants=network-online.target
+After=network-online.target
+Conflicts=ggml-rpc.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=jryates
+Group=jryates
+SupplementaryGroups=tbstream
+WorkingDirectory=/opt/ds4-mainstack-20260823
+Environment=LD_LIBRARY_PATH=/opt/rocm-therock/lib
+Environment=DS4_DIST_NHI_MAPPED=0
+ExecStartPre=/usr/bin/test -x /opt/ds4-mainstack-20260823/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=/opt/ds4-mainstack-20260823/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000
+Restart=always
+RestartSec=10
+TimeoutStopSec=120
+LimitNOFILE=65536
+MemoryMax=118G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
+
+# /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+# This file is part of the systemd package.
+# See https://fedoraproject.org/wiki/Changes/Shorter_Shutdown_Timer.
+#
+# To facilitate debugging when a service fails to stop cleanly,
+# TimeoutStopFailureMode=abort is set to "crash" services that fail to stop in
+# the time allotted. This will cause the service to be terminated with SIGABRT
+# and a coredump to be generated.
+#
+# To undo this configuration change, create a mask file:
+#   sudo mkdir -p /etc/systemd/system/service.d
+#   sudo ln -sv /dev/null /etc/systemd/system/service.d/10-timeout-abort.conf
+
+[Service]
+TimeoutStopFailureMode=abort
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/20-optimal-20260807.conf
+[Service]
+WorkingDirectory=/opt/ds4-optimal-20260807-r1
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260807-r1/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260807-r1/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/30-optimal-20260809.conf
+[Service]
+WorkingDirectory=/opt/ds4-optimal-20260809-r1
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260809-r1/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260809-r1/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/40-optimal-20260809-r2.conf
+[Service]
+WorkingDirectory=/opt/ds4-optimal-20260809-r2
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260809-r2/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260809-r2/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/50-optimal-20260811-r4.conf
+[Service]
+WorkingDirectory=/opt/ds4-optimal-20260811-r4
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260811-r4/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260811-r4/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/60-optimal-20260812-r5.conf
+[Service]
+WorkingDirectory=/opt/ds4-optimal-20260812-r5
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260812-r5/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260812-r5/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/65-mtp-spec-env.conf
+# Worker side of MTP speculative mode: enable the k-row span driver for
+# the workers layer slice (the coordinator drop-in 65-mtp-spec-20260812.conf
+# carries the coordinator envs).  Harmless in aggregate mode: the driver only
+# engages on MTP verify spans.
+[Service]
+Environment=DS4_DIST_SPEC_KROW=1
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/70-optimal-20260813-r6.conf
+[Service]
+WorkingDirectory=/opt/ds4-optimal-20260813-r6
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260813-r6/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260813-r6/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/80-optimal-20260815-r7.conf
+# r7: KV rewind-reuse + worker rewind propagation + comp-split (branch d9976d5).
+[Service]
+WorkingDirectory=/opt/ds4-optimal-20260815-r7
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260815-r7/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260815-r7/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/90-optimal-20260815-r8.conf
+# r8: same binaries as coordinator r8 (branch 292fa0e). Worker loads a single
+# model so the Q8->F16 cache was never disabled there; no env change needed.
+[Service]
+WorkingDirectory=/opt/ds4-optimal-20260815-r8
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260815-r8/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260815-r8/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/91-optimal-20260815-r9.conf
+# r8: same binaries as coordinator r8 (branch 292fa0e). Worker loads a single
+# model so the Q8->F16 cache was never disabled there; no env change needed.
+[Service]
+WorkingDirectory=/opt/ds4-optimal-20260815-r9
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260815-r9/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260815-r9/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/93-optimal-20260816-r11.conf
+# r8: same binaries as coordinator r8 (branch 292fa0e). Worker loads a single
+# model so the Q8->F16 cache was never disabled there; no env change needed.
+[Service]
+Environment=DS4_ROCM_ENABLE_MXFP4_TILE4=1
+Environment=DS4_ROCM_MXFP4_DOWN_RGROUP=4
+WorkingDirectory=/opt/ds4-optimal-20260816-r11
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260816-r11/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260816-r11/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/94-optimal-20260816-r11-adopt.conf
+# r8: same binaries as coordinator r8 (branch 292fa0e). Worker loads a single
+# model so the Q8->F16 cache was never disabled there; no env change needed.
+[Service]
+Environment=DS4_ROCM_ENABLE_MXFP4_TILE4=1
+Environment=DS4_ROCM_MXFP4_DOWN_RGROUP=4
+WorkingDirectory=/opt/ds4-optimal-20260816-r11
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-optimal-20260816-r11-adopt/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-optimal-20260816-r11-adopt/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/95-metrics-main-20260823.conf
+# Permanent baseline: upstream main c1d4597 + PR 857 commits, worker side.
+[Service]
+WorkingDirectory=/opt/ds4-metrics-main-20260823
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-metrics-main-20260823/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-metrics-main-20260823/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/96-perf-20260823.conf
+# Permanent baseline: upstream main c1d4597 + PR 857 commits, worker side.
+[Service]
+WorkingDirectory=/opt/ds4-perf-20260823
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-perf-20260823/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-perf-20260823/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000
+
+# /etc/systemd/system/ds4-mxfp4-worker.service.d/96-perf-nhi-20260824.conf
+# Standing prod: perf-prefill-decode + v3 transport (PR 861), --dist-transport auto.
+[Service]
+WorkingDirectory=/opt/ds4-perf-nhi-20260824
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4-perf-nhi-20260824/ds4
+ExecStartPre=/usr/bin/test -r /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+ExecStart=
+ExecStart=/opt/ds4-perf-nhi-20260824/ds4 --rocm -m /home/jryates/models/ds4-pr-20260801/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf -c 262144 --prefill-chunk 4096 --power 100 --role worker --layers 22:output --listen 10.99.0.1 9001 --coordinator 10.99.0.2 9000 --dist-transport auto
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service MODE=644 UID=0 GID=0
+16c301e815f77a7d903bda058ce8a36a15ef7ace0413a18a74350c37a7565bf3  /etc/systemd/system/ds4-mxfp4-worker.service
+FILE=/usr/lib/systemd/system/service.d/10-timeout-abort.conf MODE=644 UID=0 GID=0
+ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37  /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/20-optimal-20260807.conf MODE=644 UID=0 GID=0
+4d4ff6c5e77ca2bc19f7e0d36ab5567b8f4e3dc7518d414c1c9c49c73284c4eb  /etc/systemd/system/ds4-mxfp4-worker.service.d/20-optimal-20260807.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/30-optimal-20260809.conf MODE=644 UID=0 GID=0
+070f7ddf38b005dc4eb7ec21f44811a607d52f30916929ff66c2478508a4e951  /etc/systemd/system/ds4-mxfp4-worker.service.d/30-optimal-20260809.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/40-optimal-20260809-r2.conf MODE=644 UID=0 GID=0
+0f0a33dcc6ac33cbd24da6a00f83393bbe701f17f146d02e28dbaa6996758dbc  /etc/systemd/system/ds4-mxfp4-worker.service.d/40-optimal-20260809-r2.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/50-optimal-20260811-r4.conf MODE=644 UID=0 GID=0
+2bfc7285ffc703ca280ca024805cc42615888bf6675de098f588a790e7e0ef52  /etc/systemd/system/ds4-mxfp4-worker.service.d/50-optimal-20260811-r4.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/60-optimal-20260812-r5.conf MODE=644 UID=0 GID=0
+ea6db6f574700ba024d622a6afa2feba5e155d4f427d86dad097cd7b6aeeef85  /etc/systemd/system/ds4-mxfp4-worker.service.d/60-optimal-20260812-r5.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/65-mtp-spec-env.conf MODE=644 UID=0 GID=0
+232cb2486067ac1bb0d9e9776de8bbdf409b54f7aff05dafeca5caea53d42860  /etc/systemd/system/ds4-mxfp4-worker.service.d/65-mtp-spec-env.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/70-optimal-20260813-r6.conf MODE=644 UID=0 GID=0
+543861c07dcb40cbf2ab671fde9bea8f1b71ad53583613fd0b793f6e8275b1f0  /etc/systemd/system/ds4-mxfp4-worker.service.d/70-optimal-20260813-r6.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/80-optimal-20260815-r7.conf MODE=644 UID=0 GID=0
+310ee527c599d63ee5cd47623f301ad3a7fcea9fa2ff8cb462f9a743fb029d5f  /etc/systemd/system/ds4-mxfp4-worker.service.d/80-optimal-20260815-r7.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/90-optimal-20260815-r8.conf MODE=644 UID=0 GID=0
+ecd9f0b11b6d6b3de5cdd29a48ba14862a427160dbc8f0d41aa1afec1a302580  /etc/systemd/system/ds4-mxfp4-worker.service.d/90-optimal-20260815-r8.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/91-optimal-20260815-r9.conf MODE=644 UID=0 GID=0
+e1af118e440dc9dc22355eee908c89ec7bb4a4814fc13986fae2366df3e9640c  /etc/systemd/system/ds4-mxfp4-worker.service.d/91-optimal-20260815-r9.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/93-optimal-20260816-r11.conf MODE=644 UID=0 GID=0
+502ecf268b0fc0f04f628eb4d92ed2b8796a4e4077f43ed778aea5f48d194c55  /etc/systemd/system/ds4-mxfp4-worker.service.d/93-optimal-20260816-r11.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/94-optimal-20260816-r11-adopt.conf MODE=644 UID=0 GID=0
+b008d9514e24d8357dd9566d0357828e41a4f1eff724ec9776e384e58a0883f8  /etc/systemd/system/ds4-mxfp4-worker.service.d/94-optimal-20260816-r11-adopt.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/95-metrics-main-20260823.conf MODE=644 UID=0 GID=0
+9d653849ae0d1cec9b86fe7a137f4cb1d456e67008dba3ecc006765013296195  /etc/systemd/system/ds4-mxfp4-worker.service.d/95-metrics-main-20260823.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/96-perf-20260823.conf MODE=644 UID=0 GID=0
+13f313ef8633526484fc2c0c9d8956825f3cd65de9be8844346249a40b624ec1  /etc/systemd/system/ds4-mxfp4-worker.service.d/96-perf-20260823.conf
+FILE=/etc/systemd/system/ds4-mxfp4-worker.service.d/96-perf-nhi-20260824.conf MODE=644 UID=0 GID=0
+8b1f0a44edcd951504be71b778c9fe89b6957d09ca10149c87f6efa096739c57  /etc/systemd/system/ds4-mxfp4-worker.service.d/96-perf-nhi-20260824.conf
+===UNIT:ds4-tbstream-reconcile.service:SHOW===
+FragmentPath=/etc/systemd/system/ds4-tbstream-reconcile.service
+DropInPaths=/usr/lib/systemd/system/service.d/10-timeout-abort.conf
+UnitFileState=enabled
+Environment=
+EnvironmentFiles=/etc/sysconfig/ds4-tbstream (ignore_errors=no)
+WorkingDirectory=
+User=
+Group=
+SupplementaryGroups=
+===UNIT:ds4-tbstream-reconcile.service:EXECSTART===
+EXECSTART_RAW={ path=/usr/local/libexec/ds4-tbstream-reconcile.sh ; argv[]=/usr/local/libexec/ds4-tbstream-reconcile.sh ; ignore_errors=no ; start_time=[Mon 2026-08-24 17:12:54 PDT] ; stop_time=[Mon 2026-08-24 17:12:58 PDT] ; pid=1142 ; code=exited ; status=0 }
+EXECSTART_CONFIG_JSON=[{"argv[]":"/usr/local/libexec/ds4-tbstream-reconcile.sh","flags":"ABSENT","ignore_errors":"no","path":"/usr/local/libexec/ds4-tbstream-reconcile.sh"}]
+===UNIT:ds4-tbstream-reconcile.service:ENVIRONMENT-FILES===
+ENVFILE=/etc/sysconfig/ds4-tbstream MODE=644 UID=0 GID=0
+fba81f468e94f8b01cec4fd18b0de40794208e6f53fcd8a3745a39780783d398  /etc/sysconfig/ds4-tbstream
+===UNIT:ds4-tbstream-reconcile.service:CAT===
+# /etc/systemd/system/ds4-tbstream-reconcile.service
+[Unit]
+Description=Converge the DS4 USB4STREAM endpoint
+Documentation=file:/usr/local/share/doc/strix-rdma/tbstream-lifecycle.md
+After=systemd-modules-load.service sys-kernel-config.mount
+RequiresMountsFor=/sys/kernel/config
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sysconfig/ds4-tbstream
+RuntimeDirectory=ds4-tbstream
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/libexec/ds4-tbstream-reconcile.sh
+TimeoutStartSec=300
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target
+
+# /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+# This file is part of the systemd package.
+# See https://fedoraproject.org/wiki/Changes/Shorter_Shutdown_Timer.
+#
+# To facilitate debugging when a service fails to stop cleanly,
+# TimeoutStopFailureMode=abort is set to "crash" services that fail to stop in
+# the time allotted. This will cause the service to be terminated with SIGABRT
+# and a coredump to be generated.
+#
+# To undo this configuration change, create a mask file:
+#   sudo mkdir -p /etc/systemd/system/service.d
+#   sudo ln -sv /dev/null /etc/systemd/system/service.d/10-timeout-abort.conf
+
+[Service]
+TimeoutStopFailureMode=abort
+FILE=/etc/systemd/system/ds4-tbstream-reconcile.service MODE=644 UID=0 GID=0
+544a27df54eab54d1c64e2e78a1707bccae1567b404f69cbca70379f34af8ce4  /etc/systemd/system/ds4-tbstream-reconcile.service
+FILE=/usr/lib/systemd/system/service.d/10-timeout-abort.conf MODE=644 UID=0 GID=0
+ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37  /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+===UNIT:ds4-tbstream-reconcile-watchdog.service:SHOW===
+FragmentPath=/etc/systemd/system/ds4-tbstream-reconcile-watchdog.service
+DropInPaths=/usr/lib/systemd/system/service.d/10-timeout-abort.conf
+UnitFileState=static
+Environment=
+EnvironmentFiles=/etc/sysconfig/ds4-tbstream (ignore_errors=no)
+WorkingDirectory=
+User=
+Group=
+SupplementaryGroups=
+===UNIT:ds4-tbstream-reconcile-watchdog.service:EXECSTART===
+EXECSTART_RAW={ path=/usr/local/libexec/ds4-tbstream-reconcile.sh ; argv[]=/usr/local/libexec/ds4-tbstream-reconcile.sh --once ; ignore_errors=no ; start_time=[Tue 2026-08-25 13:50:59 PDT] ; stop_time=[Tue 2026-08-25 13:50:59 PDT] ; pid=383000 ; code=exited ; status=0 }
+EXECSTART_CONFIG_JSON=[{"argv[]":"/usr/local/libexec/ds4-tbstream-reconcile.sh --once","flags":"ABSENT","ignore_errors":"no","path":"/usr/local/libexec/ds4-tbstream-reconcile.sh"}]
+===UNIT:ds4-tbstream-reconcile-watchdog.service:ENVIRONMENT-FILES===
+ENVFILE=/etc/sysconfig/ds4-tbstream MODE=644 UID=0 GID=0
+fba81f468e94f8b01cec4fd18b0de40794208e6f53fcd8a3745a39780783d398  /etc/sysconfig/ds4-tbstream
+===UNIT:ds4-tbstream-reconcile-watchdog.service:CAT===
+# /etc/systemd/system/ds4-tbstream-reconcile-watchdog.service
+[Unit]
+Description=Check the DS4 USB4STREAM endpoint without bootstrap retries
+Documentation=file:/usr/local/share/doc/strix-rdma/tbstream-lifecycle.md
+After=systemd-modules-load.service sys-kernel-config.mount
+RequiresMountsFor=/sys/kernel/config
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sysconfig/ds4-tbstream
+RuntimeDirectory=ds4-tbstream
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/libexec/ds4-tbstream-reconcile.sh --once
+SuccessExitStatus=75
+TimeoutStartSec=60
+UMask=0022
+
+# /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+# This file is part of the systemd package.
+# See https://fedoraproject.org/wiki/Changes/Shorter_Shutdown_Timer.
+#
+# To facilitate debugging when a service fails to stop cleanly,
+# TimeoutStopFailureMode=abort is set to "crash" services that fail to stop in
+# the time allotted. This will cause the service to be terminated with SIGABRT
+# and a coredump to be generated.
+#
+# To undo this configuration change, create a mask file:
+#   sudo mkdir -p /etc/systemd/system/service.d
+#   sudo ln -sv /dev/null /etc/systemd/system/service.d/10-timeout-abort.conf
+
+[Service]
+TimeoutStopFailureMode=abort
+FILE=/etc/systemd/system/ds4-tbstream-reconcile-watchdog.service MODE=644 UID=0 GID=0
+10ad843cfbaebb421fe79d700b872d4996affd7142cc69d7bb0a2ad44daea26d  /etc/systemd/system/ds4-tbstream-reconcile-watchdog.service
+FILE=/usr/lib/systemd/system/service.d/10-timeout-abort.conf MODE=644 UID=0 GID=0
+ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37  /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+===UNIT:ds4-tbstream-reconcile.timer:SHOW===
+FragmentPath=/etc/systemd/system/ds4-tbstream-reconcile.timer
+DropInPaths=
+UnitFileState=enabled
+===UNIT:ds4-tbstream-reconcile.timer:EXECSTART===
+EXECSTART_RAW=
+EXECSTART_CONFIG_JSON=[]
+===UNIT:ds4-tbstream-reconcile.timer:ENVIRONMENT-FILES===
+===UNIT:ds4-tbstream-reconcile.timer:CAT===
+# /etc/systemd/system/ds4-tbstream-reconcile.timer
+[Unit]
+Description=Periodically reconcile the DS4 USB4STREAM endpoint
+
+[Timer]
+OnBootSec=1s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+RandomizedDelaySec=1s
+Unit=ds4-tbstream-reconcile-watchdog.service
+
+[Install]
+WantedBy=timers.target
+FILE=/etc/systemd/system/ds4-tbstream-reconcile.timer MODE=644 UID=0 GID=0
+c8be39843378d155106a5aa128e1b4cbc5adb99f0a876cb2ab49ef0bdd04268c  /etc/systemd/system/ds4-tbstream-reconcile.timer
+FILE=/etc/sysconfig/ds4-tbstream MODE=644 UID=0 GID=0
+fba81f468e94f8b01cec4fd18b0de40794208e6f53fcd8a3745a39780783d398  /etc/sysconfig/ds4-tbstream
+FILE=/usr/local/libexec/ds4-tbstream-reconcile.sh MODE=755 UID=0 GID=0
+8cef1cc2dd5d9e921255b148f0e573a3a0ae0d960340714644d0e14ccaa55f52  /usr/local/libexec/ds4-tbstream-reconcile.sh
+FILE=/usr/local/libexec/ds4-tbstream-cleanup.sh MODE=755 UID=0 GID=0
+0a2eb8f0ba5bdd7b43e4002ea2fb39feb8975d647521c76f05b8fd0a4da37677  /usr/local/libexec/ds4-tbstream-cleanup.sh
+FILE=/etc/modules-load.d/ds4-tbstream.conf MODE=644 UID=0 GID=0
+165dea52e41172512b13392943f00e649e8845608ea70c5f38524dd4e4212bfb  /etc/modules-load.d/ds4-tbstream.conf
+FILE=/etc/udev/rules.d/98-ds4-tbstream-reconcile.rules MODE=644 UID=0 GID=0
+b381310a35bd62d0376a865fe0c18c8a6ffb212593bf363af7585400d271a548  /etc/udev/rules.d/98-ds4-tbstream-reconcile.rules
+FILE=/etc/udev/rules.d/99-tbstream.rules MODE=644 UID=0 GID=0
+77ee2915dea6b74741d5f1781222435af72cd1a5396b285c891370dbb7d8d766  /etc/udev/rules.d/99-tbstream.rules

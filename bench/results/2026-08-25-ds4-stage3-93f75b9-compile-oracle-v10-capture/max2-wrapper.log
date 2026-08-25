@@ -1,0 +1,582 @@
+{
+  "actual_files": 1490,
+  "allow_extra": false,
+  "expected_files": 1490,
+  "extras": [],
+  "failures": [],
+  "kind": "extract",
+  "manifest": "/run/stage3-93f75b9-compile-oracle-v10-input/source-93f75b9.manifest",
+  "manifest_sha256": "5bdea6ff306961d198f341815082d72c9903f25349cd679fb9bb768fa8d83bf2",
+  "missing": [],
+  "ok": true,
+  "root": "/home/jryates/ds4-stage3-93f75b9-build-v10.partial"
+}
+{
+  "actual_files": 1490,
+  "allow_extra": false,
+  "expected_files": 1490,
+  "extras": [],
+  "failures": [],
+  "kind": "source",
+  "manifest": "/run/stage3-93f75b9-compile-oracle-v10-input/source-93f75b9.manifest",
+  "manifest_sha256": "5bdea6ff306961d198f341815082d72c9903f25349cd679fb9bb768fa8d83bf2",
+  "missing": [],
+  "ok": true,
+  "root": "/home/jryates/ds4-stage3-93f75b9-build-v10"
+}
+runner[max2]: starting clean
+rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_tp_combine_rocm tests/test_graph_deferred_dump_rocm tests/test_rocm_qkv_fusion tests/test_q8_krow_rocm tests/bench_q8_krow_rocm tests/bench_mxfp4_rocm tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+runner[max2]: starting build
+/usr/bin/make -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+	CORE_OBJS="ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
+	CFLAGS="-O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD" \
+	DS4_LINK="/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151" \
+	DS4_LINK_LIBS="-lm -pthread -lhipblas -lhipblaslt"
+make[1]: Entering directory '/home/jryates/ds4-stage3-93f75b9-build-v10'
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_cli.o ds4_cli.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_help.o ds4_help.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o linenoise.o linenoise.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_gpu_args.o ds4_gpu_args.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4.o ds4.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_distributed.o ds4_distributed.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_dist_v3.o ds4_dist_v3.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_transport.o ds4_transport.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_transport_nhi.o ds4_transport_nhi.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_tp.o ds4_tp.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_tp_nhi.o ds4_tp_nhi.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_ssd.o ds4_ssd.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -c -o ds4_rocm.o ds4_rocm.cu
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -c -o ds4_rocm_compat.o ds4_rocm_compat.cu
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -c -o ds4_rocm_unavailable.o ds4_rocm_unavailable.cu
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD   -c -o ds4_layer_pack.o ds4_layer_pack.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4 ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_server.o ds4_server.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_kvstore.o ds4_kvstore.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o rax.o rax.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4-server ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_bench.o ds4_bench.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4-bench ds4_bench.o ds4_help.o ds4_gpu_args.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_eval.o ds4_eval.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4-eval ds4_eval.o ds4_help.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_agent.o ds4_agent.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -c -o ds4_web.o ds4_web.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o ds4-agent ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+make[1]: Leaving directory '/home/jryates/ds4-stage3-93f75b9-build-v10'
+runner[max2]: starting tp
+cc -O3 -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -I. -c -o tests/test_tp_combine_rocm.o tests/test_tp_combine_rocm.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o tests/test_tp_combine_rocm tests/test_tp_combine_rocm.o ds4_rocm.o ds4_rocm_unavailable.o -lm -pthread -lhipblas -lhipblaslt
+./tests/test_tp_combine_rocm
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm chunk-copying 0.02 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.034s (0.02 GiB tensors)
+ROCm TP shared-half parity max_abs=2.23517e-08 rmse=2.23517e-08 finite=4096/4096 prequant=off
+ds4: ROCm chunk-copying 0.00 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.000s (0.00 GiB tensors)
+ROCm TP combine 7168 (hidden) bitexact               PASS
+ROCm TP combine 8191 (odd) bitexact                  PASS
+ROCm TP combine 256 bitexact                         PASS
+ROCm TP spin-combine kernel-writer plain pool        PASS
+ROCm TP spin-combine kernel-writer uncached pool     PASS
+ROCm TP spin-combine host-stamp uncached pool        PASS
+ROCm TP TP folded HC expand-add matches explicit combine PASS
+ROCm TP Flash shared-expert halves recombine         PASS
+ROCm TP rank1 compact-head Q8 attention/K-slice      PASS
+test_tp_combine_rocm: 9/9 checks passed (0 failed)
+DS4_TEST_TP_PREQUANT=1 ./tests/test_tp_combine_rocm
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm chunk-copying 0.02 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.041s (0.02 GiB tensors)
+ROCm TP shared-half parity max_abs=7.45058e-09 rmse=7.45058e-09 finite=4096/4096 prequant=on
+ROCm TP production-prequant shared halves recombine  PASS
+test_tp_combine_rocm: 1/1 checks passed (0 failed)
+runner[max2]: starting mxfp4
+cc -O3 -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -I. -c -o tests/test_mxfp4_rocm.o tests/test_mxfp4_rocm.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o tests/test_mxfp4_rocm tests/test_mxfp4_rocm.o ds4_rocm.o -lm -pthread -lhipblas -lhipblaslt
+./tests/test_mxfp4_rocm
+MXFP4 ROCm synthetic model: 3264.00 MiB, experts=256, model_dim=4096, ffn_dim=2048, selected=6
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm chunk-copying 3.19 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.397s (3.19 GiB tensors)
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=3643 max_tol_ratio=0.0253473 at=4561 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=8.01086e-05 at=1790 max_tol_ratio=0.205092 at=3703 failures=0/4096
+MXFP4 ROCm tokens=2   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0253473 at=4561 failures=0/24576
+MXFP4 ROCm tokens=2   out max_abs=0.000104904 at=5505 max_tol_ratio=0.205092 at=3703 failures=0/8192
+MXFP4 ROCm tokens=3   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/36864
+MXFP4 ROCm tokens=3   out max_abs=0.000108719 at=9542 max_tol_ratio=0.224456 at=8340 failures=0/12288
+MXFP4 ROCm tokens=4   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/49152
+MXFP4 ROCm tokens=4   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/16384
+MXFP4 ROCm tokens=5   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/61440
+MXFP4 ROCm tokens=5   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/20480
+MXFP4 ROCm tokens=8   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/98304
+MXFP4 ROCm tokens=8   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/32768
+MXFP4 ROCm tokens=32  mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/393216
+MXFP4 ROCm tokens=32  out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/131072
+MXFP4 ROCm tokens=128 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/1572864
+MXFP4 ROCm tokens=128 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/524288
+MXFP4 ROCm tokens=512 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/6291456
+MXFP4 ROCm tokens=512 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/2097152
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=3643 max_tol_ratio=0.0253473 at=4561 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=8.01086e-05 at=1790 max_tol_ratio=0.205092 at=3703 failures=0/4096
+MXFP4 ROCm tokens=1   mid max_abs=1.23978e-05 at=2584 max_tol_ratio=0.0234765 at=4404 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=0.000104904 at=1409 max_tol_ratio=0.186805 at=1825 failures=0/4096
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=9571 max_tol_ratio=0.0287725 at=9949 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=0.000108719 at=1350 max_tol_ratio=0.224456 at=148 failures=0/4096
+MXFP4 ROCm tokens=1   mid max_abs=2.86102e-06 at=8153 max_tol_ratio=0.00809894 at=10087 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=9.29832e-05 at=546 max_tol_ratio=0.283393 at=3430 failures=0/4096
+MXFP4 ROCm tokens=2   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0253473 at=4561 failures=0/24576
+MXFP4 ROCm tokens=2   out max_abs=0.000104904 at=5505 max_tol_ratio=0.205092 at=3703 failures=0/8192
+MXFP4 ROCm tokens=3   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/36864
+MXFP4 ROCm tokens=3   out max_abs=0.000108719 at=9542 max_tol_ratio=0.224456 at=8340 failures=0/12288
+MXFP4 ROCm tokens=4   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/49152
+MXFP4 ROCm tokens=4   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/16384
+MXFP4 ROCm tokens=5   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/61440
+MXFP4 ROCm tokens=5   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/20480
+MXFP4 ROCm tokens=6   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/73728
+MXFP4 ROCm tokens=6   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/24576
+MXFP4 ROCm tokens=7   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/86016
+MXFP4 ROCm tokens=7   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/28672
+MXFP4 ROCm tokens=8   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/98304
+MXFP4 ROCm tokens=8   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/32768
+MXFP4 ROCm span exactness (2..8 rows vs single-token): bitwise OK
+MXFP4 ROCm tokens=128 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/1572864
+MXFP4 ROCm tokens=128 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/524288
+MXFP4 ROCm tokens=512 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/6291456
+MXFP4 ROCm tokens=512 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/2097152
+MXFP4 ROCm variant DS4_ROCM_ENABLE_MXFP4_TILE4=1: bitwise OK
+MXFP4 ROCm tokens=128 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/1572864
+MXFP4 ROCm tokens=128 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/524288
+MXFP4 ROCm tokens=512 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/6291456
+MXFP4 ROCm tokens=512 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/2097152
+MXFP4 ROCm variant DS4_ROCM_ENABLE_MXFP4_ROW64=1: bitwise OK
+MXFP4 ROCm tokens=128 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/1572864
+MXFP4 ROCm tokens=128 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/524288
+MXFP4 ROCm tokens=512 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/6291456
+MXFP4 ROCm tokens=512 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/2097152
+MXFP4 ROCm variant DS4_ROCM_MXFP4_DOWN_RGROUP=4: bitwise OK
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=3643 max_tol_ratio=0.0253473 at=4561 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=8.01086e-05 at=1790 max_tol_ratio=0.205092 at=3703 failures=0/4096
+MXFP4 ROCm contiguous-half TP ownership combine: OK
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=3643 max_tol_ratio=0.0253473 at=4561 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=8.01086e-05 at=1790 max_tol_ratio=0.205092 at=3703 failures=0/4096
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm loading model tensors into device cache
+MXFP4 ROCm rank-local cached expert halves: OK
+MXFP4 ROCm routed MoE: PASS
+runner[max2]: starting graph
+cc -O3 -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC \
+	-DDS4_ROCM_BUILD -DDS4_TEST_HOOKS -I. -c -o tests/test_graph_deferred_dump_rocm.o tests/test_graph_deferred_dump_rocm.c
+cc -O3 -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC \
+	-DDS4_ROCM_BUILD -DDS4_TEST_HOOKS -Wno-unused-function -I. -c -o ds4_rocm_test_hooks.o ds4.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o tests/test_graph_deferred_dump_rocm tests/test_graph_deferred_dump_rocm.o ds4_rocm_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o -lm -pthread -lhipblas -lhipblaslt
+./tests/test_graph_deferred_dump_rocm
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=2 pos=0 gpus=1 layers=0:43/43)
+ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=1 pos=1 gpus=1 layers=0:43/43)
+ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=1 pos=0 gpus=2 layers=0:43/43)
+ds4: deferred graph layer-state dump armed entries=8 bytes=262240 layers=10:12
+ds4: deferred graph layer-state dump armed entries=172 bytes=5638160 layers=0:43
+ds4: dumped hc_attn_post layer 0 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-0_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 0 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-0_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 0 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-0_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 0 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-0_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 1 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-1_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 1 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-1_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 1 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-1_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 1 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-1_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 2 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-2_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 2 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-2_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 2 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-2_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 2 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-2_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 3 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-3_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 3 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-3_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 3 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-3_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 3 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-3_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 4 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-4_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 4 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-4_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 4 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-4_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 4 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-4_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 5 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-5_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 5 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-5_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 5 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-5_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 5 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-5_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 6 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-6_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 6 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-6_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 6 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-6_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 6 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-6_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 7 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-7_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 7 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-7_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 7 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-7_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 7 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-7_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 8 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-8_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 8 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-8_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 8 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-8_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 8 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-8_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 9 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-9_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 9 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-9_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 9 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-9_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 9 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-9_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 10 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-10_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 10 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-10_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 10 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-10_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 10 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-10_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 11 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-11_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 11 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-11_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 11 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-11_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 11 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-11_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 12 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-12_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 12 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-12_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 12 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-12_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 12 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-12_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 13 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-13_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 13 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-13_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 13 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-13_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 13 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-13_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 14 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-14_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 14 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-14_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 14 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-14_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 14 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-14_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 15 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-15_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 15 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-15_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 15 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-15_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 15 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-15_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 16 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-16_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 16 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-16_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 16 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-16_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 16 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-16_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 17 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-17_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 17 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-17_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 17 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-17_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 17 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-17_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 18 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-18_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 18 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-18_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 18 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-18_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 18 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-18_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 19 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-19_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 19 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-19_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 19 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-19_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 19 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-19_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 20 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-20_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 20 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-20_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 20 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-20_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 20 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-20_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 21 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-21_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 21 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-21_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 21 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-21_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 21 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-21_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 22 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-22_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 22 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-22_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 22 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-22_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 22 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-22_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 23 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-23_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 23 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-23_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 23 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-23_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 23 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-23_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 24 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-24_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 24 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-24_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 24 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-24_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 24 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-24_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 25 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-25_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 25 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-25_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 25 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-25_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 25 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-25_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 26 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-26_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 26 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-26_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 26 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-26_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 26 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-26_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 27 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-27_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 27 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-27_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 27 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-27_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 27 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-27_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 28 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-28_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 28 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-28_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 28 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-28_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 28 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-28_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 29 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-29_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 29 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-29_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 29 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-29_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 29 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-29_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 30 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-30_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 30 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-30_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 30 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-30_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 30 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-30_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 31 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-31_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 31 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-31_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 31 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-31_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 31 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-31_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 32 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-32_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 32 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-32_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 32 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-32_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 32 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-32_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 33 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-33_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 33 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-33_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 33 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-33_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 33 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-33_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 34 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-34_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 34 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-34_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 34 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-34_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 34 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-34_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 35 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-35_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 35 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-35_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 35 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-35_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 35 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-35_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 36 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-36_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 36 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-36_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 36 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-36_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 36 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-36_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 37 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-37_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 37 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-37_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 37 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-37_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 37 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-37_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 38 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-38_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 38 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-38_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 38 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-38_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 38 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-38_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 39 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-39_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 39 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-39_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 39 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-39_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 39 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-39_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 40 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-40_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 40 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-40_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 40 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-40_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 40 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-40_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 41 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-41_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 41 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-41_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 41 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-41_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 41 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-41_pos0.bin (deferred)
+ds4: dumped hc_attn_post layer 42 pos 0 to /tmp/ds4-deferred-dump-402760_hc_attn_post-42_pos0.bin (deferred)
+ds4: dumped ffn_moe_topk layer 42 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_topk-42_pos0.i32 (deferred)
+ds4: dumped ffn_moe_weights_scaled layer 42 pos 0 to /tmp/ds4-deferred-dump-402760_ffn_moe_weights_scaled-42_pos0.bin (deferred)
+ds4: dumped hc_ffn_post layer 42 pos 0 to /tmp/ds4-deferred-dump-402760_hc_ffn_post-42_pos0.bin (deferred)
+test_graph_deferred_dump_rocm: PASS (172 deferred captures)
+{
+  "armed_lines": [
+    "ds4: deferred graph layer-state dump armed entries=8 bytes=262240 layers=10:12",
+    "ds4: deferred graph layer-state dump armed entries=172 bytes=5638160 layers=0:43"
+  ],
+  "control_lines": [
+    "ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=2 pos=0 gpus=1 layers=0:43/43)",
+    "ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=1 pos=1 gpus=1 layers=0:43/43)",
+    "ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=1 pos=0 gpus=2 layers=0:43/43)",
+    "ds4: deferred graph layer-state dump armed entries=8 bytes=262240 layers=10:12",
+    "ds4: deferred graph layer-state dump armed entries=172 bytes=5638160 layers=0:43"
+  ],
+  "deferred_dump_logs": 172,
+  "failures": [],
+  "full_line_count": 1,
+  "kind": "graph-log",
+  "log": "/home/jryates/stage3-93f75b9-compile-oracle-v10-results/graph.log",
+  "log_sha256": "d98b01c8cee489c2680a6b04462a2a39589a2ec2ddbc05abcbec9de3c9f845d5",
+  "missing": [],
+  "ok": true,
+  "pass_line_count": 1,
+  "plan_lines": [],
+  "subset_line_count": 1,
+  "unexpected": [],
+  "unique_deferred_dump_logs": 172
+}
+{
+  "actual_files": 1525,
+  "allow_extra": true,
+  "expected_files": 1490,
+  "extras": [
+    "ds4",
+    "ds4-agent",
+    "ds4-bench",
+    "ds4-eval",
+    "ds4-server",
+    "ds4.o",
+    "ds4_agent.o",
+    "ds4_bench.o",
+    "ds4_cli.o",
+    "ds4_dist_v3.o",
+    "ds4_distributed.o",
+    "ds4_eval.o",
+    "ds4_gpu_args.o",
+    "ds4_help.o",
+    "ds4_kvstore.o",
+    "ds4_layer_pack.o",
+    "ds4_rocm.o",
+    "ds4_rocm_compat.o",
+    "ds4_rocm_test_hooks.o",
+    "ds4_rocm_unavailable.o",
+    "ds4_server.o",
+    "ds4_ssd.o",
+    "ds4_tp.o",
+    "ds4_tp_nhi.o",
+    "ds4_transport.o",
+    "ds4_transport_nhi.o",
+    "ds4_web.o",
+    "linenoise.o",
+    "rax.o",
+    "tests/test_graph_deferred_dump_rocm",
+    "tests/test_graph_deferred_dump_rocm.o",
+    "tests/test_mxfp4_rocm",
+    "tests/test_mxfp4_rocm.o",
+    "tests/test_tp_combine_rocm",
+    "tests/test_tp_combine_rocm.o"
+  ],
+  "failures": [],
+  "kind": "source",
+  "manifest": "/run/stage3-93f75b9-compile-oracle-v10-input/source-93f75b9.manifest",
+  "manifest_sha256": "5bdea6ff306961d198f341815082d72c9903f25349cd679fb9bb768fa8d83bf2",
+  "missing": [],
+  "ok": true,
+  "root": "/home/jryates/ds4-stage3-93f75b9-build-v10"
+}
+{
+  "build_dir": "/home/jryates/ds4-stage3-93f75b9-build-v10",
+  "commit": "93f75b98bcfcb6a44ca739754472bf767f5433dc",
+  "failures": [],
+  "graph": {
+    "armed_lines": [
+      "ds4: deferred graph layer-state dump armed entries=8 bytes=262240 layers=10:12",
+      "ds4: deferred graph layer-state dump armed entries=172 bytes=5638160 layers=0:43"
+    ],
+    "control_lines": [
+      "ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=2 pos=0 gpus=1 layers=0:43/43)",
+      "ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=1 pos=1 gpus=1 layers=0:43/43)",
+      "ds4: deferred graph layer-state dump requires one token at position zero, one local GPU, and a valid layer range (tokens=1 pos=0 gpus=2 layers=0:43/43)",
+      "ds4: deferred graph layer-state dump armed entries=8 bytes=262240 layers=10:12",
+      "ds4: deferred graph layer-state dump armed entries=172 bytes=5638160 layers=0:43"
+    ],
+    "deferred_dump_logs": 172,
+    "failures": [],
+    "full_line_count": 1,
+    "log": "/home/jryates/stage3-93f75b9-compile-oracle-v10-results/graph.log",
+    "log_sha256": "d98b01c8cee489c2680a6b04462a2a39589a2ec2ddbc05abcbec9de3c9f845d5",
+    "missing": [],
+    "ok": true,
+    "pass_line_count": 1,
+    "plan_lines": [],
+    "subset_line_count": 1,
+    "unexpected": [],
+    "unique_deferred_dump_logs": 172
+  },
+  "kind": "host",
+  "live_source": {
+    "actual_files": 1525,
+    "allow_extra": true,
+    "expected_files": 1490,
+    "extras": [
+      "ds4",
+      "ds4-agent",
+      "ds4-bench",
+      "ds4-eval",
+      "ds4-server",
+      "ds4.o",
+      "ds4_agent.o",
+      "ds4_bench.o",
+      "ds4_cli.o",
+      "ds4_dist_v3.o",
+      "ds4_distributed.o",
+      "ds4_eval.o",
+      "ds4_gpu_args.o",
+      "ds4_help.o",
+      "ds4_kvstore.o",
+      "ds4_layer_pack.o",
+      "ds4_rocm.o",
+      "ds4_rocm_compat.o",
+      "ds4_rocm_test_hooks.o",
+      "ds4_rocm_unavailable.o",
+      "ds4_server.o",
+      "ds4_ssd.o",
+      "ds4_tp.o",
+      "ds4_tp_nhi.o",
+      "ds4_transport.o",
+      "ds4_transport_nhi.o",
+      "ds4_web.o",
+      "linenoise.o",
+      "rax.o",
+      "tests/test_graph_deferred_dump_rocm",
+      "tests/test_graph_deferred_dump_rocm.o",
+      "tests/test_mxfp4_rocm",
+      "tests/test_mxfp4_rocm.o",
+      "tests/test_tp_combine_rocm",
+      "tests/test_tp_combine_rocm.o"
+    ],
+    "failures": [],
+    "kind": "source",
+    "manifest": "/run/stage3-93f75b9-compile-oracle-v10-input/source-93f75b9.manifest",
+    "manifest_sha256": "5bdea6ff306961d198f341815082d72c9903f25349cd679fb9bb768fa8d83bf2",
+    "missing": [],
+    "ok": true,
+    "root": "/home/jryates/ds4-stage3-93f75b9-build-v10"
+  },
+  "mxfp4": {
+    "failures": [],
+    "log": "/home/jryates/stage3-93f75b9-compile-oracle-v10-results/mxfp4.log",
+    "log_sha256": "5a9d491208e89860b2f86f8111e60ce921bc9e8172b9ebff96d6e085622aebd3",
+    "ok": true
+  },
+  "nonce": "34cc83dd6e4c3896d83ca13ad0fff39a",
+  "ok": true,
+  "production_binaries": {
+    "ds4": "68977aac268acc2790f120639754e08e40a416f736a519f1d7c4d77cbee92716",
+    "ds4-agent": "72e5d3b9192da5d867e7474787de22771c9dc1e2c3234293057c265ac563925f",
+    "ds4-bench": "ea43f94097990e7fb1e90071cdb08947f1def1571dca8425097e712ff4ec1bdd",
+    "ds4-eval": "2abdfe9d7759c8f51494c441d1fe6e06b9d0c3ec6dbb2ab42faa5c4ba3bbb241",
+    "ds4-server": "31c3a45e0f1b17ad8a7b94f2205cf51e55d7befb7dfb28f3fb1e7587737d4dbf"
+  },
+  "result_dir": "/home/jryates/stage3-93f75b9-compile-oracle-v10-results",
+  "runtime_library_identities": {
+    "/opt/rocm-therock/lib/libamd_comgr.so.3.0.0": "26dbf766208aafa47c729480856c62af3ebad00d552bb2e00af844098dc58d40",
+    "/opt/rocm-therock/lib/libamdhip64.so.7.13.99004-3309c6114a": "f13cb11b5287a4fb6889764f41516a33287bd987828242dbeab0de6a84e73ef6",
+    "/opt/rocm-therock/lib/libhipblas.so.3.4": "33e6518839567b2c6959600e87325f8a79fd9d2a9b92b2bd9aa6ed250bb45662",
+    "/opt/rocm-therock/lib/libhipblaslt.so.1.3": "6570c09e3f31228fdf42b93b7cfc8a6b89cd3b6728ecf3bf60ba1280b05f5bf2",
+    "/opt/rocm-therock/lib/libhsa-runtime64.so.1.21.0": "50df2ddfdc17894d9b6e93bcb182625ee2290a65d20ba8c9dbcb134003dc650e",
+    "/opt/rocm-therock/lib/librocblas.so.5.4": "6195d18f344f42b8af5696a6156e1a625a58ce9aa41f26d48de2e3bd005f281b",
+    "/opt/rocm-therock/lib/librocm_kpack.so.0.1.0": "c4b4de3c6714e8d5524a26626e54e3f3311b137d902f86b49c048de32b4f9907",
+    "/opt/rocm-therock/lib/librocprofiler-register.so.0.6.0": "7647ed03b1e6790f6043756f178f79c08b33d63058c9b83fa726cdad78093e0c",
+    "/opt/rocm-therock/lib/librocroller.so.1.0.0": "3d986711dc640dbc71d6483c579d53432fa6730c8acc1d09134260f97c7d123e",
+    "/opt/rocm-therock/lib/librocsolver.so.0.9": "bd4119b922f49bdd12d7b058ca90c9d929e529c980c1d540c5b73bb6bf4a5a8c",
+    "/opt/rocm-therock/lib/libroctx64.so.4.1.0": "ad2b79c48c48b1ed923f1120186e478c5c4939f668764d7ce688915bfed38c8f",
+    "/opt/rocm-therock/lib/llvm/lib/libLLVM.so.23.0git": "5a9496b58aa297cfeaad748b2a8611e306633ee6bd152db2dc65aed1b77d0a52",
+    "/opt/rocm-therock/lib/llvm/lib/libclang-cpp.so.23.0git": "1c9c699a9329f7db352aa9ce74a4b9fbec1f3bfa56d054b88f052167e18f2e08",
+    "/opt/rocm-therock/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so": "fe4102b002321cea17405cf9c6aa04cf46e726bea5666c40ac8639684314de02",
+    "/opt/rocm-therock/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2": "63d74ce82c72f84c71b7ff37d4b068d3b7bdad79d3bc540475507fb08de6efd6",
+    "/opt/rocm-therock/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1": "89617540fcf3478e1d193b78b112c406cb3a40547521611e07aa687b0e6cbb42",
+    "/opt/rocm-therock/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so.1": "8a04645ae7d6710cceeaa9264dab87aaae0f984b9d31bd17ef0ab343e052f553",
+    "/opt/rocm-therock/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5.8.1": "15402b36e2fdb0762e0b6590c3470fccec5e80cc8010c84ac4835573d592c02d",
+    "/opt/rocm-therock/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so.1": "f13402b67ffdfc11bb7fd23150d745ca3513411d2f99ade4b7e306ba06d256ca",
+    "/opt/rocm-therock/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1.3.2": "27361c0c552d2afd5ecf9079f356309ed827e9a27d35f2fc68c7b5e6b5c83199",
+    "/opt/rocm-therock/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1.5.7": "5fc4ab0e6899318ece9bea43d3d397d20053418a5e40cb6bc86efe19a801c75e",
+    "/usr/lib64/ld-linux-x86-64.so.2": "722298d5abe2e8ba5ea9cb998f45612e272a11e3543ff8963ecaf14fa5775414",
+    "/usr/lib64/libatomic.so.1.2.0": "93d5fbfaffc5d8bf6dca1bbf58ad102f2f657dfb74276e129c9aa7a35384a181",
+    "/usr/lib64/libc.so.6": "72e64de106dd417510a2e23a9168edd46868f7cf80abdd6913378ab6c2b2845b",
+    "/usr/lib64/libdl.so.2": "6923c42f024527f0ff56997ae7971b05e89f5d0c7c3356c01b9db1624ec9c46c",
+    "/usr/lib64/libgcc_s-15-20260123.so.1": "7529c13eb0152c70eeca9b58b0b0a34a784ba60fecb08b1cd4f91c57f449bd62",
+    "/usr/lib64/libm.so.6": "3606f83c1488dc9c5ce0ae3e7ba2184f9d3c1a60cd5435c68b2898fd556920b4",
+    "/usr/lib64/libpthread.so.0": "ac0695f4341ea6bd78be5e780427d1376ed4b9ca8286621dfa40265e247626e2",
+    "/usr/lib64/librt.so.1": "c25ffff1ddcf75c9b1a8465be3119b49c08afafd808923090c3a51b3ac879547",
+    "/usr/lib64/libstdc++.so.6.0.34": "d978bc4c857da2ffd937b03560fad0332052a4fd5f3f51ea10f3274cb599e0d2"
+  },
+  "source_manifest_sha256": "5bdea6ff306961d198f341815082d72c9903f25349cd679fb9bb768fa8d83bf2",
+  "tag": "max2",
+  "test_binaries": {
+    "tests/test_graph_deferred_dump_rocm": "8b8a5b01765f27395c38e760cb32242f4ff039880d2a0b124c73ce581e778562",
+    "tests/test_mxfp4_rocm": "402a02d2d8eb2160d05730532ae6e8cc5a42c467954aac2925a794ba157ac5af",
+    "tests/test_tp_combine_rocm": "d90dc0c8da448d498bcb80277e45c8eb5358db7bd6d5cc7b63994198a795995e"
+  },
+  "toolchain_identities": {
+    "/opt/rocm-therock/bin/hipcc": "d92839ed940e685fd15b8c60744d9f30efa65102e49e0babd655045219be371d",
+    "/opt/rocm-therock/lib/libamdhip64.so.7.13.99004-3309c6114a": "f13cb11b5287a4fb6889764f41516a33287bd987828242dbeab0de6a84e73ef6",
+    "/opt/rocm-therock/lib/libhiprtc.so.7.13.99004-3309c6114a": "2463a5f871b86632e7262a9b85ad11c42ff4607dc19a382a31500498ad6e7de5",
+    "/usr/bin/gcc": "64a60ad7f587547a92fbe63723b7b6381e37c902d98605f69219de9b34b5fafe",
+    "/usr/bin/ld.bfd": "0692eabb426c724563336cb4d7bde15bd85dc723376336cb014b28dee73ac42d",
+    "/usr/bin/make": "2dadfb9212573afcddc183353794f2fb22ef3df0afffd700ca93a905ad79f2f5"
+  },
+  "tp": {
+    "failures": [],
+    "log": "/home/jryates/stage3-93f75b9-compile-oracle-v10-results/tp.log",
+    "log_sha256": "a28a37a90ade77f2a9bf39600483a39b2b60a36216a48a5436697c03c96258a4",
+    "ok": true
+  },
+  "tree": "1da8f8f1d776b455d46a679a3a6a6e06e06acc70"
+}
+runner[max2]: HOST ORACLES PASS exact commit 93f75b98bcfcb6a44ca739754472bf767f5433dc nonce 34cc83dd6e4c3896d83ca13ad0fff39a

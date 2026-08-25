@@ -1,0 +1,4 @@
+ATTEMPT=1 REMAINING_BEFORE=210
+SYSTEMD_FENCE_RAW_JSON={"mode":"started","monotonic_ns":74566543423480,"units":{"ds4-mxfp4-worker.service":{"ActiveState":"active","Id":"ds4-mxfp4-worker.service","Job":"","LoadState":"loaded","SubState":"running"},"ds4-tbstream-reconcile.timer":{"ActiveState":"active","Id":"ds4-tbstream-reconcile.timer","Job":"","LoadState":"loaded","SubState":"waiting"}}}
+SYSTEMD_FENCE=PASS
+ATTEMPT_RC=0

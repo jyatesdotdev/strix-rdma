@@ -1,0 +1,6 @@
+/opt/rocm-therock/bin/hipcc
+/opt/rocm-therock/lib/libamdhip64.so.7.13.99004-3309c6114a
+/opt/rocm-therock/lib/libhiprtc.so.7.13.99004-3309c6114a
+/usr/bin/gcc
+/usr/bin/ld.bfd
+/usr/bin/make

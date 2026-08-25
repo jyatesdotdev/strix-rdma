@@ -1,0 +1,75 @@
+cc -O3 -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -I. -c -o tests/test_mxfp4_rocm.o tests/test_mxfp4_rocm.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o tests/test_mxfp4_rocm tests/test_mxfp4_rocm.o ds4_rocm.o -lm -pthread -lhipblas -lhipblaslt
+./tests/test_mxfp4_rocm
+MXFP4 ROCm synthetic model: 3264.00 MiB, experts=256, model_dim=4096, ffn_dim=2048, selected=6
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm chunk-copying 3.19 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.397s (3.19 GiB tensors)
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=3643 max_tol_ratio=0.0253473 at=4561 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=8.01086e-05 at=1790 max_tol_ratio=0.205092 at=3703 failures=0/4096
+MXFP4 ROCm tokens=2   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0253473 at=4561 failures=0/24576
+MXFP4 ROCm tokens=2   out max_abs=0.000104904 at=5505 max_tol_ratio=0.205092 at=3703 failures=0/8192
+MXFP4 ROCm tokens=3   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/36864
+MXFP4 ROCm tokens=3   out max_abs=0.000108719 at=9542 max_tol_ratio=0.224456 at=8340 failures=0/12288
+MXFP4 ROCm tokens=4   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/49152
+MXFP4 ROCm tokens=4   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/16384
+MXFP4 ROCm tokens=5   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/61440
+MXFP4 ROCm tokens=5   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/20480
+MXFP4 ROCm tokens=8   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/98304
+MXFP4 ROCm tokens=8   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/32768
+MXFP4 ROCm tokens=32  mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/393216
+MXFP4 ROCm tokens=32  out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/131072
+MXFP4 ROCm tokens=128 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/1572864
+MXFP4 ROCm tokens=128 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/524288
+MXFP4 ROCm tokens=512 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/6291456
+MXFP4 ROCm tokens=512 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/2097152
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=3643 max_tol_ratio=0.0253473 at=4561 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=8.01086e-05 at=1790 max_tol_ratio=0.205092 at=3703 failures=0/4096
+MXFP4 ROCm tokens=1   mid max_abs=1.23978e-05 at=2584 max_tol_ratio=0.0234765 at=4404 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=0.000104904 at=1409 max_tol_ratio=0.186805 at=1825 failures=0/4096
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=9571 max_tol_ratio=0.0287725 at=9949 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=0.000108719 at=1350 max_tol_ratio=0.224456 at=148 failures=0/4096
+MXFP4 ROCm tokens=1   mid max_abs=2.86102e-06 at=8153 max_tol_ratio=0.00809894 at=10087 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=9.29832e-05 at=546 max_tol_ratio=0.283393 at=3430 failures=0/4096
+MXFP4 ROCm tokens=2   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0253473 at=4561 failures=0/24576
+MXFP4 ROCm tokens=2   out max_abs=0.000104904 at=5505 max_tol_ratio=0.205092 at=3703 failures=0/8192
+MXFP4 ROCm tokens=3   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/36864
+MXFP4 ROCm tokens=3   out max_abs=0.000108719 at=9542 max_tol_ratio=0.224456 at=8340 failures=0/12288
+MXFP4 ROCm tokens=4   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/49152
+MXFP4 ROCm tokens=4   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/16384
+MXFP4 ROCm tokens=5   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/61440
+MXFP4 ROCm tokens=5   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/20480
+MXFP4 ROCm tokens=6   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/73728
+MXFP4 ROCm tokens=6   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/24576
+MXFP4 ROCm tokens=7   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/86016
+MXFP4 ROCm tokens=7   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/28672
+MXFP4 ROCm tokens=8   mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/98304
+MXFP4 ROCm tokens=8   out max_abs=0.000108719 at=9542 max_tol_ratio=0.283393 at=15718 failures=0/32768
+MXFP4 ROCm span exactness (2..8 rows vs single-token): bitwise OK
+MXFP4 ROCm tokens=128 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/1572864
+MXFP4 ROCm tokens=128 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/524288
+MXFP4 ROCm tokens=512 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/6291456
+MXFP4 ROCm tokens=512 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/2097152
+MXFP4 ROCm variant DS4_ROCM_ENABLE_MXFP4_TILE4=1: bitwise OK
+MXFP4 ROCm tokens=128 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/1572864
+MXFP4 ROCm tokens=128 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/524288
+MXFP4 ROCm tokens=512 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/6291456
+MXFP4 ROCm tokens=512 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/2097152
+MXFP4 ROCm variant DS4_ROCM_ENABLE_MXFP4_ROW64=1: bitwise OK
+MXFP4 ROCm tokens=128 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/1572864
+MXFP4 ROCm tokens=128 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/524288
+MXFP4 ROCm tokens=512 mid max_abs=1.23978e-05 at=14872 max_tol_ratio=0.0287725 at=34525 failures=0/6291456
+MXFP4 ROCm tokens=512 out max_abs=0.000112534 at=9542 max_tol_ratio=0.301675 at=15718 failures=0/2097152
+MXFP4 ROCm variant DS4_ROCM_MXFP4_DOWN_RGROUP=4: bitwise OK
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=3643 max_tol_ratio=0.0253473 at=4561 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=8.01086e-05 at=1790 max_tol_ratio=0.205092 at=3703 failures=0/4096
+MXFP4 ROCm contiguous-half TP ownership combine: OK
+MXFP4 ROCm tokens=1   mid max_abs=8.58307e-06 at=3643 max_tol_ratio=0.0253473 at=4561 failures=0/12288
+MXFP4 ROCm tokens=1   out max_abs=8.01086e-05 at=1790 max_tol_ratio=0.205092 at=3703 failures=0/4096
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm loading model tensors into device cache
+MXFP4 ROCm rank-local cached expert halves: OK
+MXFP4 ROCm routed MoE: PASS

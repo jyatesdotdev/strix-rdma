@@ -1,0 +1,1 @@
+host=max2 global_tmp_lock=ABSENT kfd_holders=0 tbstream_holders=0 primary_sha=2aa8837ee388bb5110af2832d0bc8a1d01ab302d56826444933efab0720ca9ba exporter_sha=ea4bc0ec462c5f76a1ce00e8899ec29c3f04098860733aca153cf9e030b5a052

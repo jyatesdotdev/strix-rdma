@@ -1,0 +1,15 @@
+curl: (7) Failed to connect to 127.0.0.1 port 8080 after 0 ms: Could not connect to server
+ATTEMPT=1 REMAINING_BEFORE=240 RC=7
+curl: (7) Failed to connect to 127.0.0.1 port 8080 after 0 ms: Could not connect to server
+ATTEMPT=2 REMAINING_BEFORE=238 RC=7
+curl: (7) Failed to connect to 127.0.0.1 port 8080 after 0 ms: Could not connect to server
+ATTEMPT=3 REMAINING_BEFORE=236 RC=7
+curl: (7) Failed to connect to 127.0.0.1 port 8080 after 0 ms: Could not connect to server
+ATTEMPT=4 REMAINING_BEFORE=233 RC=7
+curl: (7) Failed to connect to 127.0.0.1 port 8080 after 0 ms: Could not connect to server
+ATTEMPT=5 REMAINING_BEFORE=231 RC=7
+curl: (7) Failed to connect to 127.0.0.1 port 8080 after 0 ms: Could not connect to server
+ATTEMPT=6 REMAINING_BEFORE=229 RC=7
+curl: (7) Failed to connect to 127.0.0.1 port 8080 after 0 ms: Could not connect to server
+ATTEMPT=7 REMAINING_BEFORE=227 RC=7
+ATTEMPT=8 REMAINING_BEFORE=224 RC=0

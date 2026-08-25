@@ -1,0 +1,10 @@
+HOME=/home/jryates
+USER=jryates
+LOGNAME=jryates
+LANG=C.UTF-8
+LC_ALL=C.UTF-8
+PATH=/opt/rocm-therock/bin:/usr/local/bin:/usr/bin:/bin
+LD_LIBRARY_PATH=/opt/rocm-therock/lib
+ROCM_HOME=/opt/rocm-therock
+HIPCC=/opt/rocm-therock/bin/hipcc
+STAGE3_COMPILE_NONCE=34cc83dd6e4c3896d83ca13ad0fff39a

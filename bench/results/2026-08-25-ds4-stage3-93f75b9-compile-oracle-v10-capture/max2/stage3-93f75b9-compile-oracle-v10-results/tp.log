@@ -1,0 +1,29 @@
+cc -O3 -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD -I. -c -o tests/test_tp_combine_rocm.o tests/test_tp_combine_rocm.c
+/opt/rocm-therock/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -o tests/test_tp_combine_rocm tests/test_tp_combine_rocm.o ds4_rocm.o ds4_rocm_unavailable.o -lm -pthread -lhipblas -lhipblaslt
+./tests/test_tp_combine_rocm
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm chunk-copying 0.02 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.034s (0.02 GiB tensors)
+ROCm TP shared-half parity max_abs=2.23517e-08 rmse=2.23517e-08 finite=4096/4096 prequant=off
+ds4: ROCm chunk-copying 0.00 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.000s (0.00 GiB tensors)
+ROCm TP combine 7168 (hidden) bitexact               PASS
+ROCm TP combine 8191 (odd) bitexact                  PASS
+ROCm TP combine 256 bitexact                         PASS
+ROCm TP spin-combine kernel-writer plain pool        PASS
+ROCm TP spin-combine kernel-writer uncached pool     PASS
+ROCm TP spin-combine host-stamp uncached pool        PASS
+ROCm TP TP folded HC expand-add matches explicit combine PASS
+ROCm TP Flash shared-expert halves recombine         PASS
+ROCm TP rank1 compact-head Q8 attention/K-slice      PASS
+test_tp_combine_rocm: 9/9 checks passed (0 failed)
+DS4_TEST_TP_PREQUANT=1 ./tests/test_tp_combine_rocm
+ds4: ROCm backend initialized on Radeon 8060S Graphics (sm_115)
+ds4: ROCm chunk-copying 0.02 GiB model image
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm model chunk copy complete in 0.041s (0.02 GiB tensors)
+ROCm TP shared-half parity max_abs=7.45058e-09 rmse=7.45058e-09 finite=4096/4096 prequant=on
+ROCm TP production-prequant shared halves recombine  PASS
+test_tp_combine_rocm: 1/1 checks passed (0 failed)

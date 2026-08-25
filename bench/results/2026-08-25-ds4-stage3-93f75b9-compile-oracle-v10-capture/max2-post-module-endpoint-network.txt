@@ -1,0 +1,15 @@
+module=/lib/modules/7.1.5-101.fc43.x86_64/updates/thunderbolt_stream.ko
+installed_srcversion=ABSENT
+loaded_srcversion=ABSENT
+build_id=5b89774a824d13a6e22b6f418a3981ff36216bd9
+ccd946330a5612ffe7674246ac387b39d4a2e71562ed585cfc65d8d58e2650e7  /lib/modules/7.1.5-101.fc43.x86_64/updates/thunderbolt_stream.ko
+endpoint=/sys/kernel/config/thunderbolt/stream/1-2.0/ds4
+in_hopid=9
+out_hopid=9
+ring_size=4096
+throttling=0
+stable_device=/dev/tbstream0 mode=660:0:tbstream
+thunderbolt0_cidr=10.99.0.2/30
+mtu=65520
+carrier=1
+operstate=up

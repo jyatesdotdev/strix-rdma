@@ -1,0 +1,51 @@
+# HELP ds4_prompt_tokens_total Prompt tokens prefetched (prefilled)
+# TYPE ds4_prompt_tokens_total counter
+ds4_prompt_tokens_total 94
+# HELP ds4_generated_tokens_total Tokens generated, by phase
+# TYPE ds4_generated_tokens_total counter
+ds4_generated_tokens_total{phase="thinking"} 11
+ds4_generated_tokens_total{phase="response"} 0
+# HELP ds4_prefill_tps Prefill throughput tokens/s (chunk and running avg)
+# TYPE ds4_prefill_tps gauge
+ds4_prefill_tps{window="chunk"} 8.34
+ds4_prefill_tps{window="avg"} 8.34
+# HELP ds4_decode_tps Decode throughput tokens/s (chunk and running avg)
+# TYPE ds4_decode_tps gauge
+ds4_decode_tps{window="chunk"} 14.86
+ds4_decode_tps{window="avg"} 14.86
+# HELP ds4_active_requests Requests currently prefilling or decoding
+# TYPE ds4_active_requests gauge
+ds4_active_requests 0
+# HELP ds4_context_tokens Current context position per decode slot
+# TYPE ds4_context_tokens gauge
+ds4_context_tokens 0
+# HELP ds4_context_limit_tokens Configured max context (-c)
+# TYPE ds4_context_limit_tokens gauge
+ds4_context_limit_tokens 262144
+# HELP ds4_requests_total Completed requests by finish reason
+# TYPE ds4_requests_total counter
+ds4_requests_total{finish="length"} 11
+# HELP ds4_request_duration_seconds End-to-end request duration
+# TYPE ds4_request_duration_seconds summary
+ds4_request_duration_seconds_sum 7.3420000000000005
+ds4_request_duration_seconds_count 11
+# HELP ds4_prompt_duration_seconds Prefill duration
+# TYPE ds4_prompt_duration_seconds summary
+ds4_prompt_duration_seconds_sum 6.580999999999999
+ds4_prompt_duration_seconds_count 11
+# HELP ds4_kv_cache_stored_total KV cache store operations
+# TYPE ds4_kv_cache_stored_total counter
+ds4_kv_cache_stored_total 0
+# HELP ds4_kv_cache_stored_bytes_total Bytes written to KV disk cache
+# TYPE ds4_kv_cache_stored_bytes_total counter
+ds4_kv_cache_stored_bytes_total 0.0
+# HELP ds4_kv_cache_trimmed_tokens_total Tokens trimmed at KV store time
+# TYPE ds4_kv_cache_trimmed_tokens_total counter
+ds4_kv_cache_trimmed_tokens_total 0
+# HELP ds4_kv_cache_miss_total Live KV cache misses by reason
+# TYPE ds4_kv_cache_miss_total counter
+ds4_kv_cache_miss_total{reason="token-mismatch"} 5
+# HELP ds4_exporter_lines_total Journal lines seen by parse result
+# TYPE ds4_exporter_lines_total counter
+ds4_exporter_lines_total{result="parsed"} 59
+ds4_exporter_lines_total{result="ignored"} 171

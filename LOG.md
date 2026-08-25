@@ -1,6 +1,30 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-08-25 — `93f75b9` bilateral compile/runtime-oracle v10 PASS
+- **What:** The independently reviewed, exact-digest frozen v10 bundle ran the
+  stage-3 no-model compile/oracle sequence on `max` then `max2` from exact DS4
+  `93f75b98bcfcb6a44ca739754472bf767f5433dc` (1,490-file manifest). Per host:
+  `make clean`, one `make -B strix-halo`, then exactly once each
+  `test-tp-combine-rocm`, `test-mxfp4-rocm`, and
+  `test-graph-deferred-dump-rocm`. All passed; graph chronology exact (3
+  control negatives, subset 8-entry arm, full 172-entry arm, 172 unique
+  deferred dumps). Bilateral checker PASS: byte-identical binaries, toolchain,
+  and runtime-library manifests. No model, GGUF, prefill, decode, TP/NHI
+  diagnostic, umbrella `test-rocm`, or module swap occurred.
+- **Why:** Stage 3 needed proof that the deferred-graph capture work compiles
+  and passes its focused oracles identically on both hosts before any later
+  window. Nine earlier bundle versions were rejected or failed closed in
+  review/attempts (v8: macOS-local `flock` prerequisite; v9: stale worker
+  baseline discovery + Bash nounset derived-local bug, no mutation); v10 bound
+  the current exact production baseline (worker/server/exporter SHAs, API
+  8080, module srcversion dual-absence, exact-empty systemd `Job`).
+- **Impact:** **COMPILE_ORACLES_PASS; model window remains HOLD.** Wrapper
+  and settle rc all 0; restoration PASS with pre/post identity byte-identical,
+  private FLOCKs held, dmesg deltas empty, global lock absent throughout.
+  Evidence manifest `8ce422b7…9e2`.
+  Evidence: `bench/results/2026-08-25-ds4-stage3-93f75b9-compile-oracle-v10-window.md`.
+
 ## 2026-08-25 — `6460eb6` Arm A proves broad dumps perturb the standalone oracle
 - **What:** In a wholly separate v5 window, fresh bilateral TheRock
   `test-rocm` passed rollback TP 9/9, production-prequant 1/1 with all 4,096
