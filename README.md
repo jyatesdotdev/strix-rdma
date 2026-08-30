@@ -4,9 +4,12 @@
 
 Experimental hardware-assisted DS4 tensor transport between two Strix Halo
 systems over Thunderbolt/USB4, built on the Linux `thunderbolt-stream`
-(USB4STREAM) driver and the USB4 NHI DMA rings. The NHI backend is a research
-path; the production configuration currently uses descriptor-framed protocol-v3
-TCP.
+(USB4STREAM) driver and the USB4 NHI DMA rings. The two-node DS4
+tensor-parallel path has completed full-stack NHI validation and is the
+current host pair's production configuration; enabling the diagnostic
+DMA-BUF import path elsewhere remains an explicit, capability-scoped install
+step documented in `docs/INSTALL.md` and
+`tools/systemd/tbstream-lifecycle.md`.
 
 The full design and rationale live in [docs/PLAN.md](docs/PLAN.md)
 (sourced from `~/Repositories/ds4/RDMA.md`). Short version:
@@ -46,6 +49,8 @@ tools/pingpong/  Userspace latency/bandwidth test against /dev/tbstreamX.
 tools/dmabuf-probe/
                  Privileged no-traffic DMA-BUF import probe runner
                  (native-pool experiment gate; see kernel/README.md).
+tools/modprobe.d/ Diagnostic module-option template for imported DMA-BUF
+                 pools (`TBSTREAM_ZC_IMPORT`).
 bench/           Benchmark matrix scripts + results (TCP baseline vs stock
                  USB4STREAM vs zero-copy NHI stream).
 linux/           Sparse, blobless checkout of torvalds/linux for reference
@@ -83,26 +88,21 @@ the hosts.
    `docs/GPU_TO_GPU_FEASIBILITY.md`.
 5. Optional NHI transport backend in DS4.
    Integration contract: `docs/DS4_INTEGRATION.md`.
-   **Single-link software path complete:** protocol v3 negotiation and bulk
-   descriptors, persistent CPU-copy NHI, mapped 32-bit ROCm slot handoff,
-   generation/sequence rejection, and TCP/v2 fallback are implemented. The
-   mapped path copies graph tensors directly to/from registered driver slots;
-   eligible opt-in direct-slot runs also bind graph boundary tensors to those
-   GPU aliases. Native DMA-BUF-backed slots remain gated experimental work;
-   pipelined leases remain tuning work. Zero-copy patches 11 and 12 repair the
-   fresh-open path-order failures. Both CPU-copy and mapped required-NHI
-   full-model runs now pass, but NHI remains non-default pending longer soak
-   and active peer-reboot qualification.
+   **Single-link software path and TP promotion complete:** protocol v3
+   negotiation and bulk descriptors, persistent CPU-copy NHI, mapped 32-bit
+   ROCm slot handoff, generation/sequence rejection, TCP/v2 fallback, and the
+   imported DMA-BUF TP path are implemented. The current production pair runs
+   `ds4-server --tensor-parallel --transport nhi` over patch-15
+   `thunderbolt_stream`; deployment examples live in `tools/modprobe.d/` and
+   `tools/systemd/`.
 6. Tune (ring depth, slots, affinities, interrupt throttling, spin vs sleep).
 7. Soak, disconnect/reconnect, IOMMU fault, output-equivalence, and end-to-end
-   DS4 hardware tests. **Initial NHI reliability gate passed:** the exact
-   asymmetric workload completed 2,880 exchanges across 27 sessions and
-   921,600 pair descriptor completions without a kick or transport error;
-   required-NHI CPU-copy and mapped full-model correctness also pass. Controlled
-   full-model rates are effectively identical to TCP v3, so production remains
-   `--dist-transport auto` without an NHI device while longer soak and active
-   peer-reboot testing continue. See
-   `bench/results/2026-08-05-nhi-msix-rx-prime-fix.md`.
+   DS4 hardware tests. **TP NHI production validation passed:** a 23-token
+   prompt with 4096 generated tokens completed at 15.64 tok/s and a
+   3373-token cold prefill completed at 15.97 tok/s on DS4 commit `c18296e`,
+   with zero NHI failures, drops, CRC errors, or overruns. Longer endurance,
+   active peer-reboot, and wider workload soak remain the ongoing
+   qualification work.
 
 ## License
 

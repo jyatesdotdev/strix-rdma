@@ -142,10 +142,22 @@ experiment described in
 ## 7. DS4 integration
 
 The transport contract for the DS4 inference stack is
-[docs/DS4_INTEGRATION.md](DS4_INTEGRATION.md). Production currently ships
-descriptor-framed protocol-v3 TCP (`--dist-transport auto`, no
-`--dist-nhi-device`); supplying an NHI device selects the qualified
-experimental path.
+[docs/DS4_INTEGRATION.md](DS4_INTEGRATION.md). Descriptor-framed
+protocol-v3 TCP (`--dist-transport auto`, no `--dist-nhi-device`) remains
+the interoperability baseline. The two-node tensor-parallel NHI path now
+has a production-shaped systemd example set:
+
+- `tools/modprobe.d/ds4-tbstream-zc.conf`
+- `tools/systemd/ds4-mxfp4-worker.tp-nhi.conf.example`
+- `tools/systemd/ds4-mxfp4-server.tp-nhi.conf.example`
+
+Those files are intentionally not installed by `make install-lifecycle`:
+they enable the diagnostic-gated `TBSTREAM_ZC_IMPORT` module parameter and
+grant `CAP_SYS_RAWIO` to the DS4 units. Install them only on the pair that
+runs DS4 with `--tensor-parallel --transport nhi`, after patches 14–15 are
+installed under `/lib/modules/.../updates/`. Start the worker before the
+coordinator. For teardown, stop the worker first while the coordinator keeps
+its device open; stop the coordinator only after it observes the worker close.
 
 ## Troubleshooting
 

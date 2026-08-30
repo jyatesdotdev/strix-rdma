@@ -1,0 +1,33 @@
+# Example drop-in for an existing ds4-mxfp4-server.service.
+# Install as:
+#   /etc/systemd/system/ds4-mxfp4-server.service.d/99-tp-nhi.conf
+# Adjust WorkingDirectory, DS4_MODEL, DS4_TP_LISTEN, DS4_TP_PORT, and HTTP settings.
+#
+# Requires thunderbolt_stream zero-copy patches 14-15 loaded with
+# zc_diagnostic_dmabuf=1; see tools/modprobe.d/ds4-tbstream-zc.conf.
+
+[Service]
+WorkingDirectory=/opt/ds4
+Environment=DS4_MODEL=/path/to/model.gguf
+Environment=DS4_TP_LISTEN=192.0.2.2
+Environment=DS4_TP_PORT=9000
+Environment=DS4_HTTP_HOST=0.0.0.0
+Environment=DS4_HTTP_PORT=8080
+# Environment=LD_LIBRARY_PATH=/opt/rocm/lib  # site-specific; inherit when possible
+Environment=DS4_TP_NHI_RX_QUEUES=2
+SupplementaryGroups=tbstream
+
+# TBSTREAM_ZC_IMPORT is diagnostic-gated by CAP_SYS_RAWIO.  The base unit
+# must already select a non-root User=; reset inherited capability lists and
+# grant only the one capability this diagnostic path needs.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+CapabilityBoundingSet=CAP_SYS_RAWIO
+AmbientCapabilities=CAP_SYS_RAWIO
+
+ExecStartPre=
+ExecStartPre=/usr/bin/test -x /opt/ds4/ds4-server
+ExecStartPre=/usr/bin/test -r ${DS4_MODEL}
+ExecStart=
+ExecStart=/opt/ds4/ds4-server --rocm -m ${DS4_MODEL} -c 131072 -n 32768 --prefill-chunk 1024 --power 95 --tensor-parallel --mtp-draft 5 --dist-nhi-device /run/ds4-tbstream/device --transport nhi --role coordinator --listen ${DS4_TP_LISTEN} ${DS4_TP_PORT} --host ${DS4_HTTP_HOST} --port ${DS4_HTTP_PORT}

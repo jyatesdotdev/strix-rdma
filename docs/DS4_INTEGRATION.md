@@ -1,15 +1,20 @@
 # DS4 NHI integration contract
 
 This is the implementation boundary between the zero-copy USB4STREAM UAPI in
-this repository and `~/Repositories/ds4`. Software stages 1–6 are implemented
-for one coordinator-to-worker device link. Stage 7 now includes the host safety,
-lifecycle, mapped-pool, asymmetric raw/reopen, and full-model NHI gates. Progress
-diagnostics isolated a lost MSI-X notification and a separate path-before-ring
-fresh-open failure; zero-copy patches 11 and 12 repair them. The post-fix pair
-passes 2,880 DS4-shaped exchanges across 27 stream sessions, plus required-NHI
-CPU-copy and mapped full-model correctness. NHI remains opt-in while longer
-soak and active peer-reboot qualification continue, and the production default
-stays TCP v3 because controlled full-model runs show no NHI throughput gain.
+this repository and `~/Repositories/ds4`. It covers the coordinator-to-worker
+layer-slice transport. The separate `ds4-server --tensor-parallel --transport
+nhi` deployment is governed by `docs/TP_TRANSPORT_CONTRACT.md` and the systemd
+examples in `tools/systemd/`; that imported-pool TP path is now the current
+host pair's production configuration. For this layer-slice transport, the
+baseline remains descriptor-framed v3 TCP unless NHI is explicitly selected.
+
+Software stages 1–6 are implemented for one coordinator-to-worker device link.
+Stage 7 now includes the host safety, lifecycle, mapped-pool, asymmetric
+raw/reopen, and full-model NHI gates. Progress diagnostics isolated a lost
+MSI-X notification and a separate path-before-ring fresh-open failure;
+zero-copy patches 11 and 12 repair them. The post-fix pair passes 2,880
+DS4-shaped exchanges across 27 stream sessions, plus required-NHI CPU-copy
+and mapped full-model correctness.
 
 ## Current architecture
 
@@ -25,7 +30,7 @@ v2 TCP layout remains available for old peers. Two v3 peers use descriptor
 framing even when negotiation selects TCP, which makes v3 TCP the byte/output
 equivalence oracle and automatic fallback.
 
-The production selection is `--dist-transport auto` with no
+The layer-slice baseline selection is `--dist-transport auto` with no
 `--dist-nhi-device`. With no local NHI candidate, two current peers negotiate
 descriptor-framed v3 TCP. Explicit `--dist-transport tcp` is the legacy-v2
 compatibility path. Supplying an NHI device to `auto`, or selecting required
@@ -189,6 +194,7 @@ a coordinated stop/restart window for model tests.
 Host-independent verification covers strict warnings-as-errors builds, v3
 serialization/negotiation tests, transport sequence and lease-state tests,
 WORK/RESULT TCP equivalence, sanitizers, and repeated runs. The live asymmetric
-and full-model gates now complement those checks. TCP v3 remains the production
-selection because it is already mature and the controlled NHI cohort shows no
-throughput gain, not because the earlier hardware failure still reproduces.
+and full-model gates now complement those checks. TCP v3 remains the safest
+layer-slice interoperability baseline because it is mature and the controlled
+NHI cohort shows no throughput gain; it is no longer the only DS4 production
+shape because the separate TP/NHI server stack has been promoted.

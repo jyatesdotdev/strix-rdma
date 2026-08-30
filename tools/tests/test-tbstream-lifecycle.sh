@@ -11,6 +11,10 @@ MOCK_KERNEL="$TEST_DIR/mock-tbstream-kernel.sh"
 MOCK_FUSER="$TEST_DIR/mock-tbstream-fuser.sh"
 RECONCILE_TIMER="$REPO_ROOT/tools/systemd/ds4-tbstream-reconcile.timer"
 RECONCILE_WATCHDOG="$REPO_ROOT/tools/systemd/ds4-tbstream-reconcile-watchdog.service"
+MODPROBE_ZC="$REPO_ROOT/tools/modprobe.d/ds4-tbstream-zc.conf"
+TP_WORKER_UNIT="$REPO_ROOT/tools/systemd/ds4-mxfp4-worker.tp-nhi.conf.example"
+TP_SERVER_UNIT="$REPO_ROOT/tools/systemd/ds4-mxfp4-server.tp-nhi.conf.example"
+LIFECYCLE_DOC="$REPO_ROOT/tools/systemd/tbstream-lifecycle.md"
 
 TEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/tbstream-lifecycle.XXXXXX")
 case "$TEST_TMP" in
@@ -499,7 +503,37 @@ test_timer_uses_low_churn_fallback() {
     pass 'udev add uses bootstrap while the 10-second watchdog is single-pass'
 }
 
-printf '1..20\n'
+test_tp_nhi_examples_document_safe_lifecycle() {
+    grep -Fx 'options thunderbolt_stream zc_diagnostic_dmabuf=1' \
+        "$MODPROBE_ZC" >/dev/null ||
+        fail 'TP NHI modprobe template lost the diagnostic DMA-BUF gate'
+    grep -F 'worker first' "$LIFECYCLE_DOC" >/dev/null ||
+        fail 'TP NHI lifecycle no longer documents worker-first teardown'
+    if grep -F 'stop the coordinator first' "$LIFECYCLE_DOC" >/dev/null; then
+        fail 'TP NHI lifecycle retained coordinator-first teardown'
+    fi
+    for unit in "$TP_WORKER_UNIT" "$TP_SERVER_UNIT"; do
+        grep -Fx 'NoNewPrivileges=true' "$unit" >/dev/null ||
+            fail 'TP NHI unit weakens NoNewPrivileges'
+        grep -Fx 'CapabilityBoundingSet=' "$unit" >/dev/null ||
+            fail 'TP NHI unit does not reset inherited bounding capabilities'
+        grep -Fx 'AmbientCapabilities=' "$unit" >/dev/null ||
+            fail 'TP NHI unit does not reset inherited ambient capabilities'
+        grep -Fx 'CapabilityBoundingSet=CAP_SYS_RAWIO' "$unit" >/dev/null ||
+            fail 'TP NHI unit does not grant CAP_SYS_RAWIO explicitly'
+        grep -Fx 'AmbientCapabilities=CAP_SYS_RAWIO' "$unit" >/dev/null ||
+            fail 'TP NHI unit does not grant ambient CAP_SYS_RAWIO explicitly'
+        grep -F -- '--tensor-parallel' "$unit" >/dev/null ||
+            fail 'TP NHI unit lost tensor-parallel mode'
+        grep -F -- '--transport nhi' "$unit" >/dev/null ||
+            fail 'TP NHI unit lost required NHI transport'
+        grep -F '/run/ds4-tbstream/device' "$unit" >/dev/null ||
+            fail 'TP NHI unit bypasses the managed stable device path'
+    done
+    pass 'TP NHI examples preserve capability scoping and worker-first teardown'
+}
+
+printf '1..21\n'
 test_allocator_and_active_idempotence
 test_exact_allocator_hopids
 test_exact_follower_hopids
@@ -520,3 +554,4 @@ test_explicit_cleanup_refuses_then_succeeds
 test_fuser_error_fails_closed
 test_publication_failure_withdraws_link
 test_timer_uses_low_churn_fallback
+test_tp_nhi_examples_document_safe_lifecycle

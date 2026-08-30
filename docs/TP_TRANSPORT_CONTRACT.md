@@ -4,9 +4,13 @@ What the gate-4..7 campaign and the exchange probe validated, stated as
 the rules an NHI TP backend must follow. Reference implementation:
 `tools/stale-cache/tbstream-tp-exchange.cu` (measured: 29.0 µs/exchange
 transport, 35.2 µs with single-workgroup reduce, sustained full-duplex).
-Kernel side: thunderbolt_stream patches 1–15 (`kernel/zerocopy/`);
-production today runs 1–12, so TP work needs the transient patch-14/15
-module set (`tools/scripts/p14-swap.sh on /tmp/thunderbolt_stream-p15.ko`).
+Kernel side: thunderbolt_stream patches 1–15 (`kernel/zerocopy/`). The
+current DS4 tensor-parallel production pair runs the patch-15 module with
+`zc_diagnostic_dmabuf=1`; the former descriptor-v3 TCP production stack ran
+patches 1–12. Keep the diagnostic module parameter disabled unless the
+imported-pool TP path is intentionally deployed; see
+`tools/modprobe.d/ds4-tbstream-zc.conf` and the systemd TP examples in
+`tools/systemd/`.
 
 ## Pool allocation and import
 

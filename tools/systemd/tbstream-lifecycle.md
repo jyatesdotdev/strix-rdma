@@ -112,7 +112,7 @@ Keep this least-privilege service setting in both versioned DS4 units:
 SupplementaryGroups=tbstream
 ```
 
-The production transport selection is:
+The layer-slice v3 transport baseline is:
 
 ```text
 --dist-transport auto
@@ -122,10 +122,10 @@ With no `--dist-nhi-device`, two current peers negotiate descriptor-framed v3
 TCP. Explicit `--dist-transport tcp` selects the legacy-v2 compatibility path;
 it is not the v3 production spelling.
 
-Any configuration that supplies `/run/ds4-tbstream/device` remains an explicit
-qualification mode while extended soak and active peer-reboot testing continue;
-the repaired candidate also has no measured full-model speed advantage. That
-includes either:
+For layer-slice deployments, any configuration that supplies
+`/run/ds4-tbstream/device` remains an explicit qualification mode while
+extended soak and active peer-reboot testing continue; the repaired candidate
+also has no measured full-model speed advantage. That includes either:
 
 ```text
 --dist-transport auto --dist-nhi-device /run/ds4-tbstream/device
@@ -140,6 +140,48 @@ an ambiguous in-flight NHI generation; therefore pre-activation fallback is not
 a substitute for explicit NHI qualification. Do not add
 `Requires`, `After`, `ExecStartPre`, or `BindsTo` dependencies from the
 production DS4 service to the stream device.
+
+## DS4 tensor-parallel NHI drop-ins
+
+The imported DMA-BUF pool path used by DS4 tensor parallelism needs two
+additional, deliberately explicit pieces on both hosts:
+
+1. The patch-14/15 `thunderbolt_stream` module must be installed under
+   `/lib/modules/$(uname -r)/updates/` and selected by `modinfo
+   thunderbolt_stream`. Install `tools/modprobe.d/ds4-tbstream-zc.conf` as
+   `/etc/modprobe.d/ds4-tbstream-zc.conf`, run `depmod -a`, then reload the
+   module. `zc_diagnostic_dmabuf=1` exposes a diagnostic capability and must
+   not be enabled for ordinary TCP or page-pool NHI deployments.
+2. Install the versioned DS4 drop-in examples after adjusting their paths,
+   addresses, ports, and ROCm library path:
+
+   ```sh
+   install -D -m 0644 tools/systemd/ds4-mxfp4-worker.tp-nhi.conf.example \
+       /etc/systemd/system/ds4-mxfp4-worker.service.d/99-tp-nhi.conf
+   install -D -m 0644 tools/systemd/ds4-mxfp4-server.tp-nhi.conf.example \
+       /etc/systemd/system/ds4-mxfp4-server.service.d/99-tp-nhi.conf
+   systemctl daemon-reload
+   ```
+
+The examples use `/run/ds4-tbstream/device`, require the service user to be
+in the `tbstream` group, and require the base units to select a non-root
+`User=`. The drop-ins reset any inherited capability lists and then grant only
+`CAP_SYS_RAWIO` through `CapabilityBoundingSet` plus `AmbientCapabilities`.
+That capability is the kernel's current gate for `TBSTREAM_ZC_IMPORT`.
+`NoNewPrivileges=true` remains enabled; ambient capabilities are assigned by
+systemd before `execve` and do not require later privilege elevation.
+
+Startup order is worker first, coordinator second. Stop order is also worker
+first: keep the coordinator's NHI device open until it observes the worker
+close, then stop the coordinator. Keep the reconcile timer enabled on both
+hosts; do not leave both NHI devices closed with the timer stopped during a
+test gap.
+
+The production pair validated this configuration with DS4 commit `c18296e`
+on ROCm/gfx1151: 50/50 expert ownership bound on both ranks, a 23-token
+prompt with 4096 generated tokens completed at 15.64 tok/s, and a 3373-token
+cold prefill completed at 15.97 tok/s. Both nodes closed with zero NHI
+failures, event drops, CRC errors, or overruns.
 
 ## Maintenance cleanup and rollback
 
