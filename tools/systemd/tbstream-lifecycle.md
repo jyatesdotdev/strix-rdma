@@ -183,6 +183,14 @@ prompt with 4096 generated tokens completed at 15.64 tok/s, and a 3373-token
 cold prefill completed at 15.97 tok/s. Both nodes closed with zero NHI
 failures, event drops, CRC errors, or overruns.
 
+If the Thunderbolt-IP path has already wedged, first stop every DS4 holder,
+stop the reconcile timers, run the managed cleanup, then reload
+`thunderbolt_stream` on both hosts and reconcile the endpoints. Verify the
+10.99 link before restarting DS4. This full module reload recovered the
+2026-08-30 TP production incident without a reboot; use a coordinated reboot
+only if the reload does not restore bidirectional ping. Do not attempt the
+reload while any process still holds `/dev/tbstream*`.
+
 ## Maintenance cleanup and rollback
 
 First prevent both timer and udev activation, stop or switch DS4 away from NHI,

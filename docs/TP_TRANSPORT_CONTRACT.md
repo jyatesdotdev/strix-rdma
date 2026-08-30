@@ -99,9 +99,12 @@ imported-pool TP path is intentionally deployed; see
 
 13. **Never transmit toward a peer whose device is not open+enabled.**
     TX toward an inactive peer stalls on zero E2E credits and can wedge
-    the entire XDomain connection (TB-IP included, reboot-only
-    recovery). Sequence startup as: both sides open→import→ENABLE, then
-    an out-of-band barrier (TCP), then first submit. The probe's
+    the entire XDomain connection (TB-IP included). A full coordinated
+    `thunderbolt_stream` reload healed the 2026-08-30 incident without
+    reboot (see `bench/results/2026-08-30-ds4-tp-nhi-production.md`);
+    keep coordinated reboot as the fallback if reload does not restore the
+    link. Sequence startup as: both sides open→import→ENABLE, then an
+    out-of-band barrier (TCP), then first submit. The probe's
     `barrier_sync` is the reference.
 14. Keep one side's device open across restarts of the other, or keep
     the reconcile timer running; never leave both closed with the timer
