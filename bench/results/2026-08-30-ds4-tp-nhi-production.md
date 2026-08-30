@@ -36,3 +36,22 @@ The link recovered immediately, the hardened units bound rank 0/rank 1 over
 NHI, `/v1/models` became ready, and a 16-token production smoke request
 returned HTTP 200. This does not weaken the worker-first close rule; it adds
 a documented non-reboot recovery attempt for a link that has already wedged.
+
+## Reboot persistence correction
+
+The first coordinated reboot after promotion exposed that the initramfs still
+carried the older 895192-byte `thunderbolt_stream.ko`; the patched 962880-byte
+module was present under `/lib/modules/.../updates/`, but the early boot module
+had no `zc_diagnostic_dmabuf` parameter, so both DS4 services failed
+`TBSTREAM_ZC_IMPORT` as intended. Rebuilding both images with `dracut --force
+--kver "$(uname -r)"`, verifying the patched module and
+`etc/modprobe.d/ds4-tbstream-zc.conf` were present in the image, and rebooting
+again restored the persistent configuration.
+
+The post-reboot production pair then passed the full performance run:
+
+- 23-token prompt + 4096 generated tokens: HTTP 200 in 261.740 s,
+  15.65 generated tok/s.
+- 3373-token cold prefill + 64 generated tokens: HTTP 200 in 215.346 s,
+  15.97 prefill tok/s.
+- Both services had zero restarts after the corrected boot.

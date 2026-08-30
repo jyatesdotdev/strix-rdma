@@ -149,9 +149,14 @@ additional, deliberately explicit pieces on both hosts:
 1. The patch-14/15 `thunderbolt_stream` module must be installed under
    `/lib/modules/$(uname -r)/updates/` and selected by `modinfo
    thunderbolt_stream`. Install `tools/modprobe.d/ds4-tbstream-zc.conf` as
-   `/etc/modprobe.d/ds4-tbstream-zc.conf`, run `depmod -a`, then reload the
-   module. `zc_diagnostic_dmabuf=1` exposes a diagnostic capability and must
-   not be enabled for ordinary TCP or page-pool NHI deployments.
+   `/etc/modprobe.d/ds4-tbstream-zc.conf`, run `depmod -a`, and rebuild the
+   initramfs before rebooting (`dracut --force --kver "$(uname -r)"` on the
+   tested Fedora hosts). Verify the rebuilt image contains the larger patched
+   module (`lsinitrd /boot/initramfs-$(uname -r).img | grep
+   thunderbolt_stream.ko`) and that the live boot reports
+   `/sys/module/thunderbolt_stream/parameters/zc_diagnostic_dmabuf=Y`.
+   `zc_diagnostic_dmabuf=1` exposes a diagnostic capability and must not be
+   enabled for ordinary TCP or page-pool NHI deployments.
 2. Install the versioned DS4 drop-in examples after adjusting their paths,
    addresses, ports, and ROCm library path:
 

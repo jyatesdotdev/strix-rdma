@@ -155,9 +155,11 @@ Those files are intentionally not installed by `make install-lifecycle`:
 they enable the diagnostic-gated `TBSTREAM_ZC_IMPORT` module parameter and
 grant `CAP_SYS_RAWIO` to the DS4 units. Install them only on the pair that
 runs DS4 with `--tensor-parallel --transport nhi`, after patches 14–15 are
-installed under `/lib/modules/.../updates/`. Start the worker before the
-coordinator. For teardown, stop the worker first while the coordinator keeps
-its device open; stop the coordinator only after it observes the worker close.
+installed under `/lib/modules/.../updates/` and included in the initramfs
+(`dracut --force --kver "$(uname -r)"` on the tested Fedora hosts). Start the
+worker before the coordinator. For teardown, stop the worker first while the
+coordinator keeps its device open; stop the coordinator only after it observes
+the worker close.
 
 ## Troubleshooting
 
