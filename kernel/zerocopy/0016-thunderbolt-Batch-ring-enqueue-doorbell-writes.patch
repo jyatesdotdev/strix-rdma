@@ -1,0 +1,324 @@
+From 64b99e2c248d0bbdfcda4d08146293ebf15c089a Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <me@jyates.dev>
+Date: Sun, 30 Aug 2026 19:18:26 -0700
+Subject: [PATCH] thunderbolt: Batch ring enqueue doorbell writes
+
+ring_write_descriptors() wrote the producer/consumer index MMIO register
+once per frame, so a 64-frame zero-copy message paid 64 spinlock rounds
+and 64 doorbell writes on both the submit and repost paths.  The hardware
+only consumes the final index value and the MMIO write cannot bypass the
+coherent descriptor stores that precede it, so a single trailing write
+per batch is equivalent.
+
+Add __tb_ring_batch_begin/add/commit (with tb_ring_tx/rx batch wrappers)
+that hold ring->lock across a whole message and defer the doorbell to
+commit, and convert tbstream_dev_zc_submit_tx() and the zero-copy RX
+repost loop to use them.  The batched enqueue is atomic with respect to
+ring shutdown (ring->lock serializes ring->running), which removes the
+mid-loop partial-enqueue failure mode; the error counters are still
+incremented when the batch cannot start.
+---
+ drivers/thunderbolt/nhi.c    | 56 +++++++++++++++++++++--
+ drivers/thunderbolt/stream.c | 88 ++++++++++++++++++++++--------------
+ include/linux/thunderbolt.h  | 57 +++++++++++++++++++++++
+ 3 files changed, 164 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index 02b1577a5..61f0afa60 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -252,11 +252,20 @@ static u32 ring_list_count(struct list_head *head)
+  * ring_write_descriptors() - post frames from ring->queue to the controller
+  *
+  * ring->lock is held.
++ *
++ * The producer/consumer index is only written when @doorbell is true;
++ * batched enqueue paths defer it to __tb_ring_batch_commit() so a
++ * multi-frame message costs one MMIO write instead of one per frame.
++ * The hardware only consumes the final index value, and the doorbell
++ * MMIO write cannot bypass the coherent descriptor stores above it, so
++ * a single trailing write is equivalent to per-frame writes.
+  */
+-static void ring_write_descriptors(struct tb_ring *ring)
++static void ring_write_descriptors(struct tb_ring *ring, bool doorbell)
+ {
+ 	struct ring_frame *frame, *n;
+ 	struct ring_desc *descriptor;
++	bool posted = false;
++
+ 	list_for_each_entry_safe(frame, n, &ring->queue, list) {
+ 		if (ring_full(ring))
+ 			break;
+@@ -274,6 +283,9 @@ static void ring_write_descriptors(struct tb_ring *ring)
+ 		}
+ 		ring->descriptors_posted++;
+ 		ring->head = (ring->head + 1) % ring->size;
++		posted = true;
++	}
++	if (doorbell && posted) {
+ 		if (ring->is_tx)
+ 			ring_iowrite_prod(ring, ring->head);
+ 		else
+@@ -325,7 +337,7 @@ static void ring_work(struct work_struct *work)
+ 		ring->descriptors_completed++;
+ 		ring->tail = (ring->tail + 1) % ring->size;
+ 	}
+-	ring_write_descriptors(ring);
++	ring_write_descriptors(ring, true);
+ 
+ invoke_callback:
+ 	/* allow callbacks to schedule new work */
+@@ -352,7 +364,7 @@ int __tb_ring_enqueue(struct tb_ring *ring, struct ring_frame *frame)
+ 	spin_lock_irqsave(&ring->lock, flags);
+ 	if (ring->running) {
+ 		list_add_tail(&frame->list, &ring->queue);
+-		ring_write_descriptors(ring);
++		ring_write_descriptors(ring, true);
+ 	} else {
+ 		ret = -ESHUTDOWN;
+ 	}
+@@ -361,6 +373,44 @@ int __tb_ring_enqueue(struct tb_ring *ring, struct ring_frame *frame)
+ }
+ EXPORT_SYMBOL_GPL(__tb_ring_enqueue);
+ 
++/*
++ * Batched enqueue: __tb_ring_batch_begin() takes ring->lock once and
++ * verifies the ring is running, __tb_ring_batch_add() queues frames
++ * without ringing the doorbell, and __tb_ring_batch_commit() writes the
++ * producer/consumer index once for the whole batch and releases the
++ * lock.  Multi-frame messages (e.g. 64-frame zero-copy slots) otherwise
++ * pay one spinlock round and one MMIO write per frame.
++ */
++int __tb_ring_batch_begin(struct tb_ring *ring, unsigned long *flags)
++{
++	spin_lock_irqsave(&ring->lock, *flags);
++	if (!ring->running) {
++		spin_unlock_irqrestore(&ring->lock, *flags);
++		return -ESHUTDOWN;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(__tb_ring_batch_begin);
++
++void __tb_ring_batch_add(struct tb_ring *ring, struct ring_frame *frame)
++{
++	list_add_tail(&frame->list, &ring->queue);
++	ring_write_descriptors(ring, false);
++}
++EXPORT_SYMBOL_GPL(__tb_ring_batch_add);
++
++void __tb_ring_batch_commit(struct tb_ring *ring, unsigned long flags)
++{
++	/* Writing an unchanged index is harmless (the hardware sees no new
++	 * descriptors), so no need to track whether anything was posted. */
++	if (ring->is_tx)
++		ring_iowrite_prod(ring, ring->head);
++	else
++		ring_iowrite_cons(ring, ring->head);
++	spin_unlock_irqrestore(&ring->lock, flags);
++}
++EXPORT_SYMBOL_GPL(__tb_ring_batch_commit);
++
+ /**
+  * tb_ring_poll() - Poll one completed frame from the ring
+  * @ring: Ring to poll
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 17b15b9eb..60b4cdfcd 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -648,6 +648,31 @@ tbstream_dev_completed_rx(struct tbstream_dev *sdev)
+ 	return sf;
+ }
+ 
++static int tbstream_dev_consume_rx_batched(struct tbstream_dev *sdev)
++{
++	struct device *dma_dev = tb_ring_dma_device(sdev->rx_ring.ring);
++	struct tbstream_frame *sf;
++	int index;
++
++	index = sdev->rx_ring.cons % tb_ring_size(sdev->rx_ring.ring);
++	sdev->rx_ring.cons++;
++
++	sf = &sdev->rx_ring.frames[index];
++	sf->completed = false;
++	sf->offset = 0;
++	sf->frame.size = 0;
++
++	if (sf->page)
++		dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy,
++					   tb_ring_frame_size(&sf->frame),
++					   DMA_FROM_DEVICE);
++
++	/* The batch begin verified the ring is running and holds its lock,
++	 * so the enqueue cannot fail here. */
++	tb_ring_rx_batch_add(sdev->rx_ring.ring, &sf->frame);
++	return 0;
++}
++
+ static int tbstream_dev_consume_rx(struct tbstream_dev *sdev)
+ {
+ 	struct device *dma_dev = tb_ring_dma_device(sdev->rx_ring.ring);
+@@ -1542,6 +1567,18 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ 		goto out_unlock;
+ 	}
+ 
++	/* Batched enqueue: one ring lock round and one producer-index MMIO
++	 * write for the whole message instead of one per frame.  The batch is
++	 * atomic with respect to ring shutdown, so the partial-enqueue error
++	 * path of the per-frame API cannot occur here. */
++	ret = tb_ring_tx_batch_begin(sdev->tx_ring.ring, &irqflags);
++	if (ret) {
++		spin_lock_irqsave(&sdev->zc_lock, irqflags);
++		sdev->zc_counters.tx_enqueue_errors++;
++		spin_unlock_irqrestore(&sdev->zc_lock, irqflags);
++		goto out_unlock;
++	}
++
+ 	for (i = 0; i < tx.nframes; i++) {
+ 		int index = sdev->tx_ring.cons % size;
+ 		struct tbstream_frame *sf = &sdev->tx_ring.frames[index];
+@@ -1556,26 +1593,9 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ 
+ 		dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy,
+ 					   TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);
+-		ret = tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
+-		if (ret) {
+-			bool wake_error = false;
+-
+-			dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy,
+-						TB_MAX_FRAME_SIZE,
+-						DMA_TO_DEVICE);
+-			sdev->tx_ring.cons--;
+-			spin_lock_irqsave(&sdev->zc_lock, irqflags);
+-			sdev->zc_counters.tx_enqueue_errors++;
+-			if (i)
+-				wake_error = tbstream_zc_fail_locked(sdev,
+-								     TBSTREAM_ZC_ERROR_TX_PARTIAL);
+-			spin_unlock_irqrestore(&sdev->zc_lock, irqflags);
+-			if (wake_error)
+-				wake_up_interruptible_poll(&sdev->wait,
+-							   EPOLLHUP | EPOLLERR);
+-			goto out_unlock;
+-		}
++		tb_ring_tx_batch_add(sdev->tx_ring.ring, &sf->frame);
+ 	}
++	tb_ring_tx_batch_commit(sdev->tx_ring.ring, irqflags);
+ 
+ 	mutex_unlock(&sdev->lock);
+ 	return 0;
+@@ -1618,6 +1638,18 @@ static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
+ 		goto out_unlock;
+ 	}
+ 
++	/* Batched repost: one ring lock round and one consumer-index MMIO
++	 * write for the whole message instead of one per frame.  The batch
++	 * begin verifies the ring is running, so the enqueue itself cannot
++	 * fail mid-loop. */
++	ret = tb_ring_rx_batch_begin(sdev->rx_ring.ring, &irqflags);
++	if (ret) {
++		spin_lock_irqsave(&sdev->zc_lock, irqflags);
++		sdev->zc_counters.rx_repost_errors++;
++		spin_unlock_irqrestore(&sdev->zc_lock, irqflags);
++		goto out_unlock;
++	}
++
+ 	for (i = 0; i < nframes; i++) {
+ 		struct tbstream_frame *sf;
+ 		int index = sdev->rx_ring.cons %
+@@ -1627,22 +1659,10 @@ static int tbstream_dev_zc_post_rx(struct tbstream_dev *sdev, u32 nframes,
+ 		sf->frame.flags = flags & TBSTREAM_ZC_RX_F_INTERRUPT_BOUNDARIES &&
+ 				  i != 0 && i != nframes - 1 ?
+ 				  RING_FRAME_NO_INTERRUPT : 0;
+-		ret = tbstream_dev_consume_rx(sdev);
+-		if (ret) {
+-			bool wake_error = false;
+-
+-			spin_lock_irqsave(&sdev->zc_lock, irqflags);
+-			sdev->zc_counters.rx_repost_errors++;
+-			if (i)
+-				wake_error = tbstream_zc_fail_locked(sdev,
+-								     TBSTREAM_ZC_ERROR_RX_PARTIAL);
+-			spin_unlock_irqrestore(&sdev->zc_lock, irqflags);
+-			if (wake_error)
+-				wake_up_interruptible_poll(&sdev->wait,
+-							   EPOLLHUP | EPOLLERR);
+-			break;
+-		}
++		tbstream_dev_consume_rx_batched(sdev);
+ 	}
++	tb_ring_rx_batch_commit(sdev->rx_ring.ring, irqflags);
++	ret = 0;
+ 
+ out_unlock:
+ 	mutex_unlock(&sdev->lock);
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index b237ace06..5f4b0791d 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -737,6 +737,63 @@ void tb_ring_stop(struct tb_ring *ring);
+ void tb_ring_free(struct tb_ring *ring);
+ 
+ int __tb_ring_enqueue(struct tb_ring *ring, struct ring_frame *frame);
++int __tb_ring_batch_begin(struct tb_ring *ring, unsigned long *flags);
++void __tb_ring_batch_add(struct tb_ring *ring, struct ring_frame *frame);
++void __tb_ring_batch_commit(struct tb_ring *ring, unsigned long flags);
++
++/**
++ * tb_ring_tx_batch_begin() - start a batched TX enqueue
++ * @ring: Ring to enqueue to
++ * @flags: IRQ flags storage for the held ring lock
++ *
++ * Takes ring->lock and verifies the ring is running.  On success the
++ * caller queues frames with tb_ring_tx_batch_add() and finishes with
++ * tb_ring_tx_batch_commit(), which writes the producer index once for
++ * the whole batch.
++ *
++ * Return: %-ESHUTDOWN if ring_stop() has been called, %0 otherwise.
++ */
++static inline int tb_ring_tx_batch_begin(struct tb_ring *ring,
++					 unsigned long *flags)
++{
++	WARN_ON(!ring->is_tx);
++	return __tb_ring_batch_begin(ring, flags);
++}
++
++static inline void tb_ring_tx_batch_add(struct tb_ring *ring,
++					struct ring_frame *frame)
++{
++	WARN_ON(!ring->is_tx);
++	__tb_ring_batch_add(ring, frame);
++}
++
++static inline void tb_ring_tx_batch_commit(struct tb_ring *ring,
++					   unsigned long flags)
++{
++	WARN_ON(!ring->is_tx);
++	__tb_ring_batch_commit(ring, flags);
++}
++
++static inline int tb_ring_rx_batch_begin(struct tb_ring *ring,
++					 unsigned long *flags)
++{
++	WARN_ON(ring->is_tx);
++	return __tb_ring_batch_begin(ring, flags);
++}
++
++static inline void tb_ring_rx_batch_add(struct tb_ring *ring,
++					struct ring_frame *frame)
++{
++	WARN_ON(ring->is_tx);
++	__tb_ring_batch_add(ring, frame);
++}
++
++static inline void tb_ring_rx_batch_commit(struct tb_ring *ring,
++					   unsigned long flags)
++{
++	WARN_ON(ring->is_tx);
++	__tb_ring_batch_commit(ring, flags);
++}
+ 
+ /**
+  * tb_ring_rx() - enqueue a frame on an RX ring
+-- 
+2.50.1 (Apple Git-155)
+

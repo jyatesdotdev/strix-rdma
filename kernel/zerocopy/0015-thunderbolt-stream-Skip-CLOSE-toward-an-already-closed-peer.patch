@@ -1,5 +1,5 @@
 From a48b0ee1f331cca5982f025b4a65841abbc1d070 Mon Sep 17 00:00:00 2001
-From: Jordan Yates <jryates@localhost>
+From: Jonathan Yates <me@jyates.dev>
 Date: Mon, 24 Aug 2026 17:00:46 -0700
 Subject: [PATCH] thunderbolt: stream: Skip CLOSE toward an already-closed peer
 

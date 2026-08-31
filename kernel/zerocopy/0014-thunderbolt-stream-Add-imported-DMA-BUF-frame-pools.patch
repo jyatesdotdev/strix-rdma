@@ -1,5 +1,5 @@
 From ebb4db20919d44b4cba9f63c1da48a22273f5cf5 Mon Sep 17 00:00:00 2001
-From: Jordan Yates <jryates@localhost>
+From: Jonathan Yates <me@jyates.dev>
 Date: Sun, 23 Aug 2026 10:19:48 -0700
 Subject: [PATCH] thunderbolt: stream: Add imported DMA-BUF frame pools
 

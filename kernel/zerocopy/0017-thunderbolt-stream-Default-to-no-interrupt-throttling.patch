@@ -1,0 +1,35 @@
+From 6463f7fc6377771d0191f85e5db29f7c8f9da75a Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <me@jyates.dev>
+Date: Sun, 30 Aug 2026 19:18:26 -0700
+Subject: [PATCH] thunderbolt: stream: Default to no interrupt throttling
+
+The zero-copy paths suppress per-frame completions, so each message ends
+with exactly one interrupt per direction.  The 8192 ns default ITR
+interval has nothing left to batch and only delays that message-end
+interrupt; set the default to 0 (throttling disabled).  The configfs
+attribute still allows raising it for flood-heavy experiments, and the
+production reconcile scripts already forced this value.
+---
+ drivers/thunderbolt/stream.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 60b4cdfcd..3474d4b4e 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -81,7 +81,11 @@
+ #define TBSTREAM_DEV_RING_SIZE		256
+ #define TBSTREAM_DEV_MIN_RING_SIZE	32
+ #define TBSTREAM_DEV_MAX_RING_SIZE	4096
+-#define TBSTREAM_DEV_THROTTLING		8192
++/* Zero-copy messaging is latency-bound, and the zc paths raise exactly
++ * one interrupt per message end, so interrupt throttling has nothing to
++ * batch and only delays message completion.  Default to no throttling;
++ * the configfs attribute can still raise it for flood-heavy experiments. */
++#define TBSTREAM_DEV_THROTTLING		0
+ #define TBSTREAM_DEV_MAX_THROTTLING	16776960
+ 
+ static bool zc_diagnostic_kick;
+-- 
+2.50.1 (Apple Git-155)
+

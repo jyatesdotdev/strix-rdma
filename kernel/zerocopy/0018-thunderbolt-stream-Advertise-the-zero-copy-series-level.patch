@@ -1,0 +1,46 @@
+From 3c0ec4c602dcaa3918f093e91af8879ee7fd934b Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <me@jyates.dev>
+Date: Sun, 30 Aug 2026 19:19:55 -0700
+Subject: [PATCH] thunderbolt: stream: Advertise the zero-copy series level
+
+Userspace currently has no way to tell which zerocopy patch level a
+loaded module implements, which makes field reports hard to triage.
+Define TBSTREAM_ZC_SERIES (18), print it in the module init banner, and
+expose it as the read-only zc_series module parameter so tools can check
+the transport contract without parsing dmesg.
+---
+ drivers/thunderbolt/stream.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 3474d4b4e..27576e44a 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -98,6 +98,14 @@ module_param(zc_diagnostic_dmabuf, bool, 0600);
+ MODULE_PARM_DESC(zc_diagnostic_dmabuf,
+ 		 "allow privileged DMA-BUF import diagnostics (probe and pool import)");
+ 
++/* Zero-copy series level: bumped by every patch in kernel/zerocopy/ so
++ * userspace can tell exactly which transport contract the loaded module
++ * implements (dmesg banner plus this read-only parameter). */
++#define TBSTREAM_ZC_SERIES	18
++static int zc_series = TBSTREAM_ZC_SERIES;
++module_param(zc_series, int, 0444);
++MODULE_PARM_DESC(zc_series, "zero-copy patch series level (read-only)");
++
+ static_assert(sizeof(struct tbstream_zc_ring_stats) == 128);
+ static_assert(sizeof(struct tbstream_zc_stats) == 528);
+ static_assert(offsetof(struct tbstream_zc_stats, tx) == 272);
+@@ -3344,6 +3352,9 @@ static int __init tbstream_init(void)
+ {
+ 	int ret;
+ 
++	pr_info("thunderbolt_stream: zero-copy series level %d\n",
++		TBSTREAM_ZC_SERIES);
++
+ 	tbstream_dir = tb_property_create_dir(&tbstream_dir_uuid);
+ 	if (!tbstream_dir)
+ 		return -ENOMEM;
+-- 
+2.50.1 (Apple Git-155)
+
