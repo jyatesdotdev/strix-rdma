@@ -1,0 +1,46 @@
+From 2d758b961c8948b5bd658f82eb2b004d6ba17420 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <me@jyates.dev>
+Date: Mon, 31 Aug 2026 17:49:40 -0700
+Subject: [PATCH] thunderbolt: stream: Default to the validated 4096-frame ring
+
+The zero-copy TP exchange moves 64-frame messages and pipelines up to
+the ring's message capacity.  The 256-frame default leaves only four
+messages of pipeline depth, collapsing the exchange window and making
+first-wrap acquire stalls likely on hand-rolled setups; every validated
+deployment overrides it to 4096 frames (64 messages).  Make that the
+default and keep configfs for lowering it.
+---
+ drivers/thunderbolt/stream.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 27576e44a..c91e7affb 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -78,7 +78,13 @@
+  * above are not enough.
+  */
+ 
+-#define TBSTREAM_DEV_RING_SIZE		256
++/* The zero-copy TP exchange moves 64-frame messages and pipelines up to
++ * the ring's message capacity; the validated deployment envelope is a
++ * 4096-frame ring (64 messages in flight).  A 256-frame default leaves
++ * only 4 messages of pipeline depth and makes first-wrap stalls far more
++ * likely, so default to the validated size; configfs can still lower it
++ * for memory-constrained experiments. */
++#define TBSTREAM_DEV_RING_SIZE		4096
+ #define TBSTREAM_DEV_MIN_RING_SIZE	32
+ #define TBSTREAM_DEV_MAX_RING_SIZE	4096
+ /* Zero-copy messaging is latency-bound, and the zc paths raise exactly
+@@ -101,7 +107,7 @@ MODULE_PARM_DESC(zc_diagnostic_dmabuf,
+ /* Zero-copy series level: bumped by every patch in kernel/zerocopy/ so
+  * userspace can tell exactly which transport contract the loaded module
+  * implements (dmesg banner plus this read-only parameter). */
+-#define TBSTREAM_ZC_SERIES	18
++#define TBSTREAM_ZC_SERIES	19
+ static int zc_series = TBSTREAM_ZC_SERIES;
+ module_param(zc_series, int, 0444);
+ MODULE_PARM_DESC(zc_series, "zero-copy patch series level (read-only)");
+-- 
+2.50.1 (Apple Git-155)
+
