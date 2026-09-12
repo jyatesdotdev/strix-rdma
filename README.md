@@ -82,19 +82,19 @@ the hosts.
 4. Prove ROCm/GPU access to the mapped pool.
    **Complete:** the full 16 MiB TX pool registered with `hipHostRegister()` and
    passed bidirectional GPU/CPU verification on both hosts. Native `hipMalloc`
-   DMA-BUF export is also proven, but NHI import and RX cache ownership are
-   separate, uncompleted performance gates. See
-   `bench/results/2026-08-04-usb4stream-zc-oneway-rocm.md` and
-   `docs/GPU_TO_GPU_FEASIBILITY.md`.
+   as the layer-slice mmap pool remains unimplemented. Kernel `TBSTREAM_ZC_IMPORT`
+   of HIP-exported DMA-BUF pools is the current TP production path (still
+   diagnostic-gated). See `bench/results/2026-08-04-usb4stream-zc-oneway-rocm.md`
+   and `docs/GPU_TO_GPU_FEASIBILITY.md`.
 5. Optional NHI transport backend in DS4.
    Integration contract: `docs/DS4_INTEGRATION.md`.
    **Single-link software path and TP promotion complete:** protocol v3
    negotiation and bulk descriptors, persistent CPU-copy NHI, mapped 32-bit
    ROCm slot handoff, generation/sequence rejection, TCP/v2 fallback, and the
    imported DMA-BUF TP path are implemented. The current production pair runs
-   `ds4-server --tensor-parallel --transport nhi` over patch-15
-   `thunderbolt_stream`; deployment examples live in `tools/modprobe.d/` and
-   `tools/systemd/`.
+   `ds4-server --tensor-parallel --transport nhi` over series-20
+   `thunderbolt_stream` (patches 14–20 for imported DMA-BUF); deployment
+   examples live in `tools/modprobe.d/` and `tools/systemd/`.
 6. Tune (ring depth, slots, affinities, interrupt throttling, spin vs sleep).
 7. Soak, disconnect/reconnect, IOMMU fault, output-equivalence, and end-to-end
    DS4 hardware tests. **TP NHI production validation passed:** a 23-token

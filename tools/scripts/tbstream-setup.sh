@@ -3,15 +3,27 @@
 #
 # Usage: tbstream-setup.sh [stream-name]
 #   SERVICE=0-1.0        xdomain service id; autodetected if unset
-#   RING_SIZE=4096       TX/RX ring size (32-4096, default kernel value 256)
-#   THROTTLING=          interrupt throttling in ns (kernel default 8192;
-#                        lower = better latency); empty = leave default
+#   RING_SIZE=4096       TX/RX ring size (32-4096, kernel default 4096)
+#   THROTTLING=          interrupt throttling in ns (kernel default 0);
+#                        empty = leave default
+#   TBSTREAM_SETUP_FORCE=1  override the managed-lifecycle refusal below
 #
-# Run on BOTH hosts. The stream name must match on both sides.
+# Lab-only. Do not run this on a host that already has the managed
+# lifecycle (install-lifecycle / /run/ds4-tbstream/device); it allocates
+# HopIDs automatically and can steal thunderbolt-net's path. The stream
+# name must match on both sides.
 set -euo pipefail
 
 NAME=${1:-ds4}
 BASE=/sys/kernel/config/thunderbolt/stream
+
+if [ "${TBSTREAM_SETUP_FORCE:-}" != 1 ]; then
+    if [ -e /etc/sysconfig/ds4-tbstream ] || [ -e /run/ds4-tbstream/device ]; then
+        echo "error: managed lifecycle is present; use ds4-tbstream-reconcile.sh" >&2
+        echo "       (TBSTREAM_SETUP_FORCE=1 overrides this lab-only guard)" >&2
+        exit 1
+    fi
+fi
 
 modprobe thunderbolt_stream
 

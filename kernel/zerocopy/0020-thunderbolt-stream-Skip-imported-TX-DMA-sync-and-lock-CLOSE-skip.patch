@@ -1,0 +1,74 @@
+From 80de1afde3d5df9ace5e446e5f452a96e2253770 Mon Sep 17 00:00:00 2001
+From: Jonathan Yates <me@jyates.dev>
+Date: Fri, 11 Sep 2026 18:17:49 -0700
+Subject: [PATCH] thunderbolt: stream: Skip imported TX DMA sync and lock CLOSE
+ skip
+
+Imported DMA-BUF frames are exporter-coherent and must not be
+dma_sync_single_*() targets. Wrap the remaining TX submit sync in
+if (sf->page) before the batched enqueue, matching the other imported
+pool paths.
+
+sdev->closed is published from the RX callback under zc_lock. Read it
+under that lock in release before send_close so a concurrent CLOSE
+cannot be missed and stall the teardown flush.
+
+Bump TBSTREAM_ZC_SERIES to 20.
+---
+ drivers/thunderbolt/stream.c | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index c91e7affb..ba14fd82b 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -107,7 +107,7 @@ MODULE_PARM_DESC(zc_diagnostic_dmabuf,
+ /* Zero-copy series level: bumped by every patch in kernel/zerocopy/ so
+  * userspace can tell exactly which transport contract the loaded module
+  * implements (dmesg banner plus this read-only parameter). */
+-#define TBSTREAM_ZC_SERIES	19
++#define TBSTREAM_ZC_SERIES	20
+ static int zc_series = TBSTREAM_ZC_SERIES;
+ module_param(zc_series, int, 0444);
+ MODULE_PARM_DESC(zc_series, "zero-copy patch series level (read-only)");
+@@ -1609,8 +1609,9 @@ static int tbstream_dev_zc_submit_tx(struct tbstream_dev *sdev,
+ 		sf->frame.eof = last ? TBSTREAM_DATA : TBSTREAM_DATA_MORE;
+ 		sf->frame.flags = last ? 0 : RING_FRAME_NO_INTERRUPT;
+ 
+-		dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy,
+-					   TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);
++		if (sf->page)
++			dma_sync_single_for_device(dma_dev, sf->frame.buffer_phy,
++						   TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);
+ 		tb_ring_tx_batch_add(sdev->tx_ring.ring, &sf->frame);
+ 	}
+ 	tb_ring_tx_batch_commit(sdev->tx_ring.ring, irqflags);
+@@ -2483,6 +2484,9 @@ static int tbstream_dev_fops_release(struct inode *inode, struct file *file)
+ 	mutex_lock(&sdev->lock);
+ 	if (--sdev->users == 0) {
+ 		if (sdev->started) {
++			unsigned long flags;
++			bool closed;
++
+ 			/*
+ 			 * Send CLOSE tunneled packet to notify the other
+ 			 * end that we are closing the file. We do this
+@@ -2492,8 +2496,14 @@ static int tbstream_dev_fops_release(struct inode *inode, struct file *file)
+ 			 * or gone: its receive path no longer returns E2E
+ 			 * credits, so our CLOSE could never complete and
+ 			 * would only stall the teardown flush below.
++			 * sdev->closed is published from the RX callback
++			 * under zc_lock; read it the same way so we cannot
++			 * send CLOSE after observing a stale unlocked false.
+ 			 */
+-			if (!sdev->closed) {
++			spin_lock_irqsave(&sdev->zc_lock, flags);
++			closed = sdev->closed;
++			spin_unlock_irqrestore(&sdev->zc_lock, flags);
++			if (!closed) {
+ 				ret = tbstream_dev_send_close(sdev);
+ 				if (ret) {
+ 					int retry = tbstream_dev_send_close(sdev);
+-- 
+2.50.1 (Apple Git-155)
+

@@ -21,7 +21,8 @@ Exactly one endpoint allocates HopIDs. For the current pair, install
 `tools/sysconfig/ds4-tbstream.allocator` as `/etc/sysconfig/ds4-tbstream` on
 `max2`, and install the follower sample on `max`. A follower removes its own
 unpublished attempt and retries until the allocator's reversed HopIDs are
-visible; both endpoints must never be configured as followers.
+visible; both endpoints must never be configured as followers. Two allocators
+are as bad as two followers: both sides would publish overlapping exact HopIDs.
 
 The current single-link samples pin each local direction to HopID 9 with the
 paired `TBSTREAM_IN_HOPID` and `TBSTREAM_OUT_HOPID` settings. The allocator
@@ -73,9 +74,12 @@ install -o root -g root -m 0644 tools/systemd/tbstream-lifecycle.md \
 ```
 
 Install exactly one role sample as `/etc/sysconfig/ds4-tbstream`, reload udev
-and systemd, then enable both the service and timer. Start a new login before DS4
-so its process has the `tbstream` supplementary group. The service's initial
-start waits for a peer; the timer and udev add event converge later generations.
+and systemd, then enable the timer. `make install-lifecycle` enables the timer
+and starts the service once; do not `systemctl enable` the service itself —
+that can delay boot by about `TBSTREAM_WAIT_SECONDS` if the peer is down.
+Start a new login before DS4 so its process has the `tbstream` supplementary
+group. The one-shot start waits for a peer; the timer and udev add event
+converge later generations.
 The timer remains necessary for property changes and because a remove event
 cannot reliably read the already-removed service's `key` attribute. Udev starts
 reconcile immediately on stream-service add; the staggered timer is a 10–11
@@ -94,8 +98,8 @@ udevadm control --reload-rules
 udevadm trigger --action=change --subsystem-match=misc \
     --sysname-match='tbstream*'
 udevadm settle --timeout=10
-systemctl enable --now ds4-tbstream-reconcile.service \
-    ds4-tbstream-reconcile.timer
+systemctl enable --now ds4-tbstream-reconcile.timer
+systemctl start ds4-tbstream-reconcile.service
 ```
 
 Do not add ConfigFS deletion to `ExecStop=`. A normal service stop or shutdown
@@ -146,7 +150,7 @@ production DS4 service to the stream device.
 The imported DMA-BUF pool path used by DS4 tensor parallelism needs two
 additional, deliberately explicit pieces on both hosts:
 
-1. The patch-14/15 `thunderbolt_stream` module must be installed under
+1. The series-20 `thunderbolt_stream` module (patches 14–20) must be installed under
    `/lib/modules/$(uname -r)/updates/` and selected by `modinfo
    thunderbolt_stream`. Install `tools/modprobe.d/ds4-tbstream-zc.conf` as
    `/etc/modprobe.d/ds4-tbstream-zc.conf`, run `depmod -a`, and rebuild the
@@ -215,8 +219,12 @@ maintenance window. To resume, unmask them and start the main service and timer.
 For complete rollback, restore the prior TCP-only versioned DS4 units, run
 `systemctl disable --now` for the lifecycle service and timer, runtime-mask the
 main and watchdog services, remove and reload the udev event rule, daemon-reload
-systemd, run the explicit cleanup, and optionally unload
-`thunderbolt_stream`. A coordinated local reboot is the final ConfigFS reset.
+systemd, run the explicit cleanup, `rm -f /etc/modprobe.d/ds4-tbstream-zc.conf`,
+`depmod -a`, rebuild initramfs (`dracut --force --kver "$(uname -r)"` on the
+tested Fedora hosts), reload `thunderbolt_stream`, and verify
+`/sys/module/thunderbolt_stream/parameters/zc_diagnostic_dmabuf` is `N`.
+Optionally unload `thunderbolt_stream`. A coordinated local reboot is the
+final ConfigFS reset.
 
 ## Offline verification
 

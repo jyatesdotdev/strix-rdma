@@ -53,8 +53,9 @@ Two options — see [kernel/README.md](../kernel/README.md) for full rationale:
   ```
 
 Optionally validate the zero-copy series without touching the hosts:
-`make check-kernel` (needs a Linux checkout; default `KERNEL_SRC=./linux`,
-38-case worktree suite).
+`make check-kernel` (needs a Linux checkout with the USB4STREAM backport;
+default `KERNEL_SRC=./linux`, 45-case worktree suite). CI runs `make check`
+and a sparse v7.1.5 + backport `check-kernel` job.
 
 ## 3. Device access policy (both hosts)
 
@@ -71,7 +72,13 @@ sudo udevadm trigger --action=change --subsystem-match=misc --sysname-match='tbs
 
 (Installed automatically by `make install-lifecycle` in step 4b.)
 
-## 4a. Bring up a stream — quick/manual
+## 4a. Bring up a stream — lab/manual (do not mix with 4b)
+
+Lab-only and mutually exclusive with the managed lifecycle in 4b.
+`tbstream-setup.sh` allocates HopIDs automatically and refuses to run when
+`/etc/sysconfig/ds4-tbstream` or `/run/ds4-tbstream/device` exists
+(`TBSTREAM_SETUP_FORCE=1` overrides). Do not use it on a live managed pair:
+that can steal `thunderbolt-net` HopIDs.
 
 With the cable connected and `thunderbolt_stream` loaded on both ends:
 
@@ -81,7 +88,8 @@ hostB$ sudo tools/scripts/tbstream-setup.sh ds4    # same name on both sides
 ```
 
 `RING_SIZE=4096` and `THROTTLING=0` env vars matter at QD1; see
-[bench/README.md](../bench/README.md).
+[bench/README.md](../bench/README.md). The kernel defaults are already
+4096/0 after patches 17/19.
 
 ## 4b. Bring up a stream — managed lifecycle (recommended for repeated use)
 
@@ -151,15 +159,22 @@ has a production-shaped systemd example set:
 - `tools/systemd/ds4-mxfp4-worker.tp-nhi.conf.example`
 - `tools/systemd/ds4-mxfp4-server.tp-nhi.conf.example`
 
-Those files are intentionally not installed by `make install-lifecycle`:
-they enable the diagnostic-gated `TBSTREAM_ZC_IMPORT` module parameter and
-grant `CAP_SYS_RAWIO` to the DS4 units. Install them only on the pair that
-runs DS4 with `--tensor-parallel --transport nhi`, after patches 14–15 are
-installed under `/lib/modules/.../updates/` and included in the initramfs
+Layer-slice stays mapped/TCP. Imported DMA-BUF is TP-only and still
+diagnostic-gated; `make install-lifecycle` does not install the zc
+modprobe snippet. Those files are intentionally not installed by
+`make install-lifecycle`: they enable the diagnostic-gated
+`TBSTREAM_ZC_IMPORT` module parameter and grant `CAP_SYS_RAWIO` to the
+DS4 units. Install them only on the pair that runs DS4 with
+`--tensor-parallel --transport nhi`, after patches 14–20 are installed
+under `/lib/modules/.../updates/` and included in the initramfs
 (`dracut --force --kver "$(uname -r)"` on the tested Fedora hosts). Start the
 worker before the coordinator. For teardown, stop the worker first while the
 coordinator keeps its device open; stop the coordinator only after it observes
-the worker close.
+the worker close. Leaving TP NHI (complete rollback) must remove
+`/etc/modprobe.d/ds4-tbstream-zc.conf`, run `depmod -a`, rebuild initramfs,
+reload `thunderbolt_stream`, and verify `zc_diagnostic_dmabuf=N`; follow
+[tbstream-lifecycle.md](../tools/systemd/tbstream-lifecycle.md) rather than
+inventing a shorter procedure.
 
 ## Troubleshooting
 
@@ -172,9 +187,9 @@ the worker close.
   enrolled MOK.
 - **`EBUSY` on `TBSTREAM_ZC_ENABLE`**: zero-copy must be enabled on a fresh
   open before any legacy I/O; close, reopen, retry.
-- **Stale ConfigFS state**: `sudo /usr/local/libexec/ds4-tbstream-reconcile.sh
-  --cleanup` (managed installs) — it refuses while any holder has the device
-  open, by design.
+- **Stale ConfigFS state**: `sudo /usr/local/libexec/ds4-tbstream-cleanup.sh`
+  (managed installs; sources `/etc/sysconfig/ds4-tbstream`) — it refuses
+  while any holder has the device open, by design.
 - **Stalls/diagnostics**: `TBSTREAM_ZC_GET_STATS` counters and the
   `tools/ds4-shape/README.md` timeout-capture workflow localize lost
   interrupts vs. ring stalls.

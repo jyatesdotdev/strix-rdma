@@ -15,6 +15,10 @@ MODPROBE_ZC="$REPO_ROOT/tools/modprobe.d/ds4-tbstream-zc.conf"
 TP_WORKER_UNIT="$REPO_ROOT/tools/systemd/ds4-mxfp4-worker.tp-nhi.conf.example"
 TP_SERVER_UNIT="$REPO_ROOT/tools/systemd/ds4-mxfp4-server.tp-nhi.conf.example"
 LIFECYCLE_DOC="$REPO_ROOT/tools/systemd/tbstream-lifecycle.md"
+UDEV_DEVICE_RULE="$REPO_ROOT/tools/udev/99-tbstream.rules"
+UDEV_RECONCILE_RULE="$REPO_ROOT/tools/udev/98-ds4-tbstream-reconcile.rules"
+SYSCONFIG_ALLOCATOR="$REPO_ROOT/tools/sysconfig/ds4-tbstream.allocator"
+SYSCONFIG_FOLLOWER="$REPO_ROOT/tools/sysconfig/ds4-tbstream.follower"
 
 TEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/tbstream-lifecycle.XXXXXX")
 case "$TEST_TMP" in
@@ -533,7 +537,119 @@ test_tp_nhi_examples_document_safe_lifecycle() {
     pass 'TP NHI examples preserve capability scoping and worker-first teardown'
 }
 
-printf '1..21\n'
+test_udev_least_privilege() {
+    grep -F 'MODE="0660"' "$UDEV_DEVICE_RULE" >/dev/null ||
+        fail 'tbstream udev rule lost MODE=0660'
+    if grep -F 'MODE="0666"' "$UDEV_DEVICE_RULE" >/dev/null; then
+        fail 'tbstream udev rule fail-opens the DMA mmap device'
+    fi
+    pass 'tbstream character devices stay 0660, not world-writable'
+}
+
+test_udev_add_handoff() {
+    grep -F 'ENV{SYSTEMD_WANTS}+="ds4-tbstream-reconcile.service"' \
+        "$UDEV_RECONCILE_RULE" >/dev/null ||
+        fail 'udev add rule does not hand off to the reconcile service'
+    if grep -F 'ds4-tbstream-reconcile.sh' "$UDEV_RECONCILE_RULE" >/dev/null; then
+        fail 'udev add rule must not exec the long reconcile helper'
+    fi
+    pass 'udev add hands off via SYSTEMD_WANTS and does not exec reconcile'
+}
+
+test_install_lifecycle_dest_tree() {
+    local inst=$TEST_TMP/install-allocator
+    mkdir -p "$inst"
+    make -C "$REPO_ROOT" DESTDIR="$inst" ROLE=allocator install-lifecycle >/dev/null
+    assert_exists "$inst/usr/local/libexec/ds4-tbstream-reconcile.sh"
+    assert_exists "$inst/usr/local/libexec/ds4-tbstream-cleanup.sh"
+    assert_exists "$inst/etc/systemd/system/ds4-tbstream-reconcile.service"
+    assert_exists "$inst/etc/systemd/system/ds4-tbstream-reconcile.timer"
+    assert_exists "$inst/etc/systemd/system/ds4-tbstream-reconcile-watchdog.service"
+    assert_exists "$inst/etc/udev/rules.d/98-ds4-tbstream-reconcile.rules"
+    assert_exists "$inst/etc/udev/rules.d/99-tbstream.rules"
+    assert_exists "$inst/etc/modules-load.d/ds4-tbstream.conf"
+    assert_exists "$inst/usr/local/share/doc/strix-rdma/tbstream-lifecycle.md"
+    assert_exists "$inst/etc/sysconfig/ds4-tbstream"
+    grep -Fx 'TBSTREAM_ROLE=allocator' "$inst/etc/sysconfig/ds4-tbstream" >/dev/null ||
+        fail 'allocator DESTDIR install did not write TBSTREAM_ROLE=allocator'
+    assert_not_exists "$inst/etc/modprobe.d/ds4-tbstream-zc.conf"
+    pass 'DESTDIR allocator install publishes lifecycle files and omits diagnostic zc conf'
+}
+
+test_install_lifecycle_role_mismatch() {
+    local inst=$TEST_TMP/install-role
+    mkdir -p "$inst"
+    make -C "$REPO_ROOT" DESTDIR="$inst" ROLE=allocator install-lifecycle >/dev/null
+    if make -C "$REPO_ROOT" DESTDIR="$inst" ROLE=follower install-lifecycle \
+        >/dev/null 2>"$TEST_TMP/follower-without-force.err"; then
+        fail 'follower install overwrote allocator sysconfig without FORCE'
+    fi
+    grep -F 'TBSTREAM_ROLE=allocator' "$TEST_TMP/follower-without-force.err" >/dev/null ||
+        fail 'role-mismatch error does not print the existing role'
+    grep -F 'ROLE=follower' "$TEST_TMP/follower-without-force.err" >/dev/null ||
+        fail 'role-mismatch error does not print the requested role'
+    grep -Fx 'TBSTREAM_ROLE=allocator' "$inst/etc/sysconfig/ds4-tbstream" >/dev/null ||
+        fail 'allocator sysconfig was lost after rejected follower install'
+    make -C "$REPO_ROOT" DESTDIR="$inst" ROLE=follower FORCE=1 install-lifecycle >/dev/null
+    grep -Fx 'TBSTREAM_ROLE=follower' "$inst/etc/sysconfig/ds4-tbstream" >/dev/null ||
+        fail 'FORCE=1 follower install did not overwrite TBSTREAM_ROLE'
+    if make -C "$REPO_ROOT" DESTDIR="$inst" ROLE=both install-lifecycle \
+        >/dev/null 2>"$TEST_TMP/invalid-role.err"; then
+        fail 'invalid ROLE=both was accepted'
+    fi
+    grep -F 'set ROLE=allocator or ROLE=follower' "$TEST_TMP/invalid-role.err" >/dev/null ||
+        fail 'invalid ROLE error does not tell the operator the allowed values'
+    pass 'install-lifecycle rejects role mismatch without FORCE and invalid ROLE'
+}
+
+test_install_lifecycle_same_role_keep() {
+    local inst=$TEST_TMP/install-keep
+    local sysconfig
+    mkdir -p "$inst"
+    make -C "$REPO_ROOT" DESTDIR="$inst" ROLE=allocator install-lifecycle >/dev/null
+    sysconfig="$inst/etc/sysconfig/ds4-tbstream"
+    grep -Fx 'TBSTREAM_IN_HOPID=9' "$sysconfig" >/dev/null ||
+        fail 'allocator DESTDIR install did not write TBSTREAM_IN_HOPID=9'
+    sed 's/^TBSTREAM_IN_HOPID=9$/TBSTREAM_IN_HOPID=11/' "$sysconfig" >"$sysconfig.new"
+    mv "$sysconfig.new" "$sysconfig"
+    make -C "$REPO_ROOT" DESTDIR="$inst" ROLE=allocator install-lifecycle >/dev/null
+    grep -Fx 'TBSTREAM_IN_HOPID=11' "$sysconfig" >/dev/null ||
+        fail 'same-ROLE reinstall without FORCE overwrote a customized HopID'
+    grep -Fx 'TBSTREAM_ROLE=allocator' "$sysconfig" >/dev/null ||
+        fail 'same-ROLE reinstall lost TBSTREAM_ROLE=allocator'
+    pass 'same-ROLE reinstall without FORCE keeps a customized sysconfig'
+}
+
+test_sysconfig_templates_source() {
+    local status
+    status=0
+    TBSTREAM_ROLE= TBSTREAM_IN_HOPID= TBSTREAM_OUT_HOPID= bash -c '
+        set -euo pipefail
+        set -a
+        # shellcheck disable=SC1090
+        . "$1"
+        set +a
+        [ "$TBSTREAM_ROLE" = allocator ]
+        [ "$TBSTREAM_IN_HOPID" = 9 ]
+        [ "$TBSTREAM_OUT_HOPID" = 9 ]
+    ' bash "$SYSCONFIG_ALLOCATOR" || status=1
+    [ "$status" -eq 0 ] || fail 'allocator sysconfig template did not source ROLE=allocator HopIDs 9/9'
+    status=0
+    TBSTREAM_ROLE= TBSTREAM_IN_HOPID= TBSTREAM_OUT_HOPID= bash -c '
+        set -euo pipefail
+        set -a
+        # shellcheck disable=SC1090
+        . "$1"
+        set +a
+        [ "$TBSTREAM_ROLE" = follower ]
+        [ "$TBSTREAM_IN_HOPID" = 9 ]
+        [ "$TBSTREAM_OUT_HOPID" = 9 ]
+    ' bash "$SYSCONFIG_FOLLOWER" || status=1
+    [ "$status" -eq 0 ] || fail 'follower sysconfig template did not source ROLE=follower HopIDs 9/9'
+    pass 'sysconfig templates source allocator/follower roles with HopIDs 9/9'
+}
+
+printf '1..27\n'
 test_allocator_and_active_idempotence
 test_exact_allocator_hopids
 test_exact_follower_hopids
@@ -555,3 +671,9 @@ test_fuser_error_fails_closed
 test_publication_failure_withdraws_link
 test_timer_uses_low_churn_fallback
 test_tp_nhi_examples_document_safe_lifecycle
+test_udev_least_privilege
+test_udev_add_handoff
+test_install_lifecycle_dest_tree
+test_install_lifecycle_role_mismatch
+test_install_lifecycle_same_role_keep
+test_sysconfig_templates_source

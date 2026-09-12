@@ -180,11 +180,26 @@ for subject in \
 	'thunderbolt: stream: Make HopID attachment transactional' \
 	'thunderbolt: stream: Add zero-copy progress diagnostics' \
 	'thunderbolt: Flush posted MSI-X interrupt clears' \
-	'thunderbolt: stream: Prime Rx ring before enabling DMA paths'; do
+	'thunderbolt: stream: Prime Rx ring before enabling DMA paths' \
+	'thunderbolt: stream: Add imported DMA-BUF frame pools' \
+	'thunderbolt: stream: Skip CLOSE toward an already-closed peer' \
+	'thunderbolt: Batch ring enqueue doorbell writes' \
+	'thunderbolt: stream: Default to no interrupt throttling' \
+	'thunderbolt: stream: Advertise the zero-copy series level' \
+	'thunderbolt: stream: Default to the validated 4096-frame ring' \
+	'thunderbolt: stream: Skip imported TX DMA sync and lock CLOSE skip'; do
 	git -C "$TEST_TREE" log -64 --format=%s | grep -Fx "$subject" >/dev/null ||
 		fail "series did not apply $subject"
 done
 pass 'the complete zero-copy patch series applies in an isolated worktree'
+
+must_contain "$(<"$STREAM")" $'#define TBSTREAM_ZC_SERIES\t20' \
+	'zero-copy series level'
+must_contain "$(<"$STREAM")" $'#define TBSTREAM_DEV_RING_SIZE\t\t4096' \
+	'validated ring default'
+must_contain "$(<"$STREAM")" $'#define TBSTREAM_DEV_THROTTLING\t\t0' \
+	'no interrupt throttling default'
+pass 'series 20 defaults to a 4096-frame ring with throttling off'
 
 stream_start=$(body_between '^static int tbstream_dev_start' \
 	'^static void tbstream_dev_stop')
@@ -447,7 +462,7 @@ must_order "$rx_completion" 'RX transition serialization' \
 	'spin_unlock_irqrestore(&sdev->zc_lock, flags);'
 pass 'RX completion and zero-copy publication share a transition lock'
 
-consume_rx=$(body_between '^static int tbstream_dev_consume_rx' \
+consume_rx=$(body_between '^static int tbstream_dev_consume_rx[(]' \
 	'^static int tbstream_dev_alloc_rx_buffers')
 must_order "$consume_rx" 'failed RX repost ownership rollback' \
 	'sdev->rx_ring.cons++;' \
@@ -486,34 +501,40 @@ submit_body=$(body_between '^static int tbstream_dev_zc_submit_tx' '^static int 
 must_order "$submit_body" 'TX submission ownership' \
 	'tx.first = sdev->tx_ring.cons % size;' \
 	'copy_to_user(arg, &tx, sizeof(tx))' \
+	'tb_ring_tx_batch_begin(sdev->tx_ring.ring, &irqflags);' \
+	'if (sf->page)' \
 	'dma_sync_single_for_device' \
-	'tb_ring_tx(sdev->tx_ring.ring, &sf->frame);'
+	'tb_ring_tx_batch_add(sdev->tx_ring.ring, &sf->frame);' \
+	'tb_ring_tx_batch_commit(sdev->tx_ring.ring, irqflags);'
 must_contain "$submit_body" 'TB_MAX_FRAME_SIZE, DMA_TO_DEVICE);' \
 	'TX submission ownership'
 pass 'submission gives the full slot to the NHI immediately before enqueue'
 
-must_order "$submit_body" 'failed TX enqueue rollback' \
-	'tb_ring_tx(sdev->tx_ring.ring, &sf->frame);' \
-	'dma_sync_single_for_cpu' \
-	'sdev->tx_ring.cons--;'
-pass 'failed enqueue returns CPU ownership and restores the TX cursor'
+must_order "$submit_body" 'failed TX batch-begin accounting' \
+	'ret = tb_ring_tx_batch_begin(sdev->tx_ring.ring, &irqflags);' \
+	'sdev->zc_counters.tx_enqueue_errors++;'
+must_not_contain "$submit_body" 'TBSTREAM_ZC_ERROR_TX_PARTIAL' \
+	'failed TX batch-begin accounting'
+must_not_contain "$submit_body" 'sdev->tx_ring.cons--;' \
+	'failed TX batch-begin accounting'
+pass 'batch-begin failure counts an enqueue error without mid-message rollback'
 
-must_order "$submit_body" 'partial TX failure latch' \
-	'sdev->tx_ring.cons--;' \
-	'if (i)' \
-	'wake_error = tbstream_zc_fail_locked(' \
-	'TBSTREAM_ZC_ERROR_TX_PARTIAL);' \
-	'wake_up_interruptible_poll(&sdev->wait,'
-must_contain "$submit_body" 'ret = -EIO;' 'partial TX failure latch'
+must_contain "$submit_body" 'if (tbstream_dev_zc_failed(sdev))' \
+	'zero-copy failure gate'
+must_contain "$submit_body" 'ret = -EIO;' 'zero-copy failure gate'
 post_body=$(body_between '^static int tbstream_dev_zc_post_rx' '^static int tbstream_dev_zc_reap')
+must_order "$post_body" 'RX batched repost' \
+	'tb_ring_rx_batch_begin(sdev->rx_ring.ring, &irqflags);' \
+	'tbstream_dev_consume_rx_batched(sdev);' \
+	'tb_ring_rx_batch_commit(sdev->rx_ring.ring, irqflags);'
 must_contain "$post_body" 'if (tbstream_dev_zc_failed(sdev))' \
-	'partial TX failure latch'
-must_contain "$post_body" 'ret = -EIO;' 'partial TX failure latch'
+	'zero-copy failure gate'
+must_contain "$post_body" 'ret = -EIO;' 'zero-copy failure gate'
 reap_body=$(body_between '^static int tbstream_dev_zc_reap' '^static long$')
 must_contain "$reap_body" 'tbstream_dev_zc_failed(sdev)' \
-	'partial TX failure latch'
-must_contain "$reap_body" 'ret = -EIO;' 'partial TX failure latch'
-pass 'partial multi-frame enqueue failure becomes terminal for zero-copy I/O'
+	'zero-copy failure gate'
+must_contain "$reap_body" 'ret = -EIO;' 'zero-copy failure gate'
+pass 'failed zero-copy sessions reject later submit, post, and reap'
 
 must_order "$reap_body" 'fault-safe event reap' \
 	'kfifo_peek(&sdev->zc_events, &ev);' \
@@ -559,10 +580,12 @@ must_order "$ring_progress" 'descriptor-completion accounting' \
 	'if (!(ring->descriptors[ring->tail].flags' \
 	'ring->descriptors_completed++;' \
 	'ring->tail = (ring->tail + 1) % ring->size;' \
-	'ring_write_descriptors(ring);' \
+	'ring_write_descriptors(ring, true);' \
 	'spin_unlock_irqrestore(&ring->lock, flags);'
 [ "$(grep -Fc 'ring->interrupts++;' "$NHI")" -eq 2 ] ||
 	fail 'MSI-X and shared-MSI paths do not both account ring interrupts'
+must_contain "$(<"$NHI")" 'ring_write_descriptors(ring, false);' \
+	'batched enqueue defers the doorbell'
 pass 'ring posting, completion, work, and both interrupt paths are accounted'
 
 msix_clear=$(body_between_file "$NHI" '^static void ring_clear_msix' \
@@ -731,20 +754,16 @@ must_order "$enable_body" 'diagnostic session reset' \
 	'WRITE_ONCE(sdev->zc, true);'
 submit_body=$(body_between '^static int tbstream_dev_zc_submit_tx' \
 	'^static int tbstream_dev_zc_post_rx')
-must_order "$submit_body" 'partial TX diagnostic failure' \
+must_order "$submit_body" 'batch TX enqueue-error accounting' \
 	'sdev->zc_counters.tx_submit_calls++;' \
-	'sdev->zc_counters.tx_enqueue_errors++;' \
-	'if (i)' \
-	'wake_error = tbstream_zc_fail_locked(' \
-	'TBSTREAM_ZC_ERROR_TX_PARTIAL);'
+	'ret = tb_ring_tx_batch_begin(sdev->tx_ring.ring, &irqflags);' \
+	'sdev->zc_counters.tx_enqueue_errors++;'
 post_body=$(body_between '^static int tbstream_dev_zc_post_rx' \
 	'^static int tbstream_dev_zc_reap')
-must_order "$post_body" 'partial RX diagnostic failure' \
+must_order "$post_body" 'batch RX repost-error accounting' \
 	'sdev->zc_counters.rx_repost_calls++;' \
-	'sdev->zc_counters.rx_repost_errors++;' \
-	'if (i)' \
-	'wake_error = tbstream_zc_fail_locked(' \
-	'TBSTREAM_ZC_ERROR_RX_PARTIAL);'
+	'ret = tb_ring_rx_batch_begin(sdev->rx_ring.ring, &irqflags);' \
+	'sdev->zc_counters.rx_repost_errors++;'
 reap_body=$(body_between '^static int tbstream_dev_zc_reap' \
 	'^static void$')
 must_order "$reap_body" 'successful reap accounting' \
@@ -937,7 +956,10 @@ release_body=$(body_between '^static int tbstream_dev_fops_release' \
 must_order "$release_body" 'release ordering with peer-close suppression' \
 	'if (--sdev->users == 0)' \
 	'if (sdev->started)' \
-	'if (!sdev->closed)' \
+	'spin_lock_irqsave(&sdev->zc_lock, flags);' \
+	'closed = sdev->closed;' \
+	'spin_unlock_irqrestore(&sdev->zc_lock, flags);' \
+	'if (!closed)' \
 	'ret = tbstream_dev_send_close(sdev);' \
 	'tbstream_dev_stop(sdev);' \
 	'sdev->started = false;' \

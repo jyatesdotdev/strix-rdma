@@ -113,11 +113,16 @@ publishes `0660 root:tbstream` devices through
 
 ## Zero-copy UAPI (step 3 of the plan)
 
-`zerocopy/` contains the fifteen-patch follow-on series to apply after the
-v7.1 backport. Patches 1–12 are the production module set deployed on the
-`max`/`max2` pair; patches 13–15 are validated (through live DS4 inference,
-Window B) but deployed only transiently via
-`../tools/scripts/p14-swap.sh on <module.ko>`:
+`zerocopy/` contains the twenty-patch follow-on series to apply after the
+v7.1 backport. Patches 1–12 are the mapped-pool production module set.
+Only patches 13–14 (DMA-BUF probe and `TBSTREAM_ZC_IMPORT`) are gated by
+`zc_diagnostic_dmabuf`. Patches 15–20 (CLOSE skip, doorbell batching,
+series advertising, 4096-frame / no-ITR defaults, and imported TX sync)
+apply to mapped and imported pools. This pair's TP production enables
+import with an explicit `tools/modprobe.d/ds4-tbstream-zc.conf` plus
+initramfs rebuild — not because 17/19 need that gate, and not via
+`make install-lifecycle`, which never installs that snippet. `p14-swap.sh`
+is a lab helper, not the production path:
 
 1. Add `RING_FRAME_NO_INTERRUPT` so a ring client can suppress completion
    interrupts for non-final frames.
@@ -178,6 +183,14 @@ Window B) but deployed only transiently via
 15. Skip the CLOSE toward a peer that already closed (its receive path
     returns no E2E credits, so the frame could never complete) and
     ratelimit the TX flush-timeout warning.
+16. Batch ring enqueue doorbell writes so a multi-frame message costs one
+    producer-index MMIO write instead of one per frame.
+17. Default interrupt throttling to 0 for the latency-bound zero-copy path.
+18. Advertise `TBSTREAM_ZC_SERIES` in the module banner and as a read-only
+    parameter so userspace can identify the loaded transport contract.
+19. Default the stream ring to the validated 4096-frame size.
+20. Skip `dma_sync_single_*()` on imported TX submit frames and read
+    `sdev->closed` under `zc_lock` before send_close.
 
 The original five-patch zero-copy implementation was built, deployed, and
 benchmarked on both test hosts; see
@@ -186,7 +199,8 @@ benchmarked on both test hosts; see
 `pingpong` tool provides `zping`/`zpong` for RTT and `ztx`/`zrx` for one-way
 throughput. The complete twelve-patch series was independently reviewed, built
 byte-identically, deployed, embedded in both initramfs images, and booted on the
-two test hosts. The isolated ABI and source-contract suite passes 40/40.
+two test hosts. The current twenty-patch source-contract suite is
+`make check-kernel` (CI plus local); it emits 45 TAP cases against series 20.
 
 The progress counters localized the asymmetric stall to a lost MSI-X
 notification, while the separate fresh-open failure showed zero hardware
@@ -212,14 +226,16 @@ Validate the complete series without changing the local kernel checkout:
 make -C kernel/tests test
 ```
 
-The 44-case test creates an isolated worktree, applies every zero-copy patch
+The 45-case test creates an isolated worktree, applies every zero-copy patch
 in order, compares the final UAPI with the userspace mirror, verifies its
 32/64-bit ABI, compiles and runs the SG-flatten geometry unit tests, and
-checks the ownership, failure, diagnostic, and teardown invariants, plus
-the patch-14/15 contracts: gated pre-activation transactional import,
+checks the ownership, failure, diagnostic, teardown, batch-doorbell, and
+series-20 contracts: gated pre-activation transactional import,
 reverse-order failure release, peer-close CLOSE suppression, ratelimited
-flush warnings, the dedicated imported-TX CLOSE frame, and mmap holes for
-imported halves.
+flush warnings, the dedicated imported-TX CLOSE frame, mmap holes for
+imported halves, page-backed-only TX submit sync, and locked CLOSE skip.
+CI runs this suite against a sparse v7.1.5 checkout plus the USB4STREAM
+backport; `make check` (UAPI/lifecycle) is a separate job.
 
 `TBSTREAM_ZC_ENABLE` is intended to run immediately after opening a fresh
 stream. It returns `EBUSY` if legacy TX is still in flight or any RX frame has

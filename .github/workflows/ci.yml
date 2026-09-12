@@ -16,3 +16,31 @@ jobs:
 
       - name: Host-independent test suite
         run: make check
+
+  check-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone Linux v7.1.5 (thunderbolt sparse)
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --sparse --depth 1 --branch v7.1.5 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            linux-ci
+          git -C linux-ci sparse-checkout set --cone \
+            drivers/thunderbolt \
+            drivers/net/thunderbolt \
+            include/linux \
+            include/uapi \
+            Documentation/ABI
+
+      - name: Apply USB4STREAM backport
+        run: |
+          set -euo pipefail
+          git -C linux-ci -c user.name=ci -c user.email=ci@localhost \
+            am "$GITHUB_WORKSPACE"/kernel/backport/v7.1/*.patch
+
+      - name: Zero-copy series contracts
+        run: make check-kernel KERNEL_SRC="$GITHUB_WORKSPACE/linux-ci"

@@ -1,4 +1,8 @@
+#ifdef TBSTREAM_TEST_USERSPACE
+#include "thunderbolt-stream.h"
+#else
 #include <linux/thunderbolt-stream.h>
+#endif
 
 #define OFFSET_OF(type, member) __builtin_offsetof(type, member)
 
@@ -88,6 +92,35 @@ _Static_assert(_IOC_DIR(TBSTREAM_ZC_DMABUF_PROBE) == (_IOC_READ | _IOC_WRITE),
 	       "DMABUF_PROBE ioctl direction changed");
 _Static_assert(_IOC_SIZE(TBSTREAM_ZC_DMABUF_PROBE) == 96,
 	       "DMABUF_PROBE ioctl size changed");
+
+_Static_assert(_Alignof(struct tbstream_zc_import_range) == 8,
+	       "import range must have one layout on 32-bit and 64-bit ABIs");
+_Static_assert(sizeof(struct tbstream_zc_import_range) == 24,
+	       "tbstream_zc_import_range ABI changed");
+_Static_assert(OFFSET_OF(struct tbstream_zc_import_range, offset) == 8,
+	       "import range offset changed");
+_Static_assert(OFFSET_OF(struct tbstream_zc_import_range, length) == 16,
+	       "import range length changed");
+
+_Static_assert(_Alignof(struct tbstream_zc_import) == 8,
+	       "import must have one layout on 32-bit and 64-bit ABIs");
+_Static_assert(sizeof(struct tbstream_zc_import) == 88,
+	       "tbstream_zc_import ABI changed");
+_Static_assert(OFFSET_OF(struct tbstream_zc_import, tx) == 8,
+	       "import tx range offset changed");
+_Static_assert(OFFSET_OF(struct tbstream_zc_import, rx) == 32,
+	       "import rx range offset changed");
+_Static_assert(OFFSET_OF(struct tbstream_zc_import, reserved) == 56,
+	       "import reserved offset changed");
+
+_Static_assert(_IOC_TYPE(TBSTREAM_ZC_IMPORT) == TBSTREAM_ZC_MAGIC,
+	       "IMPORT ioctl type changed");
+_Static_assert(_IOC_NR(TBSTREAM_ZC_IMPORT) == 0x09,
+	       "IMPORT ioctl number changed");
+_Static_assert(_IOC_DIR(TBSTREAM_ZC_IMPORT) == _IOC_WRITE,
+	       "IMPORT ioctl direction changed");
+_Static_assert(_IOC_SIZE(TBSTREAM_ZC_IMPORT) == 88,
+	       "IMPORT ioctl size changed");
 
 int main(void)
 {
