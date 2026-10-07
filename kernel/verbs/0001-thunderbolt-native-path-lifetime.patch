@@ -1,0 +1,334 @@
+From: strix-rdma contributors <devnull@localhost>
+Subject: [PATCH 1/2] thunderbolt: add nonblocking native path ownership for service teardown
+
+The native service worker must not wait for tb->lock while domain removal
+holds that lock and waits for service work. Add opt-in software-CM-only
+try operations and retire the exact admitted tuple before synchronous
+XDomain removal. Existing path APIs retain their blocking behavior.
+
+EAGAIN never transfers ownership. ENODEV from native disable is release-
+published only after core cleanup; DMA ring stop/join remains the client's
+responsibility. Domain stop retires native paths before generic tunnels.
+With CONFIG_INFINIBAND_STRIX_NHI disabled the new fields and APIs are
+compiled out. Three behavior-preserving pieces remain: the
+__tb_approve_xdomain_paths/tb_approve_xdomain_paths lock split, a tb_cm_ops
+forward declaration and a call to the empty tb_xdomain_remove_native_paths
+stub.
+
+---
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -279,6 +279,14 @@
+ 	u8 target_link_width;
+ 	u8 link;
+ 	u8 depth;
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++	/* Native service tuple is owned under tb->lock until exact cleanup.
++	 * native_dma_removed is release/acquire published after core cleanup. */
++	int native_tx_path, native_tx_ring, native_rx_path, native_rx_ring;
++	bool native_dma_active;
++	bool native_dma_stopping;
++	bool native_dma_removed;
++#endif
+ };
+ 
+ int tb_xdomain_lane_bonding_enable(struct tb_xdomain *xd);
+@@ -294,6 +302,12 @@
+ 			     int transmit_ring, int receive_path,
+ 			     int receive_ring);
+ 
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++int tb_xdomain_try_enable_native_paths(struct tb_xdomain *xd, int transmit_path,
++		int transmit_ring, int receive_path, int receive_ring);
++int tb_xdomain_try_disable_native_paths(struct tb_xdomain *xd);
++#endif
++
+ static inline int tb_xdomain_disable_all_paths(struct tb_xdomain *xd)
+ {
+ 	return tb_xdomain_disable_paths(xd, -1, -1, -1, -1);
+@@ -491,6 +505,9 @@
+ }
+ 
+ void tb_service_properties_changed(struct tb_service *svc);
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++int tb_service_try_native_properties_changed(struct tb_service *svc);
++#endif
+ 
+ /**
+  * struct tb_nhi - thunderbolt native host interface
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -1263,6 +1263,11 @@
+ 				    const uuid_t *remote_uuid);
+ void tb_xdomain_add(struct tb_xdomain *xd);
+ void tb_xdomain_remove(struct tb_xdomain *xd);
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++void tb_xdomain_remove_native_paths(struct tb_xdomain *xd);
++#else
++static inline void tb_xdomain_remove_native_paths(struct tb_xdomain *xd) { }
++#endif
+ struct tb_xdomain *tb_xdomain_find_by_link_depth(struct tb *tb, u8 link,
+ 						 u8 depth);
+ 
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -2155,6 +2155,10 @@
+  */
+ void tb_xdomain_remove(struct tb_xdomain *xd)
+ {
++	/* Software-CM callers hold tb->lock, including domain stop, scan,
++	 * unplug and resume cleanup. Retire native paths before any callback
++	 * or cancel_sync can wait for a service worker. ICM is a no-op here. */
++	tb_xdomain_remove_native_paths(xd);
+ 	tb_xdomain_debugfs_remove(xd);
+ 
+ 	stop_handshake(xd);
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -16,6 +16,8 @@
+ #include "tb_regs.h"
+ #include "tunnel.h"
+ 
++static const struct tb_cm_ops tb_cm_ops;
++
+ #define TB_TIMEOUT		100	/* ms */
+ #define TB_RELEASE_BW_TIMEOUT	10000	/* ms */
+ 
+@@ -2316,7 +2318,7 @@
+ 	return 0;
+ }
+ 
+-static int tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
++static int __tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
+ 				    int transmit_path, int transmit_ring,
+ 				    int receive_path, int receive_ring)
+ {
+@@ -2330,7 +2332,7 @@
+ 	dst_port = tb_port_at(xd->route, sw);
+ 	nhi_port = tb_switch_find_port(tb->root_switch, TB_TYPE_NHI);
+ 
+-	mutex_lock(&tb->lock);
++	lockdep_assert_held(&tb->lock);
+ 
+ 	/*
+ 	 * When tunneling DMA paths the link should not enter CL states
+@@ -2353,15 +2355,25 @@
+ 	}
+ 
+ 	list_add_tail(&tunnel->list, &tcm->tunnel_list);
+-	mutex_unlock(&tb->lock);
+ 	return 0;
+ 
+ err_free:
+ 	tb_tunnel_put(tunnel);
+ err_clx:
+ 	tb_enable_clx(sw);
+-	mutex_unlock(&tb->lock);
++
++	return ret;
++}
++
++static int tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
++		int transmit_path, int transmit_ring, int receive_path, int receive_ring)
++{
++	int ret;
+ 
++	mutex_lock(&tb->lock);
++	ret = __tb_approve_xdomain_paths(tb, xd, transmit_path, transmit_ring,
++				       receive_path, receive_ring);
++	mutex_unlock(&tb->lock);
+ 	return ret;
+ }
+ 
+@@ -2407,10 +2419,143 @@
+ 					      transmit_ring, receive_path,
+ 					      receive_ring);
+ 		mutex_unlock(&tb->lock);
++	}
++	return 0;
++}
++
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++/**
++ * tb_xdomain_try_enable_native_paths() - Nonblocking native DMA path admission
++ * @xd: XDomain (caller must keep its service alive)
++ * @transmit_path: Independently reserved output HopID
++ * @transmit_ring: Caller-owned TX ring HopID
++ * @receive_path: Independently reserved input HopID
++ * @receive_ring: Caller-owned RX ring HopID
++ *
++ * Software CM only, one native tuple per XDomain. -EAGAIN means tb->lock
++ * could not be acquired and NOTHING changed. -ENODEV rejects removal; other
++ * errors roll back activation. On success the caller must retain all four
++ * IDs/rings until try_disable returns 0 or -ENODEV. Existing path APIs keep
++ * their blocking semantics. No service work may wait for tb->lock on remove.
++ */
++int tb_xdomain_try_enable_native_paths(struct tb_xdomain *xd, int transmit_path,
++		int transmit_ring, int receive_path, int receive_ring)
++{
++	struct tb *tb = xd->tb;
++	int ret;
++
++	if (tb->cm_ops != &tb_cm_ops)
++		return -EOPNOTSUPP;
++	if (smp_load_acquire(&xd->native_dma_removed))
++		return -ENODEV;
++	if (!mutex_trylock(&tb->lock))
++		return -EAGAIN;
++	if (xd->native_dma_stopping || xd->native_dma_removed || xd->is_unplugged)
++		ret = -ENODEV;
++	else if (xd->native_dma_active)
++		ret = -EBUSY;
++	else if (transmit_path < 8 || receive_path < 8 ||
++		 transmit_ring < 1 || receive_ring < 1)
++		ret = -EINVAL;
++	else {
++		ret = __tb_approve_xdomain_paths(tb, xd, transmit_path,
++				transmit_ring, receive_path, receive_ring);
++		if (!ret) {
++			xd->native_tx_path = transmit_path;
++			xd->native_tx_ring = transmit_ring;
++			xd->native_rx_path = receive_path;
++			xd->native_rx_ring = receive_ring;
++			xd->native_dma_active = true;
++		}
+ 	}
++	mutex_unlock(&tb->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tb_xdomain_try_enable_native_paths);
++
++static void tb_release_native_paths(struct tb_xdomain *xd)
++{
++	lockdep_assert_held(&xd->tb->lock);
++	if (xd->native_dma_active) {
++		/* The tuple cannot be reused: its service still owns both rings and
++		 * both HopID reservations. Earlier core invalid-tunnel cleanup may
++		 * already have removed it; exact matching is then a safe no-op. */
++		__tb_disconnect_xdomain_paths(xd->tb, xd, xd->native_tx_path,
++			xd->native_tx_ring, xd->native_rx_path, xd->native_rx_ring);
++		xd->native_dma_active = false;
++	}
++}
++
++/**
++ * tb_xdomain_try_disable_native_paths() - Release the admitted native tuple
++ * @xd: XDomain with a tuple admitted by try_enable_native_paths()
++ *
++ * Returns 0 after exact tuple cleanup, -ENODEV after the removing core has
++ * already completed cleanup, or -EAGAIN with ownership UNCHANGED. Never waits
++ * for tb->lock. A service removing outside core removal may retry in its own
++ * process context, without its worker/object lock held, until local release.
++ * Removal from under tb->lock observes native_dma_removed without taking it.
++ * DMA must be locally stopped/joined separately before freeing any memory.
++ */
++int tb_xdomain_try_disable_native_paths(struct tb_xdomain *xd)
++{
++	struct tb *tb = xd->tb;
++
++	if (tb->cm_ops != &tb_cm_ops)
++		return -EOPNOTSUPP;
++	if (smp_load_acquire(&xd->native_dma_removed))
++		return -ENODEV;
++	if (!mutex_trylock(&tb->lock))
++		return -EAGAIN;
++	tb_release_native_paths(xd);
++	mutex_unlock(&tb->lock);
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(tb_xdomain_try_disable_native_paths);
+ 
++/**
++ * tb_service_try_native_properties_changed() - Publish without racing removal
++ * @svc: Native service whose local properties changed
++ *
++ * Serializes notification queueing with removal's stop_handshake. A plain
++ * flag check followed by tb_service_properties_changed() could enqueue work
++ * after removal canceled it. -EAGAIN requires retry; -ENODEV is terminal and
++ * queues nothing. Caller must not hold svc->lock. Existing API is unchanged.
++ */
++int tb_service_try_native_properties_changed(struct tb_service *svc)
++{
++	struct tb_xdomain *xd = tb_service_parent(svc);
++	struct tb *tb = xd->tb;
++	int ret = 0;
++
++	if (tb->cm_ops != &tb_cm_ops)
++		return -EOPNOTSUPP;
++	if (smp_load_acquire(&xd->native_dma_stopping))
++		return -ENODEV;
++	if (!mutex_trylock(&tb->lock))
++		return -EAGAIN;
++	if (xd->native_dma_stopping || xd->is_unplugged)
++		ret = -ENODEV;
++	else
++		tb_service_properties_changed(svc);
++	mutex_unlock(&tb->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tb_service_try_native_properties_changed);
++
++void tb_xdomain_remove_native_paths(struct tb_xdomain *xd)
++{
++	if (xd->tb->cm_ops != &tb_cm_ops)
++		return;
++	/* Every software-CM XDomain removal funnels through here, BEFORE
++	 * stop_handshake, service unbind and cancel_delayed_work_sync. */
++	lockdep_assert_held(&xd->tb->lock);
++	smp_store_release(&xd->native_dma_stopping, true);
++	tb_release_native_paths(xd);
++	smp_store_release(&xd->native_dma_removed, true);
++}
++#endif
++
+ /* hotplug handling */
+ 
+ /*
+@@ -2930,6 +3075,20 @@
+ 	tb_queue_hotplug(tb, route, pkg->port, pkg->unplug);
+ }
+ 
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++static void tb_stop_native_paths(struct tb_switch *sw)
++{
++	struct tb_port *port;
++
++	tb_switch_for_each_port(sw, port) {
++		if (tb_port_has_remote(port))
++			tb_stop_native_paths(port->remote->sw);
++		else if (port->xdomain)
++			tb_xdomain_remove_native_paths(port->xdomain);
++	}
++}
++#endif
++
+ static void tb_stop(struct tb *tb)
+ {
+ 	struct tb_cm *tcm = tb_priv(tb);
+@@ -2937,6 +3096,11 @@
+ 	struct tb_tunnel *n;
+ 
+ 	cancel_delayed_work(&tcm->remove_work);
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++	/* Publish native admission shutdown and retire its exact tuples BEFORE
++	 * generic tunnel destruction and synchronous service removal. */
++	tb_stop_native_paths(tb->root_switch);
++#endif
+ 	/* tunnels are only present after everything has been initialized */
+ 	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
+ 		/*
+@@ -2948,6 +3112,10 @@
+ 			tb_tunnel_deactivate(tunnel);
+ 		tb_tunnel_put(tunnel);
+ 	}
++	/* Native XDomain removal below may look for its exact tuple. All
++	 * tunnels above are deactivated/released: never traverse freed nodes. */
++	if (IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI))
++		INIT_LIST_HEAD(&tcm->tunnel_list);
+ 	tb_switch_remove(tb->root_switch);
+ 	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
+ }

@@ -1,10 +1,13 @@
-.PHONY: test check-uapi
+.PHONY: test check-uapi check-native-verbs
 
 CC ?= cc
 KERNEL_SRC ?= ../../linux
 
 test:
 	./test-zerocopy-series.sh "$(KERNEL_SRC)"
+
+check-native-verbs:
+	CC="$(CC)" CFLAGS="$(CFLAGS)" sh ./test-native-verbs.sh
 
 check-uapi:
 	$(CC) -std=c11 -Wall -Wextra -Werror -nostdinc \

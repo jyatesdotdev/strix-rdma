@@ -19,7 +19,7 @@ MODLOADDIR ?= /etc/modules-load.d
 SYSCONFDIR ?= /etc/sysconfig
 KERNEL_SRC ?= $(CURDIR)/linux
 
-.PHONY: all tools rocm check check-kernel install-lifecycle clean
+.PHONY: all tools rocm check check-kernel check-native-verbs install-lifecycle clean
 
 all: tools
 
@@ -39,6 +39,11 @@ check: tools
 
 check-kernel:
 	$(MAKE) -C kernel/tests test KERNEL_SRC="$(KERNEL_SRC)"
+
+# Experimental native-verbs offline behavior only; no build/install/live action.
+check-native-verbs:
+	$(MAKE) -C kernel/tests check-native-verbs
+	CC="$(CC)" CFLAGS="$(CFLAGS)" sh providers/strix_nhi/test-identity.sh
 
 # Installs the fail-closed tbstream lifecycle documented in
 # tools/systemd/tbstream-lifecycle.md. ROLE selects the sysconfig template;

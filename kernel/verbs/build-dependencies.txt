@@ -1,0 +1,40 @@
+Executed build: Linux arm64 userland, GCC 14.4.0; target kernel v7.1.5.
+Not a deployment configuration or x86_64 module qualification.
+
+Base image (public cached gcc:14):
+gcc@sha256:468b5b959b5f4025724d8549f45550c6ad38a32474733cbf130f8f2c1bc80805
+Debian 13/trixie arm64. Existing make 4.4.1-2, libssl-dev 3.5.6-1~deb13u2.
+Containers: uid/gid65534, cap-drop ALL, no-new-privileges, cpus2, memory4g,
+pids-limit256. Build network disabled. Public source transferred using stdin tar;
+no device, host-network, credential/private-source or host-filesystem mounts.
+
+Linux public source archive:
+https://github.com/gregkh/linux/archive/155b42bec9cbb6b8cdc47dd9bd09503a81fbe493.tar.gz
+SHA256 f734c376f0bb4ce8c4c607f59a9504e765a442a34db3b0a65c4441605aec4f96
+Prepared with all 8 kernel/backport/v7.1 and 20 kernel/zerocopy patches,
+then the native driver. Generated config, source hashes, Module.symvers and build
+logs are preserved in the workflow implementation evidence (see handoff artifact).
+
+Additional public Debian packages downloaded using authenticated apt metadata,
+extracted with dpkg-deb -x in container-owned /tmp as uid65534. No installation
+scripts executed. The apt container had ordinary isolated network access only.
+Package archive SHA256 pins:
+efd37aaf7324f2342eeae38c30009b7ebb2055ecabf1a5f7b22170360fd2bc7a  bc_1.07.1-4+b1_arm64.deb
+36b26ef0700504923089b4920e0bd704ff03de750515c90399cbc69bf43aed6d  bison_2%3a3.8.2+dfsg-1+b2_arm64.deb
+2b5f5aa509bc12ef82cc42b854704ff538efabea9824b49ed53418f1eba43d51  flex_2.6.4-8.2+b4_arm64.deb
+cc8a4f93ef8addf167b1a011a4b2ccb00060be51c6bffb2205f8438fa8c7527e  libelf-dev_0.192-4_arm64.deb
+815b4265c7d6c89c5bbad456bdeed7af893da6912c9d16cf4c581001927c0e37  libelf1t64_0.192-4_arm64.deb
+
+Executed compile: make -j2 vmlinux modules, then make W=1 -j2 vmlinux modules.
+W=1 inherited warnings: arm64/kernel/{sys,traps}.c override-initializers and
+existing drivers/thunderbolt/stream.c and lib/rhashtable.c kernel-doc warnings.
+The opt-in native core extension was built enabled and disabled; the default-off
+build has no native module entry or native path API exports.
+Portable tests: Darwin clang21 ASan/UBSan and Linux GCC14 ASan/UBSan.
+These tests model transport/MR/CQ adapters; no target-kernel code was executed.
+
+Non-successful preparation attempts (retained in handoff): Docker rejected a
+Darwin /tmp bind path; corrected to stdin transfer with supervisor approval.
+Docker rejected cpus4 because the daemon has two CPUs; corrected to cpus2.
+Initial native object build exposed create_user_cq callback signature mismatch;
+corrected to actual v7.1.5 uverbs_attr_bundle API before successful builds.

@@ -1,0 +1,42 @@
+Executed provider build: Linux aarch64, GCC14.4.0, CMake3.31.6, rdma-core v62.0.
+Not an x86_64 deployment build or a live-device test.
+
+Base image:
+gcc@sha256:468b5b959b5f4025724d8549f45550c6ad38a32474733cbf130f8f2c1bc80805
+Debian13/trixie arm64; kernel dependency pins are in kernel/verbs/build-dependencies.txt.
+
+rdma-core commit: 31af04ec84378724cb6256814d4ffde359a7123b
+Archive: https://codeload.github.com/linux-rdma/rdma-core/tar.gz/31af04ec84378724cb6256814d4ffde359a7123b
+SHA256: 8df90e5882d8e7c7fc95e7cb6bb00ea231aed9eeb9b9ae99c855aab3724344a4
+
+Additional public Debian packages, downloaded via authenticated apt metadata and
+extracted with dpkg-deb -x as uid65534; no package installation or maintainer scripts.
+Exact archive SHA256:
+983aa00debd072f7bfae69f93b1b9e4628da0a914c3745b9022e4cd60215493b  cmake_3.31.6-2_arm64.deb
+d9060145be892f43cd1888024114ceab019c81479d4b0a3383fe14cebe2295cb  cmake-data_3.31.6-2_all.deb
+346da1614a66ae07549243f2abf1dc5fdcc590a4ccb408458b5ea7ef7997477d  libjsoncpp26_1.9.6-3_arm64.deb
+0489548a052d64b1acf7f61b0f08fd2da954b6fd6b9c729a4e740d7d39652d00  libnl-3-200_3.7.0-2_arm64.deb
+6832cb3cd490d166e4d07e24b11850148b02f25cdb6a1607dd20790657bbf8f3  libnl-3-dev_3.7.0-2_arm64.deb
+86cd5b58c83cd70a834625f112a6c30da249bb842c4ac4daa44fd4c08298b7be  libnl-route-3-200_3.7.0-2_arm64.deb
+137bb608ae47bd47909fe21041441325f90deee63a44a60b61f9595dfecea314  libnl-route-3-dev_3.7.0-2_arm64.deb
+8a9477ed7af47d7ddefa1fe02bf9f87d6778e8cc59062064f1b076880a7a14a5  libpkgconf3_1.8.1-4_arm64.deb
+3bee5b995ee3219779d0f50b2622b0fbc05bb89c69fa833c83d685a3c88aa73d  librhash1_1.4.5-1_arm64.deb
+a9be0f24d7686ba94a6ef4f3c638079c6b39c4263306860d51046c4125d065f4  libuv1t64_1.50.0-2_arm64.deb
+aaf89947e9a5a6d980d14f43dfde8d0ad4e869b5cd33567321ca8baeb7ee7740  pkgconf_1.8.1-4_arm64.deb
+bce0638102650b61224901da320c2f867a91cfc133532a5fb526d2ce05465fe6  pkgconf-bin_1.8.1-4_arm64.deb
+
+Compile containers: network-none, uid/gid65534, cap-drop ALL, no-new-privileges,
+cpus2, memory3g, pids-limit256. Only public inputs transferred via stdin tar;
+no device/private/host mounts. Dependency download container used ordinary
+isolated network, same uid/capability restrictions. No host installation.
+
+Environment after extracting packages to /tmp/deps:
+PATH=/tmp/deps/usr/bin:$PATH
+LD_LIBRARY_PATH=/tmp/deps/usr/lib/aarch64-linux-gnu
+PKG_CONFIG_SYSROOT_DIR=/tmp/deps
+PKG_CONFIG_LIBDIR=/tmp/deps/usr/lib/aarch64-linux-gnu/pkgconfig
+
+Optional missing upstream features: libudev, libsystemd, Valgrind, pyverbs,
+manpages. Native provider uses standard commands and does not require these.
+No errors suppressed in provider code; tests treat rdma-core private headers as
+system includes due to their existing unused-parameter warnings.

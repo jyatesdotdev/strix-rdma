@@ -1,0 +1,2156 @@
+From: strix-rdma contributors <devnull@localhost>
+Subject: [PATCH 2/2] RDMA: add opt-in experimental native NHI software verbs
+
+Apply after the v7.1 backport, zero-copy series20, and the opt-in native
+path-lifetime core patch. This patch only adds the new native driver. Default off; no module-device alias; enable=1 is required.
+This implementation is experimental and has not passed hardware/DS4 gates.
+Canonical source and validation boundaries are in kernel/verbs/README.md.
+
+---
+diff --git a/drivers/infiniband/Kconfig b/drivers/infiniband/Kconfig
+--- a/drivers/infiniband/Kconfig
++++ b/drivers/infiniband/Kconfig
+@@ -112,3 +112,5 @@
+ source "drivers/infiniband/ulp/rtrs/Kconfig"
+ 
++source "drivers/infiniband/hw/strix_nhi/Kconfig"
++
+ endif # INFINIBAND
+diff --git a/drivers/infiniband/Makefile b/drivers/infiniband/Makefile
+--- a/drivers/infiniband/Makefile
++++ b/drivers/infiniband/Makefile
+@@ -3,3 +3,4 @@
+ obj-$(CONFIG_INFINIBAND)		+= hw/
+ obj-$(CONFIG_INFINIBAND)		+= ulp/
+ obj-$(CONFIG_INFINIBAND)		+= sw/
++obj-$(CONFIG_INFINIBAND_STRIX_NHI) += hw/strix_nhi/
+diff --git a/drivers/infiniband/hw/strix_nhi/Kconfig b/drivers/infiniband/hw/strix_nhi/Kconfig
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/Kconfig
+@@ -0,0 +1,13 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config INFINIBAND_STRIX_NHI
++	tristate "Experimental native NHI software verbs"
++	depends on INFINIBAND_USER_ACCESS && INFINIBAND_USER_MEM
++	depends on USB4 && USB4_NET && NET && INET && PCI
++	select INFINIBAND_VIRT_DMA
++	default n
++	help
++	  CPU-copy software RC SEND/RECV, READ and WRITE using independent
++	  Thunderbolt XDomain NHI rings. This is not RoCE or RNIC offload.
++	  Requires the Strix series20 Thunderbolt backports, a same-XDomain
++	  thunderbolt-net device, and explicit enable=1 at module load.
++	  Experimental: hardware and peer-loss qualification is outstanding.
+diff --git a/drivers/infiniband/hw/strix_nhi/Makefile b/drivers/infiniband/hw/strix_nhi/Makefile
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_INFINIBAND_STRIX_NHI) += strix_nhi.o
++strix_nhi-y := main.o ring.o verbs.o mr.o protocol.o
+diff --git a/drivers/infiniband/hw/strix_nhi/native_wire.h b/drivers/infiniband/hw/strix_nhi/native_wire.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/native_wire.h
+@@ -0,0 +1,248 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef STRIX_NHI_NATIVE_WIRE_H
++#define STRIX_NHI_NATIVE_WIRE_H
++
++#ifdef __KERNEL__
++#include <linux/types.h>
++#include <linux/string.h>
++typedef u8 sn_u8;
++typedef u32 sn_u32;
++typedef u64 sn_u64;
++#else
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++typedef uint8_t sn_u8;
++typedef uint32_t sn_u32;
++typedef uint64_t sn_u64;
++#endif
++
++#define SN_MAGIC 0x534e4831U /* SNH1; not compatible with USB4STREAM or TVD1 */
++#define SN_VERSION 1U
++#define SN_HEADER 112U
++#define SN_FRAME 4096U
++#define SN_PAYLOAD (SN_FRAME - SN_HEADER)
++#define SN_MESSAGE (2U * 1024U * 1024U)
++#define SN_QUEUE_DEPTH 4U
++#define SN_MAX_CQE 64U
++#define SN_MAX_MRS 4U
++#define SN_MR_BYTES (8U * 1024U * 1024U)
++#define SN_PIN_BYTES (32U * 1024U * 1024U)
++#define SN_PSN_MAX 0xffffffU
++
++/* Values and byte offsets are a wire contract, never a C structure layout. */
++enum sn_opcode {
++	SN_SEND = 1, SN_WRITE = 2, SN_READ = 3, SN_READ_REPLY = 4,
++	SN_ACK = 5, SN_READ_ACK = 6, SN_CREDIT = 7,
++	SN_HELLO = 8, SN_HELLO_ACK = 9, SN_BIND = 10, SN_BIND_ACK = 11
++};
++/* HELLO/HELLO_ACK capability bits in total: v1 is SEND/WRITE/READ. */
++#define SN_CAPS_V1 0x7U
++#define SN_CAPS_KNOWN SN_CAPS_V1
++enum sn_status {
++	SN_OK = 0, SN_RNR = 1, SN_ACCESS = 2, SN_LENGTH = 3,
++	SN_PROTOCOL = 4
++};
++struct sn_header {
++	sn_u32 opcode, total, src_qpn, dst_qpn;
++	sn_u64 src_generation, dst_generation, src_epoch, dst_epoch;
++	sn_u64 sequence, ack_sequence;
++	sn_u32 offset, length;
++	sn_u64 address;
++	sn_u32 rkey, status;
++};
++struct sn_binding {
++	sn_u64 local_epoch, peer_epoch, local_generation, peer_generation;
++	sn_u32 local_qpn, peer_qpn;
++};
++struct sn_readiness {
++	sn_u64 local_epoch, peer_epoch, local_echo, peer_echo;
++	unsigned int rx_primed, rings_started, paths_active, peer_ready, carrier;
++};
++
++static inline sn_u32 sn_get32(const sn_u8 *p)
++{
++	return (sn_u32)p[0] << 24 | (sn_u32)p[1] << 16 |
++	       (sn_u32)p[2] << 8 | p[3];
++}
++static inline sn_u64 sn_get64(const sn_u8 *p)
++{
++	return (sn_u64)sn_get32(p) << 32 | sn_get32(p + 4);
++}
++static inline void sn_put32(sn_u8 *p, sn_u32 v)
++{
++	p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
++}
++static inline void sn_put64(sn_u8 *p, sn_u64 v)
++{
++	sn_put32(p, v >> 32); sn_put32(p + 4, (sn_u32)v);
++}
++/* CRC field 96..99 is logically zero. No authentication is implied. */
++static inline sn_u32 sn_crc(const sn_u8 *p, size_t n)
++{
++	sn_u32 crc = ~0U;
++	size_t i;
++	unsigned int bit;
++
++	for (i = 0; i < n; i++) {
++		crc ^= (i >= 96 && i < 100) ? 0 : p[i];
++		for (bit = 0; bit < 8; bit++)
++			crc = (crc >> 1) ^ (0x82f63b78U & (0U - (crc & 1)));
++	}
++	return ~crc;
++}
++static inline int sn_qp_fields_valid(const struct sn_header *h)
++{
++	return h->src_qpn && h->src_qpn <= SN_PSN_MAX && h->dst_qpn &&
++	       h->dst_qpn <= SN_PSN_MAX && h->src_generation &&
++	       h->dst_generation && h->src_epoch && h->dst_epoch;
++}
++static inline int sn_header_valid(const struct sn_header *h)
++{
++	if (h->total > SN_MESSAGE || h->length > SN_PAYLOAD ||
++	    h->offset > h->total || h->length > h->total - h->offset)
++		return 0;
++	switch (h->opcode) {
++	case SN_SEND:
++	case SN_READ_REPLY:
++	case SN_WRITE:
++		if (!sn_qp_fields_valid(h)) return 0;
++		if (h->opcode != SN_WRITE && (h->address || h->rkey))
++			return 0;
++		if (h->status || h->ack_sequence ||
++		    (h->total && !h->length) ||
++		    (!h->total && (h->length || h->offset)))
++			return 0;
++		if (h->opcode == SN_WRITE && (!h->rkey ||
++		    h->address > ~(sn_u64)0 - h->total))
++			return 0;
++		return 1;
++	case SN_READ:
++		return sn_qp_fields_valid(h) && !h->length && !h->offset && !h->status &&
++		       !h->ack_sequence && h->rkey &&
++		       h->address <= ~(sn_u64)0 - h->total;
++	case SN_ACK:
++		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
++		       !h->address && !h->rkey && !h->sequence && h->status <= SN_PROTOCOL;
++	case SN_READ_ACK:
++		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
++		       !h->address && !h->rkey && !h->sequence && !h->status;
++	case SN_CREDIT:
++		/* Sequence is a monotonic credit revision, total is available RQ. */
++		return sn_qp_fields_valid(h) && h->total <= SN_QUEUE_DEPTH && !h->length &&
++		       !h->offset && !h->address && !h->rkey && !h->status && !h->ack_sequence;
++	case SN_HELLO:
++		/* dst_epoch is 0 until the peer is known; total carries capabilities. */
++		return h->src_epoch && h->total && !(h->total & ~SN_CAPS_KNOWN) &&
++		       !h->src_qpn && !h->dst_qpn && !h->src_generation &&
++		       !h->dst_generation && !h->sequence && !h->ack_sequence &&
++		       !h->offset && !h->length && !h->address && !h->rkey && !h->status;
++	case SN_HELLO_ACK:
++		return h->src_epoch && h->dst_epoch && h->total &&
++		       !(h->total & ~SN_CAPS_KNOWN) &&
++		       !h->src_qpn && !h->dst_qpn && !h->src_generation &&
++		       !h->dst_generation && !h->sequence && !h->ack_sequence &&
++		       !h->offset && !h->length && !h->address && !h->rkey && !h->status;
++	case SN_BIND:
++		/* dst_generation is 0; the ACK echoes it. sequence/ack are our PSNs. */
++		return h->src_qpn && h->src_qpn <= SN_PSN_MAX && h->dst_qpn &&
++		       h->dst_qpn <= SN_PSN_MAX && h->src_generation &&
++		       !h->dst_generation && h->src_epoch && h->dst_epoch &&
++		       h->sequence <= SN_PSN_MAX && h->ack_sequence <= SN_PSN_MAX &&
++		       !h->total && !h->offset && !h->length && !h->address &&
++		       !h->rkey && !h->status;
++	case SN_BIND_ACK:
++		return h->src_qpn && h->src_qpn <= SN_PSN_MAX && h->dst_qpn &&
++		       h->dst_qpn <= SN_PSN_MAX && h->src_generation &&
++		       h->dst_generation && h->src_epoch && h->dst_epoch &&
++		       h->sequence <= SN_PSN_MAX && h->ack_sequence <= SN_PSN_MAX &&
++		       !h->total && !h->offset && !h->length && !h->address &&
++		       !h->rkey && !h->status;
++	default:
++		return 0;
++	}
++}
++/* Caller supplies payload at frame + SN_HEADER before encoding. */
++static inline int sn_encode(sn_u8 *frame, size_t capacity,
++			    const struct sn_header *h)
++{
++	if (!sn_header_valid(h) || capacity < SN_HEADER + h->length)
++		return -1;
++	memset(frame, 0, SN_HEADER);
++	sn_put32(frame, SN_MAGIC);
++	frame[4] = SN_VERSION;
++	frame[7] = SN_HEADER;
++	frame[8] = h->opcode;
++	sn_put32(frame + 12, h->total);
++	sn_put32(frame + 16, h->src_qpn);
++	sn_put32(frame + 20, h->dst_qpn);
++	sn_put64(frame + 24, h->src_generation);
++	sn_put64(frame + 32, h->dst_generation);
++	sn_put64(frame + 40, h->src_epoch);
++	sn_put64(frame + 48, h->dst_epoch);
++	sn_put64(frame + 56, h->sequence);
++	sn_put64(frame + 64, h->ack_sequence);
++	sn_put32(frame + 72, h->offset);
++	sn_put32(frame + 76, h->length);
++	sn_put64(frame + 80, h->address);
++	sn_put32(frame + 88, h->rkey);
++	sn_put32(frame + 92, h->status);
++	sn_put32(frame + 96, sn_crc(frame, SN_HEADER + h->length));
++	return 0;
++}
++static inline int sn_decode(struct sn_header *h, const sn_u8 *p, size_t n)
++{
++	struct sn_header v;
++	size_t i;
++
++	if (n < SN_HEADER || n > SN_FRAME || sn_get32(p) != SN_MAGIC ||
++	    p[4] != SN_VERSION || p[5] || p[6] || p[7] != SN_HEADER ||
++	    p[9] || p[10] || p[11])
++		return -1;
++	for (i = 100; i < SN_HEADER; i++)
++		if (p[i])
++			return -1;
++	if (sn_get32(p + 76) != n - SN_HEADER || sn_get32(p + 96) != sn_crc(p, n))
++		return -1;
++	memset(&v, 0, sizeof(v));
++	v.opcode = p[8]; v.total = sn_get32(p + 12);
++	v.src_qpn = sn_get32(p + 16); v.dst_qpn = sn_get32(p + 20);
++	v.src_generation = sn_get64(p + 24); v.dst_generation = sn_get64(p + 32);
++	v.src_epoch = sn_get64(p + 40); v.dst_epoch = sn_get64(p + 48);
++	v.sequence = sn_get64(p + 56); v.ack_sequence = sn_get64(p + 64);
++	v.offset = sn_get32(p + 72); v.length = sn_get32(p + 76);
++	v.address = sn_get64(p + 80); v.rkey = sn_get32(p + 88);
++	v.status = sn_get32(p + 92);
++	if (!sn_header_valid(&v))
++		return -1;
++	*h = v;
++	return 0;
++}
++static inline int sn_ready(const struct sn_readiness *r)
++{
++	return r->local_epoch && r->peer_epoch &&
++	       r->local_echo == r->peer_epoch && r->peer_echo == r->local_epoch &&
++	       r->rx_primed && r->rings_started && r->paths_active &&
++	       r->peer_ready && r->carrier;
++}
++/* Local state sufficient to carry handshake frames; data still needs sn_ready. */
++static inline int sn_local_ready(const struct sn_readiness *r)
++{
++	return r->local_epoch && r->rings_started && r->paths_active &&
++	       r->rx_primed && r->carrier;
++}
++static inline int sn_admit(const struct sn_binding *b, const struct sn_header *h)
++{
++	return b->local_epoch && b->peer_epoch && b->local_generation &&
++	       b->peer_generation && b->local_qpn && b->peer_qpn &&
++	       h->src_epoch == b->peer_epoch && h->dst_epoch == b->local_epoch &&
++	       h->src_generation == b->peer_generation &&
++	       h->dst_generation == b->local_generation &&
++	       h->src_qpn == b->peer_qpn && h->dst_qpn == b->local_qpn;
++}
++static inline int sn_range(sn_u64 base, sn_u64 size, sn_u64 address, sn_u64 length)
++{
++	return size <= ~(sn_u64)0 - base && address >= base &&
++	       address - base <= size && length <= size - (address - base);
++}
++#endif
+diff --git a/drivers/infiniband/hw/strix_nhi/native_order.h b/drivers/infiniband/hw/strix_nhi/native_order.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/native_order.h
+@@ -0,0 +1,85 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef STRIX_NHI_NATIVE_ORDER_H
++#define STRIX_NHI_NATIVE_ORDER_H
++#include "native_wire.h"
++
++/* One ordered operation per direction. Storage/copies and MR ownership are
++ * deliberately supplied by the caller; progress is committed after copying. */
++struct sn_assembly {
++	struct sn_header operation, replay;
++	sn_u64 expected;
++	sn_u32 received, replay_status;
++	unsigned int active, have_replay;
++};
++enum sn_fragment_result {
++	SN_FRAGMENT_DROP, SN_FRAGMENT_START, SN_FRAGMENT_APPEND,
++	SN_FRAGMENT_DUPLICATE, SN_FRAGMENT_REPLAY, SN_FRAGMENT_INVALID
++};
++static inline int sn_same_operation(const struct sn_header *a,
++				     const struct sn_header *b)
++{
++	return a->opcode == b->opcode && a->sequence == b->sequence &&
++	       a->total == b->total && a->address == b->address && a->rkey == b->rkey;
++}
++/* Binding and wire validation MUST precede this operation-level check. */
++static inline enum sn_fragment_result
++sn_fragment(const struct sn_assembly *a, const struct sn_header *h)
++{
++	if (a->have_replay && h->sequence == a->replay.sequence)
++		return sn_same_operation(&a->replay, h) ?
++			SN_FRAGMENT_REPLAY : SN_FRAGMENT_INVALID;
++	if (h->sequence != a->expected || a->expected == ~(sn_u64)0)
++		return SN_FRAGMENT_DROP;
++	if (!a->active)
++		return h->offset ? SN_FRAGMENT_DROP : SN_FRAGMENT_START;
++	if (!sn_same_operation(&a->operation, h))
++		return SN_FRAGMENT_INVALID;
++	if (h->offset < a->received)
++		return h->length <= a->received - h->offset ?
++			SN_FRAGMENT_DUPLICATE : SN_FRAGMENT_INVALID;
++	return h->offset == a->received ? SN_FRAGMENT_APPEND : SN_FRAGMENT_DROP;
++}
++static inline void sn_fragment_commit(struct sn_assembly *a,
++				       const struct sn_header *h)
++{
++	if (!a->active) {
++		a->operation = *h;
++		a->received = 0;
++		a->active = 1;
++	}
++	a->received += h->length;
++}
++static inline void sn_operation_commit(struct sn_assembly *a, sn_u32 status)
++{
++	a->replay = a->operation;
++	a->replay_status = status;
++	a->have_replay = 1;
++	a->active = 0;
++	a->received = 0;
++	a->expected++;
++}
++/* Verbs timeout unit is 4.096 us * 2^timeout; 0 is unbounded and rejected.
++ * Return nanoseconds so timer rounding cannot shorten the accepted interval. */
++static inline sn_u64 sn_ack_timeout_ns(unsigned int timeout)
++{
++	return timeout && timeout <= 31 ? (sn_u64)4096 << timeout : 0;
++}
++static inline sn_u64 sn_rnr_timeout_ns(unsigned int timer)
++{
++	static const sn_u32 usec[32] = {
++		655360, 10, 20, 30, 40, 60, 80, 120,
++		160, 240, 320, 480, 640, 960, 1280, 1920,
++		2560, 3840, 5120, 7680, 10240, 15360, 20480, 30720,
++		40960, 61440, 81920, 122880, 163840, 245760, 327680, 491520
++	};
++	return timer < 32 ? (sn_u64)usec[timer] * 1000 : 0;
++}
++/* Limit counts retransmissions after the initial attempt. */
++static inline int sn_retry_take(unsigned int *used, unsigned int limit)
++{
++	if (limit > 6 || *used >= limit)
++		return 0;
++	++*used;
++	return 1;
++}
++#endif
+diff --git a/drivers/infiniband/hw/strix_nhi/native_platform.h b/drivers/infiniband/hw/strix_nhi/native_platform.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/native_platform.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef STRIX_NHI_NATIVE_PLATFORM_H
++#define STRIX_NHI_NATIVE_PLATFORM_H
++#include "native_wire.h"
++
++/* v7.1.5 icm_probe has no case for these Strix Halo device IDs; nhi_select_cm
++ * therefore always selects software CM. Firmware CM can disconnect other
++ * services' paths, so widening this predicate requires a fresh core audit. */
++static inline int sn_supported_nhi(sn_u32 vendor, sn_u32 device)
++{
++	return vendor == 0x1022 && (device == 0x158d || device == 0x158e);
++}
++#endif
+diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
+@@ -0,0 +1,137 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef STRIX_NHI_H
++#define STRIX_NHI_H
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/netdevice.h>
++#include <linux/thunderbolt.h>
++#include <linux/workqueue.h>
++#include <rdma/ib_verbs.h>
++#include <rdma/ib_umem.h>
++#include "native_order.h"
++
++#define SN_ABI 1
++#define SN_RING_SIZE 64
++#define SN_CONTROL_RESERVE 8
++#define SN_SERVICE "strixv1"
++#define SN_CONTROL_BYTES 112
++/* Handshake retransmission intervals; loss is expected, peers retransmit. */
++#define SN_HELLO_INTERVAL_NS 100000000ULL
++#define SN_BIND_INTERVAL_NS 100000000ULL
++#define SN_ACCESS_FLAGS (IB_ACCESS_LOCAL_WRITE | IB_ACCESS_REMOTE_WRITE | IB_ACCESS_REMOTE_READ)
++
++struct sn_device;
++struct sn_mr {
++	struct ib_mr ib;
++	struct ib_umem *umem;
++	struct list_head entry;
++	u64 base, size, pinned;
++	u32 access;
++	unsigned int users;
++};
++struct sn_cq {
++	struct ib_cq ib;
++	struct ib_wc entries[SN_MAX_CQE];
++	unsigned int head, count, notify;
++	bool failed;
++};
++struct sn_wqe {
++	struct sn_mr *mr;
++	u64 id, address, remote_address;
++	u32 length, rkey, opcode, flags;
++};
++struct sn_qp {
++	struct ib_qp ib;
++	struct ib_qp_attr attr;
++	struct ib_qp_init_attr init;
++	struct sn_binding binding;
++	struct sn_wqe sq[SN_QUEUE_DEPTH], rq[SN_QUEUE_DEPTH];
++	unsigned int sq_head, sq_count, rq_head, rq_count;
++	u8 *outgoing, *incoming, *read_snapshot, *read_incoming;
++	struct sn_assembly receive, read_receive;
++	struct sn_header read_request;
++	struct sn_mr *remote_mr;
++	u64 next_sequence, last_read, deadline, progress_deadline;
++	u64 response_deadline, assembly_deadline, credit_revision;
++	u32 last_credit;
++	u32 outgoing_offset, response_offset, last_read_length;
++	unsigned int retries, rnr_retries, response_retries;
++	bool active, outgoing_sent, response_active, response_sent, have_last_read, rnr_wait;
++	bool bound, all_signaled, destroying, credit_sent;
++	/* Next BIND retransmission while unbound (ktime ns). */
++	u64 next_bind;
++};
++struct sn_slot {
++	struct ring_frame frame;
++	struct sn_device *device;
++	void *buffer;
++	bool done, canceled;
++};
++struct sn_device {
++	struct ib_device ib;
++	struct tb_service *service;
++	struct net_device *netdev;
++	struct notifier_block net_notifier;
++	/* Serializes uverbs objects, worker copies, admission, and property state.
++	 * Ring callbacks only set slot flags under ring_lock; never take lock. */
++	struct mutex lock;
++	spinlock_t ring_lock;
++	struct delayed_work work;
++	struct tb_ring *tx_ring, *rx_ring;
++	struct sn_slot tx[SN_RING_SIZE], rx[SN_RING_SIZE];
++	unsigned int tx_head, tx_tail, rx_tail;
++	int in_hop, out_hop;
++	bool paths_active, rings_started, rx_primed, dead, registered, net_gone;
++	bool reset_rings, static_published;
++	bool have_context, have_pd;
++	unsigned int cq_count, mr_count;
++	u64 pinned, key_serial, qpn_serial;
++	u64 tx_frames, rx_frames, bad_frames, send_bytes, write_bytes, read_bytes;
++	struct list_head mrs;
++	struct sn_qp *qp;
++	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
++	struct ib_qp wc_qp[2];
++	struct sn_readiness ready;
++	union ib_gid gid, peer_gid;
++	/* Control frames have priority over data; coalescing is by ACK identity. */
++	struct sn_header control[16];
++	unsigned int control_head, control_count;
++	/* Consecutive invalid remote directory snapshots; see sn_snapshot_check(). */
++	unsigned int invalid_snapshots;
++	/* Next allowed renotification while not ready; see sn_work(). */
++	unsigned long renotify_after;
++	/* Next HELLO retransmission (ktime ns); session handshake is timer-driven. */
++	u64 next_hello;
++};
++static inline struct sn_device *sn_dev(struct ib_device *ib)
++{
++	return container_of(ib, struct sn_device, ib);
++}
++static inline struct sn_qp *sn_qp(struct ib_qp *ib)
++{
++	return container_of(ib, struct sn_qp, ib);
++}
++static inline struct sn_cq *sn_cq(struct ib_cq *ib)
++{
++	return container_of(ib, struct sn_cq, ib);
++}
++extern const struct ib_device_ops sn_verbs_ops;
++struct ib_mr *sn_reg_user_mr(struct ib_pd *, u64, u64, u64, int,
++			   struct ib_dmah *, struct ib_udata *);
++int sn_dereg_mr(struct ib_mr *, struct ib_udata *);
++void sn_schedule(struct sn_device *d);
++int sn_publish(struct sn_device *d);
++void sn_qp_error(struct sn_qp *q, enum ib_wc_status status);
++int sn_complete(struct sn_qp *q, struct sn_wqe *w, bool receive,
++		enum ib_wc_status status, u32 length);
++struct sn_mr *sn_mr_get(struct sn_qp *q, u32 key, u64 address, u32 length, u32 access);
++void sn_mr_put(struct sn_mr *m);
++int sn_mr_copy(struct sn_mr *m, u64 address, void *buffer, u32 length, bool to_mr);
++int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *payload, bool control);
++int sn_rings_start(struct sn_device *d);
++int sn_rings_stop(struct sn_device *d);
++void sn_ring_receive(struct sn_device *d);
++void sn_engine_receive(struct sn_device *d, const void *frame, size_t bytes);
++void sn_engine_progress(struct sn_device *d);
++void sn_engine_reset(struct sn_qp *q);
++#endif
+diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/strix_nhi/main.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/main.c
+@@ -0,0 +1,327 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/etherdevice.h>
++#include <linux/delay.h>
++#include <linux/random.h>
++#include <linux/pci.h>
++#include <linux/rtnetlink.h>
++#include <net/net_namespace.h>
++#include <rdma/ib_user_verbs.h>
++#include "strix_nhi.h"
++#include "native_platform.h"
++
++static bool enable;
++module_param(enable, bool, 0400);
++MODULE_PARM_DESC(enable, "Explicitly enable experimental native NHI software verbs");
++static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
++				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
++static struct tb_property_dir *sn_directory;
++
++void sn_schedule(struct sn_device *d)
++{
++	if (READ_ONCE(d->registered) && !READ_ONCE(d->dead))
++		mod_delayed_work(system_unbound_wq, &d->work, 0);
++}
++static void sn_gid_from_uuid(union ib_gid *gid, const uuid_t *uuid)
++{
++	memset(gid, 0, sizeof(*gid));
++	gid->raw[0] = 0xfe; gid->raw[1] = 0x80;
++	memcpy(gid->raw + 8, uuid->b + 8, 8);
++}
++/* Static rendezvous: one immediate per service incarnation, published once.
++ * The dynamic session handshake is wire-carried (HELLO/BIND), so the property
++ * channel only ever carries this single inline VALUE, the class of property
++ * that round-trips reliably. */
++int sn_publish(struct sn_device *d)
++{
++	struct tb_service *svc = d->service;
++	struct tb_property_dir *dir, *old;
++	int ret;
++
++	dir = tb_property_create_dir(&sn_uuid);
++	if (!dir) return -ENOMEM;
++	ret = tb_property_add_immediate(dir, "rxhop", d->in_hop);
++	if (ret) { tb_property_free_dir(dir); return ret; }
++	mutex_lock(&svc->lock);
++	old = svc->local_properties;
++	svc->local_properties = dir;
++	mutex_unlock(&svc->lock);
++	tb_property_free_dir(old);
++	return tb_service_try_native_properties_changed(svc);
++}
++static int sn_remote_rxhop(struct sn_device *d, u64 *hop)
++{
++	struct tb_service *svc = d->service;
++	struct tb_property *p;
++	int ret = -EAGAIN;
++
++	mutex_lock(&svc->lock);
++	if (svc->remote_properties && uuid_equal(svc->remote_properties->uuid, &sn_uuid)) {
++		p = tb_property_find(svc->remote_properties, "rxhop", TB_PROPERTY_TYPE_VALUE);
++		if (p) { *hop = p->value.immediate; ret = 0; }
++	}
++	mutex_unlock(&svc->lock);
++	return ret;
++}
++static int sn_refresh(struct sn_device *d)
++{
++	struct tb_xdomain *xd = tb_service_parent(d->service);
++	u64 hop;
++	int ret;
++
++	if (d->out_hop < 0) {
++		ret = sn_remote_rxhop(d, &hop);
++		if (ret) return ret;
++		if (hop < 8 || hop > xd->remote_max_hopid) return -EPROTO;
++		ret = tb_xdomain_alloc_out_hopid(xd, hop);
++		if (ret < 0) return ret;
++		if (ret != hop) { tb_xdomain_release_out_hopid(xd, ret); return -EBUSY; }
++		d->out_hop = ret;
++	}
++	if (!d->rings_started && d->ready.carrier)
++		return sn_rings_start(d);
++	return 0;
++}
++static void sn_work(struct work_struct *work)
++{
++	struct sn_device *d = container_of(to_delayed_work(work), struct sn_device, work);
++	bool active, was_active;
++	int ret;
++
++	mutex_lock(&d->lock);
++	if (d->dead) { mutex_unlock(&d->lock); return; }
++	was_active = sn_ready(&d->ready);
++	d->ready.carrier = d->netdev && netif_running(d->netdev) && netif_carrier_ok(d->netdev);
++	ret = 0;
++	/* Latch even a down/up event entirely between worker passes. Do not
++	 * overwrite the loss with current carrier and reuse the old DMA paths. */
++	if (d->reset_rings) {
++		ret = sn_rings_stop(d);
++		if (!ret) d->reset_rings = false;
++	}
++	if (!ret) ret = sn_refresh(d);
++	if (ret) {
++		d->ready.peer_ready = 0;
++		if (d->qp && d->qp->bound) sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
++	}
++	if ((ret != -EAGAIN && ret) || d->net_gone ||
++	    smp_load_acquire(&tb_service_parent(d->service)->native_dma_stopping)) {
++		d->dead = true;
++		if (d->qp) sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
++	}
++	/* Static rendezvous is a one-shot immediate; retry until the core takes it. */
++	if (!d->static_published) {
++		ret = sn_publish(d);
++		if (!ret) d->static_published = true;
++		else if (ret != -EAGAIN)
++			pr_notice_ratelimited("strix_nhi: static rendezvous publish failed: %d\n", ret);
++	}
++	active = !d->dead && sn_ready(&d->ready);
++	if ((!d->ready.carrier || d->dead) && d->tx_ring)
++		sn_rings_stop(d);
++	sn_ring_receive(d);
++	sn_engine_progress(d);
++	mutex_unlock(&d->lock);
++	if (was_active != active && d->registered) {
++		struct ib_event event = {.device = &d->ib,
++			.event = active ? IB_EVENT_PORT_ACTIVE : IB_EVENT_PORT_ERR};
++		event.element.port_num = 1; ib_dispatch_event(&event);
++	}
++	if (!READ_ONCE(d->dead)) queue_delayed_work(system_unbound_wq, &d->work, msecs_to_jiffies(1));
++}
++static struct net_device *sn_find_netdev(struct tb_service *svc)
++{
++	struct net_device *netdev, *found = NULL;
++	struct tb_xdomain *xd = tb_service_parent(svc);
++
++	rtnl_lock();
++	for_each_netdev(&init_net, netdev) {
++		struct device *parent = netdev->dev.parent;
++		struct tb_service *network;
++
++		if (!parent) continue;
++		network = tb_to_service(parent);
++		if (!network || strcmp(network->key, "network") || network->prtcid != 1 ||
++		    tb_service_parent(network) != xd || !parent->driver ||
++		    strcmp(parent->driver->name, "thunderbolt-net") || netdev->type != ARPHRD_ETHER)
++			continue;
++		if (found) { dev_put(found); found = NULL; break; }
++		dev_hold(netdev); found = netdev;
++	}
++	rtnl_unlock();
++	return found;
++}
++static int sn_net_event(struct notifier_block *nb, unsigned long event, void *ptr)
++{
++	struct sn_device *d = container_of(nb, struct sn_device, net_notifier);
++	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
++
++	/* d->netdev is set before this notifier is registered, then changes only
++	 * here (rtnl-serialized, written under d->lock for the worker). */
++	if (!netdev || netdev != d->netdev) return NOTIFY_DONE;
++	/* thunderbolt-net unregistration waits in netdev_wait_allrefs for every
++	 * reference, and the RDMA core never drops a port netdev on its own for
++	 * NETDEV_UNREGISTER. Release both now; the device stays dead until the
++	 * service is reprobed and never re-associates another netdev. */
++	if (event == NETDEV_UNREGISTER) ib_device_set_netdev(&d->ib, NULL, 1);
++	mutex_lock(&d->lock);
++	if (event == NETDEV_UNREGISTER || event == NETDEV_DOWN || !netif_carrier_ok(netdev)) {
++		if (d->ready.carrier) {
++			do { d->ready.local_epoch = get_random_u64(); } while (!d->ready.local_epoch);
++			d->ready.local_echo = d->ready.peer_echo = 0;
++			d->ready.peer_ready = 0;
++			d->next_hello = 0;
++		}
++		d->ready.carrier = 0;
++		d->reset_rings = true;
++		if (event == NETDEV_UNREGISTER) { d->net_gone = true; d->netdev = NULL; }
++		d->control_count = 0;
++		if (d->qp) sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
++	}
++	mutex_unlock(&d->lock);
++	if (event == NETDEV_UNREGISTER) dev_put(netdev);
++	sn_schedule(d);
++	return NOTIFY_DONE;
++}
++static int sn_probe(struct tb_service *svc, const struct tb_service_id *id)
++{
++	struct sn_device *d;
++	struct tb_xdomain *xd = tb_service_parent(svc);
++	struct net_device *netdev;
++	int ret;
++
++	if (!sn_supported_nhi(to_pci_dev(xd->tb->nhi->dev)->vendor,
++	    to_pci_dev(xd->tb->nhi->dev)->device))
++		return -EOPNOTSUPP;
++	netdev = sn_find_netdev(svc);
++	if (!netdev) return -EPROBE_DEFER;
++	d = ib_alloc_device(sn_device, ib);
++	if (!d) { dev_put(netdev); return -ENOMEM; }
++	d->service = svc; d->netdev = netdev;
++	d->in_hop = d->out_hop = -1;
++	mutex_init(&d->lock); spin_lock_init(&d->ring_lock);
++	INIT_LIST_HEAD(&d->mrs); INIT_DELAYED_WORK(&d->work, sn_work);
++	do { d->ready.local_epoch = get_random_u64(); } while (!d->ready.local_epoch);
++	sn_gid_from_uuid(&d->gid, xd->local_uuid);
++	sn_gid_from_uuid(&d->peer_gid, xd->remote_uuid);
++	/* Leave the low HopIDs to thunderbolt-net's login (it requires 8 and may
++	 * take more). TB-IP re-login fails while we hold its HopID, and our rings
++	 * gate on its carrier. */
++	ret = tb_xdomain_alloc_in_hopid(xd, 10);
++	if (ret < 0) goto free;
++	d->in_hop = ret;
++	d->ib.node_type = RDMA_NODE_IB_CA;
++	d->ib.phys_port_cnt = 1; d->ib.num_comp_vectors = 1;
++	memcpy(&d->ib.node_guid, d->gid.raw + 8, 8);
++	strscpy(d->ib.node_desc, "Strix native NHI software verbs (experimental)", sizeof(d->ib.node_desc));
++	d->ib.dev.parent = &svc->dev;
++	/* Keep the core's default write commands (PD, MR, QP, query, ...). */
++	d->ib.uverbs_cmd_mask |= BIT_ULL(IB_USER_VERBS_CMD_POST_SEND) |
++		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) | BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ) |
++		BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
++	ib_set_device_ops(&d->ib, &sn_verbs_ops);
++	ret = ib_device_set_netdev(&d->ib, netdev, 1);
++	if (ret) goto hop;
++	/* After set_netdev: an unregistration that already raced past the lookup
++	 * is rebroadcast by netdev_wait_allrefs_any while references remain. */
++	d->net_notifier.notifier_call = sn_net_event;
++	ret = register_netdevice_notifier(&d->net_notifier);
++	if (ret) goto hop;
++	ret = ib_register_device(&d->ib, "strix_nhi%d", NULL);
++	if (ret) goto notifier;
++	d->registered = true;
++	tb_service_set_drvdata(svc, d);
++	sn_schedule(d);
++	return 0;
++notifier:
++	unregister_netdevice_notifier(&d->net_notifier);
++hop:
++	tb_xdomain_release_in_hopid(xd, d->in_hop);
++free:
++	dev_put(d->netdev);
++	ib_dealloc_device(&d->ib);
++	return ret;
++}
++static void sn_remove(struct tb_service *svc)
++{
++	struct sn_device *d = tb_service_get_drvdata(svc);
++	struct tb_xdomain *xd = tb_service_parent(svc);
++	struct tb_property_dir *old;
++	int ret;
++
++	mutex_lock(&d->lock);
++	d->dead = true; d->ready.peer_ready = 0;
++	if (d->qp) sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
++	mutex_unlock(&d->lock);
++	unregister_netdevice_notifier(&d->net_notifier);
++	cancel_delayed_work_sync(&d->work);
++	/* No object lock or workqueue is held while waiting for local core
++	 * ownership. Core-removal callbacks observe its release-published
++	 * cleanup marker immediately. Ordinary unbind retries in this thread,
++	 * never on a workqueue that core teardown might be draining. */
++	while ((ret = sn_rings_stop(d))) {
++		/* Only EAGAIN is possible after software-CM admission. Never
++		 * turn an unexpected core error into unsafe ownership release. */
++		WARN_ON_ONCE(ret != -EAGAIN);
++		msleep(1);
++	}
++	ib_unregister_device(&d->ib);
++	/* Ring callbacks, the notifier and uverbs commands that raced with the
++	 * first cancel may have requeued the worker; it must not outlive d. */
++	cancel_delayed_work_sync(&d->work);
++	mutex_lock(&svc->lock);
++	old = svc->local_properties; svc->local_properties = NULL;
++	mutex_unlock(&svc->lock);
++	tb_property_free_dir(old);
++	while (tb_service_try_native_properties_changed(svc) == -EAGAIN)
++		msleep(1);
++	if (d->out_hop >= 0) tb_xdomain_release_out_hopid(xd, d->out_hop);
++	tb_xdomain_release_in_hopid(xd, d->in_hop);
++	dev_put(d->netdev); /* NULL after NETDEV_UNREGISTER released it */
++	ib_dealloc_device(&d->ib);
++}
++/* An active experimental service cannot yet be safely suspended/resumed.
++ * Reject system suspend rather than silently leaving active DMA paths. */
++static int sn_suspend(struct device *dev)
++{
++	return -EBUSY;
++}
++static const struct dev_pm_ops sn_pm_ops = {
++	.suspend = sn_suspend, .freeze = sn_suspend, .poweroff = sn_suspend,
++};
++static const struct tb_service_id sn_ids[] = {{ TB_SERVICE(SN_SERVICE, 1) }, {}};
++/* Intentionally no module-device alias: never auto-load from a peer advert. */
++static struct tb_service_driver sn_driver = {
++	.driver = {.owner = THIS_MODULE, .name = "strix_nhi", .pm = &sn_pm_ops},
++	.probe = sn_probe, .remove = sn_remove, .id_table = sn_ids,
++};
++static int __init sn_init(void)
++{
++	int ret;
++
++	if (!enable) return -EACCES;
++	sn_directory = tb_property_create_dir(&sn_uuid);
++	if (!sn_directory) return -ENOMEM;
++	ret = tb_property_add_immediate(sn_directory, "prtcid", 1);
++	if (!ret) ret = tb_property_add_immediate(sn_directory, "prtcvers", SN_VERSION);
++	if (!ret) ret = tb_property_add_immediate(sn_directory, "prtcrevs", 0);
++	if (!ret) ret = tb_property_add_immediate(sn_directory, "prtcstns", 0);
++	if (ret) goto free;
++	ret = tb_register_property_dir(SN_SERVICE, sn_directory);
++	if (ret) goto free;
++	ret = tb_register_service_driver(&sn_driver);
++	if (!ret) return 0;
++	tb_unregister_property_dir(SN_SERVICE, sn_directory);
++free:
++	tb_property_free_dir(sn_directory);
++	return ret;
++}
++static void __exit sn_exit(void)
++{
++	tb_unregister_service_driver(&sn_driver);
++	tb_unregister_property_dir(SN_SERVICE, sn_directory);
++	tb_property_free_dir(sn_directory);
++}
++module_init(sn_init);
++module_exit(sn_exit);
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Opt-in native NHI CPU-copy software verbs; not RoCE");
+diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/strix_nhi/ring.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/ring.c
+@@ -0,0 +1,194 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/dma-mapping.h>
++#include "strix_nhi.h"
++
++static void sn_ring_callback(struct tb_ring *ring, struct ring_frame *frame, bool canceled)
++{
++	struct sn_slot *s = container_of(frame, struct sn_slot, frame);
++	struct sn_device *d = s->device;
++	unsigned long flags;
++
++	spin_lock_irqsave(&d->ring_lock, flags);
++	s->canceled = canceled;
++	s->done = true;
++	spin_unlock_irqrestore(&d->ring_lock, flags);
++	sn_schedule(d);
++}
++static bool sn_slot_done(struct sn_device *d, struct sn_slot *s)
++{
++	unsigned long flags;
++	bool done;
++
++	spin_lock_irqsave(&d->ring_lock, flags);
++	done = s->done;
++	if (done)
++		s->done = false;
++	spin_unlock_irqrestore(&d->ring_lock, flags);
++	return done;
++}
++static int sn_slots_alloc(struct sn_device *d, struct tb_ring *r, struct sn_slot *slots)
++{
++	int i;
++
++	for (i = 0; i < SN_RING_SIZE; i++) {
++		struct sn_slot *s = &slots[i];
++
++		s->device = d;
++		s->frame.callback = sn_ring_callback;
++		s->buffer = dma_alloc_coherent(tb_ring_dma_device(r), SN_FRAME,
++				&s->frame.buffer_phy, GFP_KERNEL);
++		if (!s->buffer)
++			return -ENOMEM;
++	}
++	return 0;
++}
++static void sn_slots_free(struct tb_ring *r, struct sn_slot *slots)
++{
++	int i;
++
++	if (!r)
++		return;
++	for (i = 0; i < SN_RING_SIZE; i++) {
++		struct sn_slot *s = &slots[i];
++
++		if (s->buffer)
++			dma_free_coherent(tb_ring_dma_device(r), SN_FRAME,
++					  s->buffer, s->frame.buffer_phy);
++		s->buffer = NULL;
++		s->done = false;
++	}
++}
++int sn_rings_start(struct sn_device *d)
++{
++	struct tb_xdomain *xd = tb_service_parent(d->service);
++	int ret, i;
++
++	/* A previous nonblocking teardown may still own the exact path tuple. */
++	if (d->tx_ring || d->rx_ring) {
++		ret = sn_rings_stop(d);
++		if (ret) return ret;
++	}
++	d->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, SN_RING_SIZE,
++				     RING_FLAG_FRAME | RING_FLAG_E2E);
++	if (!d->tx_ring)
++		return -ENOMEM;
++	d->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, SN_RING_SIZE,
++		RING_FLAG_FRAME | RING_FLAG_E2E, d->tx_ring->hop,
++		BIT(1), BIT(2), NULL, NULL);
++	if (!d->rx_ring) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	ret = sn_slots_alloc(d, d->tx_ring, d->tx);
++	if (ret) goto fail;
++	ret = sn_slots_alloc(d, d->rx_ring, d->rx);
++	if (ret) goto fail;
++	tb_ring_start(d->tx_ring);
++	tb_ring_start(d->rx_ring);
++	d->rings_started = true;
++	for (i = 0; i < SN_RING_SIZE; i++) {
++		ret = tb_ring_rx(d->rx_ring, &d->rx[i].frame);
++		if (ret) goto fail;
++	}
++	d->rx_primed = true;
++	ret = tb_xdomain_try_enable_native_paths(xd, d->out_hop, d->tx_ring->hop,
++				     d->in_hop, d->rx_ring->hop);
++	if (ret) goto fail;
++	d->paths_active = true;
++	d->ready.rx_primed = d->ready.rings_started = d->ready.paths_active = 1;
++	return 0;
++fail:
++	sn_rings_stop(d);
++	return ret;
++}
++int sn_rings_stop(struct sn_device *d)
++{
++	struct tb_xdomain *xd = tb_service_parent(d->service);
++	int ret;
++
++	d->ready.paths_active = d->ready.rings_started = d->ready.rx_primed = 0;
++	/* No peer close packet. tb_ring_stop disables local DMA and synchronously
++	 * joins cancellation callbacks. Only then may staging memory be freed. */
++	if (d->rings_started) {
++		tb_ring_stop(d->tx_ring);
++		tb_ring_stop(d->rx_ring);
++		d->rings_started = false;
++	}
++	if (d->paths_active) {
++		ret = tb_xdomain_try_disable_native_paths(xd);
++		/* Core owns the exact admitted tuple. EAGAIN retains EVERY ring,
++		 * buffer and HopID; ENODEV proves core cleanup already completed. */
++		if (ret && ret != -ENODEV) return ret;
++		d->paths_active = false;
++	}
++	d->rx_primed = false;
++	sn_slots_free(d->tx_ring, d->tx);
++	sn_slots_free(d->rx_ring, d->rx);
++	if (d->tx_ring) tb_ring_free(d->tx_ring);
++	if (d->rx_ring) tb_ring_free(d->rx_ring);
++	d->tx_ring = d->rx_ring = NULL;
++	d->tx_head = d->tx_tail = d->rx_tail = 0;
++	return 0;
++}
++int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *payload, bool control)
++{
++	struct sn_slot *s;
++	bool hs = h->opcode >= SN_HELLO && h->opcode <= SN_BIND_ACK;
++	unsigned int limit = SN_RING_SIZE - 1;
++	int ret;
++
++	lockdep_assert_held(&d->lock);
++	if (d->dead || d->reset_rings ||
++	    smp_load_acquire(&tb_service_parent(d->service)->native_dma_stopping) ||
++	    READ_ONCE(tb_service_parent(d->service)->is_unplugged))
++		return -ENOLINK;
++	/* Handshake frames only need local paths; everything else needs the
++	 * fully established reciprocal session. */
++	if (hs ? !sn_local_ready(&d->ready) : !sn_ready(&d->ready))
++		return -ENOLINK;
++	if (!control) limit -= SN_CONTROL_RESERVE;
++	while (d->tx_head != d->tx_tail &&
++	       sn_slot_done(d, &d->tx[d->tx_tail % SN_RING_SIZE])) {
++		if (d->tx[d->tx_tail % SN_RING_SIZE].canceled)
++			return -EIO;
++		d->tx_tail++;
++	}
++	if (d->tx_head - d->tx_tail >= limit)
++		return -EAGAIN;
++	s = &d->tx[d->tx_head % SN_RING_SIZE];
++	if (h->length) memcpy(s->buffer + SN_HEADER, payload, h->length);
++	if (sn_encode(s->buffer, SN_FRAME, h))
++		return -EINVAL;
++	s->frame.size = (SN_HEADER + h->length) & 0xfff;
++	s->frame.flags = 0;
++	/* Match tbnet's proven framing: sof=FRAME_START(1), eof=FRAME_END(2). */
++	s->frame.sof = 1; s->frame.eof = 2;
++	s->canceled = false;
++	dma_wmb();
++	ret = tb_ring_tx(d->tx_ring, &s->frame);
++	if (!ret) { d->tx_head++; d->tx_frames++; }
++	return ret;
++}
++void sn_ring_receive(struct sn_device *d)
++{
++	int i;
++
++	lockdep_assert_held(&d->lock);
++	if (!d->rings_started || d->dead)
++		return;
++	for (i = 0; i < SN_RING_SIZE; i++) {
++		struct sn_slot *s = &d->rx[d->rx_tail % SN_RING_SIZE];
++
++		if (!sn_slot_done(d, s)) break;
++		d->rx_tail++;
++		if (s->canceled) continue;
++		dma_rmb();
++		d->rx_frames++;
++		if (!(s->frame.flags & (RING_DESC_CRC_ERROR | RING_DESC_BUFFER_OVERRUN)))
++			sn_engine_receive(d, s->buffer, tb_ring_frame_size(&s->frame));
++		s->frame.size = 0;
++		s->frame.flags = 0;
++		if (tb_ring_rx(d->rx_ring, &s->frame) && d->qp)
++			sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
++	}
++}
+diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/strix_nhi/verbs.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/verbs.c
+@@ -0,0 +1,484 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/random.h>
++#include <linux/vmalloc.h>
++#include <rdma/uverbs_ioctl.h>
++#include "strix_nhi.h"
++
++static void sn_event(struct ib_cq *cq, enum ib_event_type type)
++{
++	struct ib_event event = {.device = cq->device, .event = type};
++
++	event.element.cq = cq;
++	if (cq->event_handler) cq->event_handler(&event, cq->cq_context);
++}
++/* A CQE never points at the real QP: ib_uverbs_poll_cq dereferences
++ * wc->qp->qp_num after poll_cq has dropped d->lock, and a concurrent
++ * DESTROY_QP may already have freed the QP. These device-owned identities
++ * live until ib_dealloc_device, after uverbs has drained. Alternating slots
++ * mean only a poll stalled across two destroy/create cycles can report a
++ * newer QPN; that race is cosmetic, never a use-after-free. */
++static struct ib_qp *sn_wc_qp(struct sn_device *d, u32 qp_num)
++{
++	return &d->wc_qp[qp_num & 1];
++}
++int sn_complete(struct sn_qp *q, struct sn_wqe *w, bool receive,
++		enum ib_wc_status status, u32 length)
++{
++	struct sn_cq *cq = sn_cq(receive ? q->ib.recv_cq : q->ib.send_cq);
++	struct ib_wc *wc;
++	bool notify;
++
++	lockdep_assert_held(&sn_dev(q->ib.device)->lock);
++	if (!receive && status == IB_WC_SUCCESS && !q->all_signaled &&
++	    !(w->flags & IB_SEND_SIGNALED))
++		return 0;
++	if (cq->failed) return -ENOSPC;
++	if (cq->count == cq->ib.cqe) {
++		cq->failed = true;
++		sn_event(&cq->ib, IB_EVENT_CQ_ERR);
++		return -ENOSPC;
++	}
++	wc = &cq->entries[(cq->head + cq->count) % cq->ib.cqe];
++	memset(wc, 0, sizeof(*wc));
++	wc->wr_id = w->id; wc->status = status;
++	wc->qp = sn_wc_qp(sn_dev(q->ib.device), q->ib.qp_num);
++	WRITE_ONCE(wc->qp->qp_num, q->ib.qp_num);
++	wc->opcode = receive ? IB_WC_RECV : w->opcode == SN_READ ? IB_WC_RDMA_READ :
++		     w->opcode == SN_WRITE ? IB_WC_RDMA_WRITE : IB_WC_SEND;
++	wc->byte_len = length;
++	cq->count++;
++	/* d->lock orders completed placement before CQ publication/polling. */
++	notify = cq->notify == IB_CQ_NEXT_COMP ||
++		 (cq->notify && status != IB_WC_SUCCESS);
++	if (notify) {
++		cq->notify = 0;
++		if (cq->ib.comp_handler) cq->ib.comp_handler(&cq->ib, cq->ib.cq_context);
++	}
++	return 0;
++}
++static void sn_flush_qp(struct sn_qp *q, enum ib_wc_status status, bool notify)
++{
++	struct sn_device *d = sn_dev(q->ib.device);
++	struct ib_event event = {.device = &d->ib, .event = IB_EVENT_QP_FATAL};
++	bool first = true, changed = q->attr.qp_state != IB_QPS_ERR;
++
++	lockdep_assert_held(&d->lock);
++	q->attr.qp_state = IB_QPS_ERR;
++	q->bound = false;
++	while (q->sq_count) {
++		struct sn_wqe *w = &q->sq[q->sq_head];
++		sn_complete(q, w, false, first ? status : IB_WC_WR_FLUSH_ERR, 0);
++		sn_mr_put(w->mr); w->mr = NULL;
++		q->sq_head = (q->sq_head + 1) % SN_QUEUE_DEPTH; q->sq_count--;
++		first = false;
++	}
++	while (q->rq_count) {
++		struct sn_wqe *w = &q->rq[q->rq_head];
++		sn_complete(q, w, true, IB_WC_WR_FLUSH_ERR, 0);
++		sn_mr_put(w->mr); w->mr = NULL;
++		q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
++	}
++	sn_engine_reset(q);
++	if (changed && notify && !q->destroying && q->ib.event_handler) {
++		event.element.qp = &q->ib;
++		q->ib.event_handler(&event, q->ib.qp_context);
++	}
++}
++void sn_qp_error(struct sn_qp *q, enum ib_wc_status status)
++{
++	sn_flush_qp(q, status, true);
++}
++static int sn_query_device(struct ib_device *ib, struct ib_device_attr *a,
++			   struct ib_udata *udata)
++{
++	memset(a, 0, sizeof(*a));
++	a->max_mr_size = SN_MR_BYTES; a->page_size_cap = PAGE_SIZE;
++	a->max_qp = 1; a->max_qp_wr = SN_QUEUE_DEPTH;
++	a->max_send_sge = a->max_recv_sge = 1;
++	a->max_cq = 2; a->max_cqe = SN_MAX_CQE;
++	a->max_mr = SN_MAX_MRS; a->max_pd = 1;
++	a->max_qp_rd_atom = a->max_qp_init_rd_atom = a->max_res_rd_atom = 1;
++	a->atomic_cap = IB_ATOMIC_NONE;
++	a->sys_image_guid = ib->node_guid;
++	return 0;
++}
++static int sn_query_port(struct ib_device *ib, u32 port, struct ib_port_attr *a)
++{
++	struct sn_device *d = sn_dev(ib);
++
++	if (port != 1) return -EINVAL;
++	memset(a, 0, sizeof(*a));
++	mutex_lock(&d->lock);
++	a->state = !d->dead && !d->reset_rings && sn_ready(&d->ready) &&
++		!smp_load_acquire(&tb_service_parent(d->service)->native_dma_stopping) &&
++		!READ_ONCE(tb_service_parent(d->service)->is_unplugged) ? IB_PORT_ACTIVE : IB_PORT_DOWN;
++	a->phys_state = a->state == IB_PORT_ACTIVE ? IB_PORT_PHYS_STATE_LINK_UP : IB_PORT_PHYS_STATE_DISABLED;
++	a->max_mtu = a->active_mtu = IB_MTU_4096;
++	a->gid_tbl_len = a->pkey_tbl_len = 1;
++	a->max_msg_sz = SN_MESSAGE;
++	/* No protocol capability bits, negotiated speed, width or IB link claims. */
++	mutex_unlock(&d->lock);
++	return 0;
++}
++static int sn_immutable(struct ib_device *ib, u32 port, struct ib_port_immutable *a)
++{
++	if (port != 1) return -EINVAL;
++	a->pkey_tbl_len = a->gid_tbl_len = 1;
++	a->core_cap_flags = 0; a->max_mad_size = 0;
++	return 0;
++}
++static enum rdma_link_layer sn_link_layer(struct ib_device *ib, u32 port)
++{
++	return port == 1 ? IB_LINK_LAYER_ETHERNET : IB_LINK_LAYER_UNSPECIFIED;
++}
++static int sn_query_gid(struct ib_device *ib, u32 port, int index, union ib_gid *gid)
++{
++	if (port != 1 || index) return -EINVAL;
++	*gid = sn_dev(ib)->gid;
++	return 0;
++}
++static int sn_query_pkey(struct ib_device *ib, u32 port, u16 index, u16 *pkey)
++{
++	if (port != 1 || index) return -EINVAL;
++	*pkey = 0xffff;
++	return 0;
++}
++static int sn_alloc_context(struct ib_ucontext *ctx, struct ib_udata *udata)
++{
++	struct sn_device *d = sn_dev(ctx->device);
++	int ret = 0;
++
++	if (udata->inlen || udata->outlen) return -EOPNOTSUPP;
++	mutex_lock(&d->lock);
++	if (d->dead) ret = -ENODEV;
++	else if (d->have_context) ret = -EBUSY;
++	else d->have_context = true;
++	mutex_unlock(&d->lock);
++	return ret;
++}
++static void sn_dealloc_context(struct ib_ucontext *ctx)
++{
++	struct sn_device *d = sn_dev(ctx->device);
++	mutex_lock(&d->lock); d->have_context = false; mutex_unlock(&d->lock);
++}
++static void sn_disassociate_context(struct ib_ucontext *ctx)
++{
++	struct sn_device *d = sn_dev(ctx->device);
++
++	/* There are no user mappings. The uverbs core destroys the objects after
++	 * excluding commands; join the copying worker and flush before unpinning. */
++	mutex_lock(&d->lock);
++	if (d->qp) sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
++	mutex_unlock(&d->lock);
++}
++static int sn_alloc_pd(struct ib_pd *pd, struct ib_udata *udata)
++{
++	struct sn_device *d = sn_dev(pd->device);
++	int ret = 0;
++
++	if (!udata || udata->inlen || udata->outlen) return -EOPNOTSUPP;
++	mutex_lock(&d->lock);
++	if (d->dead) ret = -ENODEV;
++	else if (d->have_pd) ret = -ENOMEM;
++	else d->have_pd = true;
++	mutex_unlock(&d->lock);
++	return ret;
++}
++static int sn_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
++{
++	struct sn_device *d = sn_dev(pd->device);
++	mutex_lock(&d->lock); d->have_pd = false; mutex_unlock(&d->lock);
++	return 0;
++}
++static int sn_create_cq(struct ib_cq *ib, const struct ib_cq_init_attr *a,
++			struct uverbs_attr_bundle *attrs)
++{
++	struct ib_udata *udata = &attrs->driver_udata;
++	struct sn_device *d = sn_dev(ib->device);
++	int ret = 0;
++
++	if (!udata || a->flags || udata->inlen || udata->outlen) return -EOPNOTSUPP;
++	if (a->cqe < 1 || a->cqe > SN_MAX_CQE || a->comp_vector) return -EINVAL;
++	mutex_lock(&d->lock);
++	if (d->dead) ret = -ENODEV;
++	else if (d->cq_count == 2) ret = -ENOMEM;
++	else { d->cq_count++; ib->cqe = a->cqe; }
++	mutex_unlock(&d->lock);
++	return ret;
++}
++static int sn_destroy_cq(struct ib_cq *ib, struct ib_udata *udata)
++{
++	struct sn_device *d = sn_dev(ib->device);
++	mutex_lock(&d->lock); d->cq_count--; mutex_unlock(&d->lock);
++	return 0;
++}
++static int sn_poll_cq(struct ib_cq *ib, int n, struct ib_wc *wc)
++{
++	struct sn_device *d = sn_dev(ib->device);
++	struct sn_cq *cq = sn_cq(ib);
++	int i = 0;
++
++	if (n < 0) return -EINVAL;
++	mutex_lock(&d->lock);
++	while (i < n && cq->count) {
++		wc[i++] = cq->entries[cq->head];
++		cq->head = (cq->head + 1) % ib->cqe; cq->count--;
++	}
++	if (!i && cq->failed) i = -EIO;
++	mutex_unlock(&d->lock);
++	return i;
++}
++static int sn_notify_cq(struct ib_cq *ib, enum ib_cq_notify_flags flags)
++{
++	struct sn_device *d = sn_dev(ib->device);
++	struct sn_cq *cq = sn_cq(ib);
++	int notify = flags & IB_CQ_SOLICITED_MASK, ret;
++
++	if ((flags & ~(IB_CQ_SOLICITED_MASK | IB_CQ_REPORT_MISSED_EVENTS)) ||
++	    (notify != IB_CQ_NEXT_COMP && notify != IB_CQ_SOLICITED)) return -EINVAL;
++	mutex_lock(&d->lock);
++	if (cq->failed) ret = -EIO;
++	else {
++		/* Re-arming with SOLICITED cannot weaken an outstanding NEXT arm. */
++		if (cq->notify != IB_CQ_NEXT_COMP) cq->notify = notify;
++		ret = !!((flags & IB_CQ_REPORT_MISSED_EVENTS) && cq->count);
++	}
++	mutex_unlock(&d->lock);
++	return ret;
++}
++static int sn_create_qp(struct ib_qp *ib, struct ib_qp_init_attr *a, struct ib_udata *udata)
++{
++	struct sn_device *d = sn_dev(ib->device);
++	struct sn_qp *q = sn_qp(ib);
++	int ret = 0;
++
++	if (!udata || udata->inlen || udata->outlen || a->qp_type != IB_QPT_RC ||
++	    a->srq || a->create_flags || a->cap.max_inline_data) return -EOPNOTSUPP;
++	if (!a->cap.max_send_wr || a->cap.max_send_wr > SN_QUEUE_DEPTH ||
++	    !a->cap.max_recv_wr || a->cap.max_recv_wr > SN_QUEUE_DEPTH ||
++	    a->cap.max_send_sge != 1 || a->cap.max_recv_sge != 1 ||
++	    !a->send_cq || !a->recv_cq) return -EINVAL;
++	q->outgoing = kvzalloc(SN_MESSAGE, GFP_KERNEL);
++	q->incoming = kvzalloc(SN_MESSAGE, GFP_KERNEL);
++	q->read_snapshot = kvzalloc(SN_MESSAGE, GFP_KERNEL);
++	q->read_incoming = kvzalloc(SN_MESSAGE, GFP_KERNEL);
++	if (!q->outgoing || !q->incoming || !q->read_snapshot || !q->read_incoming) {
++		ret = -ENOMEM; goto free;
++	}
++	mutex_lock(&d->lock);
++	if (d->dead) ret = -ENODEV;
++	else if (d->qp) ret = -ENOMEM;
++	else if (d->qpn_serial == SN_PSN_MAX) ret = -EOVERFLOW;
++	if (!ret) {
++		ib->qp_num = ++d->qpn_serial;
++		q->binding.local_qpn = ib->qp_num;
++		do { q->binding.local_generation = get_random_u64(); } while (!q->binding.local_generation);
++		q->attr.qp_state = IB_QPS_RESET;
++		q->init = *a;
++		q->all_signaled = a->sq_sig_type == IB_SIGNAL_ALL_WR;
++		d->qp = q;
++	}
++	mutex_unlock(&d->lock);
++	if (!ret) { sn_schedule(d); return 0; }
++free:
++	kvfree(q->outgoing); kvfree(q->incoming);
++	kvfree(q->read_snapshot); kvfree(q->read_incoming);
++	return ret;
++}
++static void sn_cq_remove_qp(struct sn_cq *cq, struct ib_qp *qp)
++{
++	struct ib_qp *identity = sn_wc_qp(sn_dev(cq->ib.device), qp->qp_num);
++	unsigned int i, count = cq->count, kept = 0;
++
++	/* Only one QP exists at a time, so the identity selects its CQEs. */
++	for (i = 0; i < count; i++) {
++		struct ib_wc wc = cq->entries[(cq->head + i) % cq->ib.cqe];
++		if (wc.qp != identity) cq->entries[(cq->head + kept++) % cq->ib.cqe] = wc;
++	}
++	cq->count = kept;
++}
++static int sn_destroy_qp(struct ib_qp *ib, struct ib_udata *udata)
++{
++	struct sn_device *d = sn_dev(ib->device);
++	struct sn_qp *q = sn_qp(ib);
++
++	mutex_lock(&d->lock);
++	q->destroying = true;
++	d->qp = NULL;
++	sn_qp_error(q, IB_WC_WR_FLUSH_ERR);
++	d->control_count = 0;
++	sn_cq_remove_qp(sn_cq(ib->send_cq), ib);
++	if (ib->recv_cq != ib->send_cq) sn_cq_remove_qp(sn_cq(ib->recv_cq), ib);
++	/* Worker copies also hold d->lock. DMA slots contain copies only, never
++	 * QP or MR pointers. The service rings remain primed across QP lifetime. */
++	mutex_unlock(&d->lock);
++	kvfree(q->outgoing); kvfree(q->incoming);
++	kvfree(q->read_snapshot); kvfree(q->read_incoming);
++	sn_schedule(d);
++	return 0;
++}
++static int sn_modify_qp(struct ib_qp *ib, struct ib_qp_attr *a, int mask, struct ib_udata *udata)
++{
++	struct sn_device *d = sn_dev(ib->device);
++	struct sn_qp *q = sn_qp(ib);
++	const struct ib_global_route *grh = rdma_ah_read_grh(&a->ah_attr);
++	int required = IB_QP_STATE, ret = -EINVAL;
++
++	mutex_lock(&d->lock);
++	if (d->dead) { ret = -ENODEV; goto out; }
++	if (!(mask & IB_QP_STATE) || !ib_modify_qp_is_ok(q->attr.qp_state, a->qp_state, IB_QPT_RC, mask)) goto out;
++	if (a->qp_state == IB_QPS_ERR || a->qp_state == IB_QPS_RESET) {
++		if (mask != required) goto out;
++		sn_flush_qp(q, IB_WC_WR_FLUSH_ERR, false);
++		if (a->qp_state == IB_QPS_RESET) {
++			memset(&q->attr, 0, sizeof(q->attr));
++			q->attr.qp_state = IB_QPS_RESET;
++			do { q->binding.local_generation = get_random_u64(); } while (!q->binding.local_generation);
++			q->binding.peer_generation = 0;
++			d->control_count = 0;
++		}
++		ret = 0; goto out;
++	}
++	if (q->attr.qp_state == IB_QPS_RESET && a->qp_state == IB_QPS_INIT) {
++		required |= IB_QP_PKEY_INDEX | IB_QP_PORT | IB_QP_ACCESS_FLAGS;
++		if (mask != required || a->port_num != 1 || a->pkey_index ||
++		    (a->qp_access_flags & ~SN_ACCESS_FLAGS)) goto out;
++		q->attr.port_num = 1; q->attr.qp_access_flags = a->qp_access_flags;
++	} else if (q->attr.qp_state == IB_QPS_INIT && a->qp_state == IB_QPS_RTR) {
++		required |= IB_QP_AV | IB_QP_PATH_MTU | IB_QP_DEST_QPN | IB_QP_RQ_PSN |
++			    IB_QP_MAX_DEST_RD_ATOMIC | IB_QP_MIN_RNR_TIMER;
++		if (mask != required || a->path_mtu != IB_MTU_4096 || !a->dest_qp_num ||
++		    a->dest_qp_num > SN_PSN_MAX || a->rq_psn > SN_PSN_MAX ||
++		    a->max_dest_rd_atomic > 1 || a->min_rnr_timer != 12 ||
++		    rdma_ah_get_port_num(&a->ah_attr) != 1 ||
++		    rdma_ah_get_ah_flags(&a->ah_attr) != IB_AH_GRH ||
++		    grh->sgid_index || grh->flow_label || grh->traffic_class || grh->hop_limit != 64 ||
++		    rdma_ah_get_sl(&a->ah_attr) || rdma_ah_get_static_rate(&a->ah_attr) ||
++		    memcmp(&grh->dgid, &d->peer_gid, sizeof(d->peer_gid))) goto out;
++		q->attr.path_mtu = a->path_mtu; q->attr.dest_qp_num = a->dest_qp_num;
++		q->attr.rq_psn = a->rq_psn; q->attr.max_dest_rd_atomic = a->max_dest_rd_atomic;
++		q->attr.min_rnr_timer = a->min_rnr_timer;
++		q->attr.ah_attr = a->ah_attr;
++		/* Core releases this borrowed cache reference after modify_qp. */
++		q->attr.ah_attr.grh.sgid_attr = NULL;
++		q->binding.peer_qpn = a->dest_qp_num;
++		q->receive.expected = a->rq_psn;
++	} else if (q->attr.qp_state == IB_QPS_RTR && a->qp_state == IB_QPS_RTS) {
++		required |= IB_QP_SQ_PSN | IB_QP_TIMEOUT | IB_QP_RETRY_CNT |
++			    IB_QP_RNR_RETRY | IB_QP_MAX_QP_RD_ATOMIC;
++		if (mask != required || a->sq_psn > SN_PSN_MAX || a->timeout != 14 ||
++		    a->retry_cnt > 6 || a->rnr_retry > 6 || a->max_rd_atomic > 1) goto out;
++		q->attr.sq_psn = a->sq_psn; q->attr.timeout = a->timeout;
++		q->attr.retry_cnt = a->retry_cnt; q->attr.rnr_retry = a->rnr_retry;
++		q->attr.max_rd_atomic = a->max_rd_atomic;
++		q->next_sequence = a->sq_psn;
++	} else { ret = -EOPNOTSUPP; goto out; }
++	q->attr.qp_state = a->qp_state;
++	ret = 0;
++out:
++	mutex_unlock(&d->lock);
++	if (!ret) sn_schedule(d);
++	return ret;
++}
++static int sn_query_qp(struct ib_qp *ib, struct ib_qp_attr *a, int mask, struct ib_qp_init_attr *init)
++{
++	struct sn_device *d = sn_dev(ib->device);
++	mutex_lock(&d->lock);
++	*a = sn_qp(ib)->attr; *init = sn_qp(ib)->init;
++	a->cur_qp_state = a->qp_state;
++	mutex_unlock(&d->lock);
++	return 0;
++}
++static int sn_post_send(struct ib_qp *ib, const struct ib_send_wr *wr, const struct ib_send_wr **bad)
++{
++	struct sn_device *d = sn_dev(ib->device);
++	struct sn_qp *q = sn_qp(ib);
++	int ret = 0;
++
++	mutex_lock(&d->lock);
++	for (; wr; wr = wr->next) {
++		struct sn_wqe w = {0};
++		const struct ib_sge *s = wr->sg_list;
++		if (d->dead || q->destroying || q->attr.qp_state != IB_QPS_RTS) { ret = -EINVAL; break; }
++		if (wr->opcode != IB_WR_SEND && wr->opcode != IB_WR_RDMA_WRITE && wr->opcode != IB_WR_RDMA_READ) { ret = -EOPNOTSUPP; break; }
++		if (wr->send_flags & ~(IB_SEND_SIGNALED | IB_SEND_FENCE)) { ret = -EOPNOTSUPP; break; }
++		if (wr->opcode == IB_WR_RDMA_READ && !q->attr.max_rd_atomic) { ret = -EINVAL; break; }
++		if (wr->num_sge != 1 || !s || s->length > SN_MESSAGE) { ret = -EINVAL; break; }
++		if (q->sq_count == q->init.cap.max_send_wr) { ret = -ENOMEM; break; }
++		w.mr = sn_mr_get(q, s->lkey, s->addr, s->length, wr->opcode == IB_WR_RDMA_READ ? IB_ACCESS_LOCAL_WRITE : 0);
++		if (!w.mr) { ret = -EACCES; break; }
++		w.id = wr->wr_id; w.address = s->addr; w.length = s->length;
++		w.flags = wr->send_flags;
++		w.opcode = wr->opcode == IB_WR_SEND ? SN_SEND : wr->opcode == IB_WR_RDMA_READ ? SN_READ : SN_WRITE;
++		if (w.opcode != SN_SEND) {
++			w.remote_address = rdma_wr(wr)->remote_addr; w.rkey = rdma_wr(wr)->rkey;
++			if (!w.rkey || w.remote_address > U64_MAX - w.length) {
++				sn_mr_put(w.mr); ret = -EINVAL; break;
++			}
++		}
++		q->sq[(q->sq_head + q->sq_count) % SN_QUEUE_DEPTH] = w;
++		if (!q->sq_count) q->progress_deadline = ktime_get_ns() + 30000000000ULL;
++		q->sq_count++;
++	}
++	if (ret) *bad = wr;
++	mutex_unlock(&d->lock);
++	sn_schedule(d);
++	return ret;
++}
++static int sn_post_recv(struct ib_qp *ib, const struct ib_recv_wr *wr, const struct ib_recv_wr **bad)
++{
++	struct sn_device *d = sn_dev(ib->device);
++	struct sn_qp *q = sn_qp(ib);
++	int ret = 0;
++
++	mutex_lock(&d->lock);
++	for (; wr; wr = wr->next) {
++		struct sn_wqe w = {0};
++		const struct ib_sge *s = wr->sg_list;
++		if (d->dead || q->destroying || q->attr.qp_state == IB_QPS_RESET || q->attr.qp_state == IB_QPS_ERR) { ret = -EINVAL; break; }
++		if (wr->num_sge != 1 || !s || s->length > SN_MESSAGE) { ret = -EINVAL; break; }
++		if (q->rq_count == q->init.cap.max_recv_wr) { ret = -ENOMEM; break; }
++		w.mr = sn_mr_get(q, s->lkey, s->addr, s->length, IB_ACCESS_LOCAL_WRITE);
++		if (!w.mr) { ret = -EACCES; break; }
++		w.id = wr->wr_id; w.address = s->addr; w.length = s->length;
++		q->rq[(q->rq_head + q->rq_count) % SN_QUEUE_DEPTH] = w;
++		q->rq_count++;
++	}
++	if (ret) *bad = wr;
++	mutex_unlock(&d->lock);
++	sn_schedule(d);
++	return ret;
++}
++static ssize_t native_stats_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct sn_device *d = sn_dev(container_of(dev, struct ib_device, dev));
++	ssize_t n;
++
++	mutex_lock(&d->lock);
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\n",
++		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
++		d->write_bytes, d->read_bytes);
++	mutex_unlock(&d->lock);
++	return n;
++}
++static DEVICE_ATTR_RO(native_stats);
++static struct attribute *sn_attributes[] = { &dev_attr_native_stats.attr, NULL };
++static const struct attribute_group sn_device_group = { .attrs = sn_attributes };
++const struct ib_device_ops sn_verbs_ops = {
++	.owner = THIS_MODULE, .driver_id = RDMA_DRIVER_UNKNOWN,
++	.uverbs_abi_ver = SN_ABI, .device_group = &sn_device_group,
++	.query_device = sn_query_device, .query_port = sn_query_port,
++	.get_port_immutable = sn_immutable, .get_link_layer = sn_link_layer,
++	.query_gid = sn_query_gid, .query_pkey = sn_query_pkey,
++	.alloc_ucontext = sn_alloc_context, .dealloc_ucontext = sn_dealloc_context,
++	.disassociate_ucontext = sn_disassociate_context,
++	.alloc_pd = sn_alloc_pd, .dealloc_pd = sn_dealloc_pd,
++	.create_user_cq = sn_create_cq, .destroy_cq = sn_destroy_cq,
++	.poll_cq = sn_poll_cq, .req_notify_cq = sn_notify_cq,
++	.create_qp = sn_create_qp, .destroy_qp = sn_destroy_qp,
++	.modify_qp = sn_modify_qp, .query_qp = sn_query_qp,
++	.post_send = sn_post_send, .post_recv = sn_post_recv,
++	.reg_user_mr = sn_reg_user_mr, .dereg_mr = sn_dereg_mr,
++	.size_ib_cq = sizeof(struct sn_cq), .size_ib_pd = sizeof(struct ib_pd),
++	.size_ib_qp = sizeof(struct sn_qp), .size_ib_ucontext = sizeof(struct ib_ucontext),
++};
+diff --git a/drivers/infiniband/hw/strix_nhi/mr.c b/drivers/infiniband/hw/strix_nhi/mr.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/mr.c
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/scatterlist.h>
++#include "strix_nhi.h"
++
++struct sn_mr *sn_mr_get(struct sn_qp *q, u32 key, u64 address, u32 length, u32 access)
++{
++	struct sn_device *d = sn_dev(q->ib.device);
++	struct sn_mr *m;
++
++	lockdep_assert_held(&d->lock);
++	list_for_each_entry(m, &d->mrs, entry) {
++		if (m->ib.lkey != key || m->ib.pd != q->ib.pd)
++			continue;
++		if ((m->access & access) != access ||
++		    !sn_range(m->base, m->size, address, length))
++			return NULL;
++		m->users++;
++		return m;
++	}
++	return NULL;
++}
++void sn_mr_put(struct sn_mr *m)
++{
++	if (m) {
++		lockdep_assert_held(&sn_dev(m->ib.device)->lock);
++		WARN_ON(!m->users);
++		m->users--;
++	}
++}
++int sn_mr_copy(struct sn_mr *m, u64 address, void *buffer, u32 length, bool to_mr)
++{
++	size_t copied, skip;
++
++	lockdep_assert_held(&sn_dev(m->ib.device)->lock);
++	if (!m->users || !sn_range(m->base, m->size, address, length) ||
++	    (to_mr && !(m->access & IB_ACCESS_LOCAL_WRITE)))
++		return -EACCES;
++	if (!length)
++		return 0;
++	skip = address - m->base + ib_umem_offset(m->umem);
++	/* VIRT_DMA umem owns pinned CPU pages; only separate coherent staging
++	 * buffers are ever mapped into the NHI. sg_pcopy handles page boundaries. */
++	if (to_mr)
++		copied = sg_pcopy_from_buffer(m->umem->sgt_append.sgt.sgl,
++			m->umem->sgt_append.sgt.orig_nents, buffer, length, skip);
++	else
++		copied = sg_pcopy_to_buffer(m->umem->sgt_append.sgt.sgl,
++			m->umem->sgt_append.sgt.orig_nents, buffer, length, skip);
++	return copied == length ? 0 : -EFAULT;
++}
++struct ib_mr *sn_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
++			   u64 iova, int access, struct ib_dmah *dmah,
++			   struct ib_udata *udata)
++{
++	struct sn_device *d = sn_dev(pd->device);
++	struct sn_mr *m;
++	int ret = 0;
++	u64 pinned = PAGE_ALIGN((start & ~PAGE_MASK) + length);
++
++	if (!udata || udata->inlen || udata->outlen || dmah || access & ~SN_ACCESS_FLAGS)
++		return ERR_PTR(-EOPNOTSUPP);
++	if (!length || length > SN_MR_BYTES || start > ULONG_MAX ||
++	    !sn_range(start, length, start, length) ||
++	    !sn_range(iova, length, iova, length) ||
++	    ((access & IB_ACCESS_REMOTE_WRITE) && !(access & IB_ACCESS_LOCAL_WRITE)))
++		return ERR_PTR(-EINVAL);
++	m = kzalloc(sizeof(*m), GFP_KERNEL);
++	if (!m)
++		return ERR_PTR(-ENOMEM);
++	mutex_lock(&d->lock);
++	if (d->dead) ret = -ENODEV;
++	else if (d->mr_count == SN_MAX_MRS || pinned > SN_PIN_BYTES - d->pinned)
++		ret = -ENOMEM;
++	else if (d->key_serial == U32_MAX) ret = -EOVERFLOW;
++	if (ret)
++		goto fail;
++	m->umem = ib_umem_get_va(&d->ib, start, length, access);
++	if (IS_ERR(m->umem)) {
++		ret = PTR_ERR(m->umem);
++		goto fail;
++	}
++	m->ib.device = &d->ib;
++	m->ib.pd = pd;
++	m->ib.lkey = ++d->key_serial;
++	m->ib.rkey = m->ib.lkey;
++	m->base = iova; m->size = length; m->pinned = pinned; m->access = access;
++	m->ib.iova = iova; m->ib.length = length;
++	list_add_tail(&m->entry, &d->mrs);
++	d->mr_count++; d->pinned += pinned;
++	mutex_unlock(&d->lock);
++	return &m->ib;
++fail:
++	mutex_unlock(&d->lock);
++	kfree(m);
++	return ERR_PTR(ret);
++}
++int sn_dereg_mr(struct ib_mr *ib, struct ib_udata *udata)
++{
++	struct sn_mr *m = container_of(ib, struct sn_mr, ib);
++	struct sn_device *d = sn_dev(ib->device);
++
++	mutex_lock(&d->lock);
++	if (m->users) {
++		mutex_unlock(&d->lock);
++		return -EBUSY;
++	}
++	list_del(&m->entry);
++	d->mr_count--; d->pinned -= m->pinned;
++	ib_umem_release(m->umem);
++	mutex_unlock(&d->lock);
++	kfree(m);
++	return 0;
++}
+diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/strix_nhi/protocol.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/infiniband/hw/strix_nhi/protocol.c
+@@ -0,0 +1,458 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "strix_nhi.h"
++
++/* Session handshake is wire-carried over the native rings. Static discovery
++ * uses only immediate service properties (rxhop); epochs/generations in the
++ * frames themselves reject stale sessions. HELLO/HELLO_ACK establish the
++ * reciprocal readiness echoes; BIND/BIND_ACK pair the QP exactly like the
++ * retired property snapshot did, with the generation echo rejecting stale
++ * pairings. Handshake frames are best-effort: timers retransmit them. */
++static void sn_session_reset(struct sn_device *d)
++{
++	struct sn_qp *q = d->qp;
++
++	d->ready.peer_epoch = 0;
++	d->ready.peer_ready = 0;
++	d->ready.local_echo = 0;
++	d->ready.peer_echo = 0;
++	d->control_count = 0;
++	if (q && q->bound) sn_qp_error(q, IB_WC_GENERAL_ERR);
++}
++static void sn_control_queue(struct sn_device *d, const struct sn_header *h)
++{
++	unsigned int i;
++
++	/* One pending entry per handshake opcode; a newer echo REPLACES a stale
++	 * one. ACKs keep their identity coalescing in sn_ack(). Overflow just
++	 * drops: timers retry. */
++	for (i = 0; i < d->control_count; i++) {
++		struct sn_header *old = &d->control[(d->control_head + i) % ARRAY_SIZE(d->control)];
++		if (old->opcode == h->opcode) { *old = *h; return; }
++	}
++	if (d->control_count == ARRAY_SIZE(d->control)) return;
++	d->control[(d->control_head + d->control_count++) % ARRAY_SIZE(d->control)] = *h;
++}
++static void sn_receive_hello(struct sn_device *d, const struct sn_header *h)
++{
++	struct sn_header r = {0};
++
++	if (!sn_local_ready(&d->ready)) return;
++	if (d->ready.peer_epoch && d->ready.peer_epoch != h->src_epoch)
++		sn_session_reset(d);
++	d->ready.peer_epoch = h->src_epoch;
++	d->ready.local_echo = h->src_epoch;
++	r.opcode = SN_HELLO_ACK; r.src_epoch = d->ready.local_epoch;
++	r.dst_epoch = h->src_epoch; r.total = SN_CAPS_V1;
++	sn_control_queue(d, &r);
++}
++static void sn_receive_hello_ack(struct sn_device *d, const struct sn_header *h)
++{
++	struct sn_header r = {0};
++
++	if (!sn_local_ready(&d->ready)) return;
++	if (h->dst_epoch != d->ready.local_epoch) return;
++	/* A valid echo proves the peer's current epoch. Adopt it and refresh our
++	 * own echo so a session where only one side reset still converges. */
++	if (d->ready.peer_epoch != h->src_epoch) {
++		if (d->ready.peer_epoch && d->ready.peer_echo) sn_session_reset(d);
++		d->ready.peer_epoch = h->src_epoch;
++	}
++	if (d->ready.local_echo != h->src_epoch) {
++		d->ready.local_echo = h->src_epoch;
++		r.opcode = SN_HELLO_ACK; r.src_epoch = d->ready.local_epoch;
++		r.dst_epoch = h->src_epoch; r.total = SN_CAPS_V1;
++		sn_control_queue(d, &r);
++	}
++	d->ready.peer_echo = d->ready.local_epoch;
++	d->ready.peer_ready = 1;
++}
++static void sn_receive_bind(struct sn_device *d, const struct sn_header *h, bool ack)
++{
++	struct sn_qp *q = d->qp;
++	struct sn_header r = {0};
++
++	if (!q || q->destroying || q->attr.qp_state != IB_QPS_RTS ||
++	    !sn_ready(&d->ready)) return;
++	if (h->src_epoch != d->ready.peer_epoch ||
++	    h->dst_epoch != d->ready.local_epoch) return;
++	/* Cross-check the pairing exactly like the retired property snapshot. */
++	if (h->dst_qpn != q->ib.qp_num || h->src_qpn != q->attr.dest_qp_num ||
++	    h->sequence != q->attr.rq_psn || h->ack_sequence != q->attr.sq_psn)
++		return;
++	if (q->bound && q->binding.peer_generation != h->src_generation) {
++		/* The peer recreated its QP; never silently re-pair. */
++		d->control_count = 0;
++		sn_qp_error(q, IB_WC_GENERAL_ERR);
++		return;
++	}
++	if (ack) {
++		/* Only an echo of our current generation may complete the pair. */
++		if (h->dst_generation != q->binding.local_generation) return;
++	} else {
++		r.opcode = SN_BIND_ACK; r.src_qpn = q->ib.qp_num;
++		r.dst_qpn = q->attr.dest_qp_num;
++		r.src_generation = q->binding.local_generation;
++		r.dst_generation = h->src_generation;
++		r.src_epoch = d->ready.local_epoch; r.dst_epoch = h->src_epoch;
++		r.sequence = q->attr.sq_psn; r.ack_sequence = q->attr.rq_psn;
++		sn_control_queue(d, &r);
++	}
++	if (!q->bound) {
++		q->binding.local_epoch = d->ready.local_epoch;
++		q->binding.peer_epoch = d->ready.peer_epoch;
++		q->binding.peer_generation = h->src_generation;
++		q->binding.peer_qpn = h->src_qpn;
++		q->bound = true;
++	}
++}
++
++static struct sn_header sn_out_header(struct sn_qp *q, u32 opcode)
++{
++	struct sn_header h = {0};
++
++	h.opcode = opcode;
++	h.src_qpn = q->binding.local_qpn; h.dst_qpn = q->binding.peer_qpn;
++	h.src_generation = q->binding.local_generation; h.dst_generation = q->binding.peer_generation;
++	h.src_epoch = q->binding.local_epoch; h.dst_epoch = q->binding.peer_epoch;
++	return h;
++}
++/* Returns nonzero after a full control queue failed the QP; the flush has
++ * already retired every SQ/RQ WQE, so callers must not touch them again. */
++static int sn_ack(struct sn_qp *q, u32 opcode, u64 sequence, u32 status)
++{
++	struct sn_device *d = sn_dev(q->ib.device);
++	struct sn_header h = sn_out_header(q, opcode);
++	unsigned int i;
++
++	h.ack_sequence = sequence; h.status = status;
++	for (i = 0; i < d->control_count; i++) {
++		struct sn_header *old = &d->control[(d->control_head + i) % ARRAY_SIZE(d->control)];
++		if (old->opcode == opcode && old->ack_sequence == sequence) {
++			*old = h;
++			return 0;
++		}
++	}
++	if (d->control_count == ARRAY_SIZE(d->control)) {
++		sn_qp_error(q, IB_WC_GENERAL_ERR);
++		return -ENOSPC;
++	}
++	d->control[(d->control_head + d->control_count++) % ARRAY_SIZE(d->control)] = h;
++	return 0;
++}
++void sn_engine_reset(struct sn_qp *q)
++{
++	sn_mr_put(q->remote_mr); q->remote_mr = NULL;
++	q->active = q->response_active = q->outgoing_sent = q->response_sent = false;
++	q->have_last_read = q->rnr_wait = q->credit_sent = false;
++	memset(&q->receive, 0, sizeof(q->receive));
++	memset(&q->read_receive, 0, sizeof(q->read_receive));
++}
++static void sn_send_complete(struct sn_qp *q)
++{
++	struct sn_wqe *w = &q->sq[q->sq_head];
++	int ret;
++
++	if (WARN_ON_ONCE(!q->sq_count || q->attr.qp_state != IB_QPS_RTS))
++		return;
++	ret = sn_complete(q, w, false, IB_WC_SUCCESS, w->opcode == SN_READ ? w->length : 0);
++	sn_mr_put(w->mr); w->mr = NULL;
++	q->sq_head = (q->sq_head + 1) % SN_QUEUE_DEPTH; q->sq_count--;
++	q->next_sequence++;
++	q->active = q->outgoing_sent = q->rnr_wait = false;
++	q->progress_deadline = ktime_get_ns() + 30000000000ULL;
++	if (ret) sn_qp_error(q, IB_WC_GENERAL_ERR);
++}
++static void sn_receive_ack(struct sn_qp *q, const struct sn_header *h)
++{
++	if (h->opcode == SN_READ_ACK) {
++		if (q->response_active && h->ack_sequence == q->read_request.sequence)
++			q->response_active = false;
++		return;
++	}
++	if (!q->active || !q->sq_count || h->ack_sequence != q->next_sequence)
++		return;
++	if (h->status == SN_RNR) {
++		if (q->sq[q->sq_head].opcode != SN_SEND || q->rnr_wait) return;
++		if (!sn_retry_take(&q->rnr_retries, q->attr.rnr_retry)) {
++			sn_qp_error(q, IB_WC_RNR_RETRY_EXC_ERR); return;
++		}
++		q->rnr_wait = true;
++		q->outgoing_sent = true;
++		q->deadline = ktime_get_ns() + sn_rnr_timeout_ns(q->attr.min_rnr_timer);
++	} else if (h->status != SN_OK) {
++		sn_qp_error(q, h->status == SN_ACCESS ? IB_WC_REM_ACCESS_ERR : IB_WC_REM_INV_REQ_ERR);
++	} else if (q->sq[q->sq_head].opcode != SN_READ) {
++		sn_send_complete(q);
++	}
++}
++static void sn_receive_read_reply(struct sn_qp *q, const struct sn_header *h, const u8 *payload)
++{
++	struct sn_wqe *w;
++	enum sn_fragment_result result;
++
++	if (q->have_last_read && h->sequence == q->last_read && h->total == q->last_read_length) {
++		sn_ack(q, SN_READ_ACK, h->sequence, SN_OK);
++		return;
++	}
++	if (!q->active || !q->sq_count || h->sequence != q->next_sequence) return;
++	w = &q->sq[q->sq_head];
++	if (w->opcode != SN_READ || h->total != w->length) {
++		sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
++	}
++	result = sn_fragment(&q->read_receive, h);
++	if (result == SN_FRAGMENT_INVALID) {
++		sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
++	}
++	if (result != SN_FRAGMENT_START && result != SN_FRAGMENT_APPEND) return;
++	memcpy(q->read_incoming + h->offset, payload, h->length);
++	sn_fragment_commit(&q->read_receive, h);
++	if (q->read_receive.received != h->total) return;
++	if (sn_mr_copy(w->mr, w->address, q->read_incoming, w->length, true)) {
++		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
++	}
++	sn_dev(q->ib.device)->read_bytes += h->total;
++	q->last_read = h->sequence; q->last_read_length = h->total; q->have_last_read = true;
++	if (sn_ack(q, SN_READ_ACK, h->sequence, SN_OK)) return;
++	sn_send_complete(q);
++}
++static void sn_request_error(struct sn_qp *q, const struct sn_header *h, u32 status)
++{
++	/* Retain the rejection, just like placement, so retry cannot change it. */
++	if (!q->receive.active) sn_fragment_commit(&q->receive, h);
++	sn_operation_commit(&q->receive, status);
++	sn_ack(q, SN_ACK, h->sequence, status);
++	sn_mr_put(q->remote_mr); q->remote_mr = NULL;
++}
++static void sn_receive_request(struct sn_qp *q, const struct sn_header *h, const u8 *payload)
++{
++	enum sn_fragment_result result = sn_fragment(&q->receive, h);
++	struct sn_wqe *w;
++	int ret;
++
++	if (result == SN_FRAGMENT_REPLAY) {
++		if (h->opcode == SN_READ && q->receive.replay_status == SN_OK) {
++			/* Never resample a live MR for a duplicate READ. */
++			if (!q->response_active || q->response_sent) {
++				q->response_active = true; q->response_sent = false;
++				q->response_offset = 0;
++			}
++		} else sn_ack(q, SN_ACK, h->sequence, q->receive.replay_status);
++		return;
++	}
++	if (result == SN_FRAGMENT_INVALID) {
++		sn_ack(q, SN_ACK, h->sequence, SN_PROTOCOL);
++		sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
++	}
++	if (result != SN_FRAGMENT_START && result != SN_FRAGMENT_APPEND) return;
++	if (result == SN_FRAGMENT_START) {
++		q->assembly_deadline = ktime_get_ns() + 30000000000ULL;
++		/* A serial peer's next operation implicitly acknowledges its previous
++		 * READ response, allowing the single retained snapshot to advance. */
++		q->response_active = false;
++		if (h->opcode == SN_SEND) {
++			if (!q->rq_count) { sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
++			w = &q->rq[q->rq_head];
++			if (h->total > w->length) {
++				sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
++				sn_mr_put(w->mr); w->mr = NULL;
++				q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
++				sn_request_error(q, h, SN_LENGTH);
++				sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
++			}
++		} else {
++			u32 access = h->opcode == SN_READ ? IB_ACCESS_REMOTE_READ : IB_ACCESS_REMOTE_WRITE;
++			if (!(q->attr.qp_access_flags & access) ||
++			    (h->opcode == SN_READ && !q->attr.max_dest_rd_atomic)) {
++				sn_request_error(q, h, SN_ACCESS); return;
++			}
++			q->remote_mr = sn_mr_get(q, h->rkey, h->address, h->total, access);
++			if (!q->remote_mr) { sn_request_error(q, h, SN_ACCESS); return; }
++		}
++		if (h->opcode == SN_READ) {
++			ret = sn_mr_copy(q->remote_mr, h->address, q->read_snapshot, h->total, false);
++			sn_mr_put(q->remote_mr); q->remote_mr = NULL;
++			if (ret) { sn_request_error(q, h, SN_ACCESS); return; }
++			q->read_request = *h;
++			q->response_active = true; q->response_sent = false;
++			q->response_offset = q->response_retries = 0;
++			q->response_deadline = ktime_get_ns() + 30000000000ULL;
++			sn_fragment_commit(&q->receive, h);
++			sn_operation_commit(&q->receive, SN_OK);
++			return;
++		}
++	}
++	memcpy(q->incoming + h->offset, payload, h->length);
++	sn_fragment_commit(&q->receive, h);
++	if (q->receive.received != h->total) return;
++	if (h->opcode == SN_SEND) {
++		w = &q->rq[q->rq_head];
++		ret = sn_mr_copy(w->mr, w->address, q->incoming, h->total, true);
++		if (!ret) ret = sn_complete(q, w, true, IB_WC_SUCCESS, h->total);
++		sn_mr_put(w->mr); w->mr = NULL;
++		q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
++	} else {
++		ret = sn_mr_copy(q->remote_mr, h->address, q->incoming, h->total, true);
++		sn_mr_put(q->remote_mr); q->remote_mr = NULL;
++	}
++	if (ret) {
++		sn_request_error(q, h, SN_ACCESS);
++		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
++	}
++	if (h->opcode == SN_SEND) sn_dev(q->ib.device)->send_bytes += h->total;
++	else sn_dev(q->ib.device)->write_bytes += h->total;
++	sn_operation_commit(&q->receive, SN_OK);
++	sn_ack(q, SN_ACK, h->sequence, SN_OK);
++}
++void sn_engine_receive(struct sn_device *d, const void *frame, size_t bytes)
++{
++	struct sn_qp *q = d->qp;
++	struct sn_header h;
++
++	if (sn_decode(&h, frame, bytes)) {
++		d->bad_frames++;
++		return;
++	}
++	switch (h.opcode) {
++	case SN_HELLO: sn_receive_hello(d, &h); return;
++	case SN_HELLO_ACK: sn_receive_hello_ack(d, &h); return;
++	case SN_BIND: sn_receive_bind(d, &h, false); return;
++	case SN_BIND_ACK: sn_receive_bind(d, &h, true); return;
++	}
++	if (!q || !q->bound || q->attr.qp_state != IB_QPS_RTS || !sn_ready(&d->ready)) return;
++	if (!sn_admit(&q->binding, &h)) {
++		d->bad_frames++;
++		return;
++	}
++	switch (h.opcode) {
++	case SN_ACK: case SN_READ_ACK: sn_receive_ack(q, &h); break;
++	case SN_READ_REPLY: sn_receive_read_reply(q, &h, frame + SN_HEADER); break;
++	case SN_SEND: case SN_WRITE: case SN_READ:
++		sn_receive_request(q, &h, frame + SN_HEADER); break;
++	case SN_CREDIT:
++		/* Credits are only hints; RQ ownership is checked on actual SEND. */
++		break;
++	}
++}
++static int sn_fragments_send(struct sn_device *d, struct sn_header *h, const u8 *data,
++			     u32 *offset, bool reply)
++{
++	int ret;
++
++	do {
++		h->offset = *offset;
++		h->length = min_t(u32, h->total - *offset, SN_PAYLOAD);
++		ret = sn_ring_send(d, h, data + *offset, reply);
++		if (ret) return ret;
++		*offset += h->length;
++	} while (*offset < h->total);
++	return 0;
++}
++void sn_engine_progress(struct sn_device *d)
++{
++	struct sn_qp *q = d->qp;
++	struct sn_header h;
++	struct sn_wqe *w;
++	u64 now = ktime_get_ns();
++	int ret;
++
++	/* Retransmit HELLO until the reciprocal echoes complete the session. */
++	if (!d->dead && sn_local_ready(&d->ready) && !sn_ready(&d->ready) &&
++	    now >= d->next_hello) {
++		h = (struct sn_header){0};
++		h.opcode = SN_HELLO; h.src_epoch = d->ready.local_epoch;
++		h.dst_epoch = d->ready.peer_epoch; h.total = SN_CAPS_V1;
++		sn_ring_send(d, &h, NULL, true);
++		d->next_hello = now + SN_HELLO_INTERVAL_NS;
++	}
++	/* Handshake control (HELLO_ACK/BIND) must drain before full readiness;
++	 * data ACKs that cannot send yet stay queued. */
++	while (d->control_count) {
++		h = d->control[d->control_head];
++		ret = sn_ring_send(d, &h, NULL, true);
++		if (ret) break;
++		d->control_head = (d->control_head + 1) % ARRAY_SIZE(d->control);
++		d->control_count--;
++	}
++	if (!sn_ready(&d->ready) || d->dead) goto watchdog;
++	/* Retransmit BIND while the QP waits to pair; sn_ready is required. */
++	if (q && !q->bound && !q->destroying && q->attr.qp_state == IB_QPS_RTS &&
++	    now >= q->next_bind) {
++		h = (struct sn_header){0};
++		h.opcode = SN_BIND; h.src_qpn = q->ib.qp_num;
++		h.dst_qpn = q->attr.dest_qp_num;
++		h.src_generation = q->binding.local_generation;
++		h.src_epoch = d->ready.local_epoch; h.dst_epoch = d->ready.peer_epoch;
++		h.sequence = q->attr.sq_psn; h.ack_sequence = q->attr.rq_psn;
++		sn_control_queue(d, &h);
++		q->next_bind = now + SN_BIND_INTERVAL_NS;
++	}
++	if (!q || !q->bound || q->attr.qp_state != IB_QPS_RTS) goto watchdog;
++	if (q->receive.active && now >= q->assembly_deadline) {
++		sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
++	}
++	if (!q->credit_sent || q->last_credit != q->rq_count) {
++		if (q->credit_revision == U64_MAX) {
++			sn_qp_error(q, IB_WC_GENERAL_ERR); return;
++		}
++		h = sn_out_header(q, SN_CREDIT);
++		h.sequence = q->credit_revision + 1; h.total = q->rq_count;
++		if (!sn_ring_send(d, &h, NULL, true)) {
++			q->credit_revision++; q->last_credit = q->rq_count;
++			q->credit_sent = true;
++		}
++	}
++	if (q->response_active) {
++		if (q->response_sent && now >= q->response_deadline) {
++			if (!sn_retry_take(&q->response_retries, q->attr.retry_cnt)) {
++				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
++			}
++			q->response_sent = false; q->response_offset = 0;
++			q->response_deadline = now + 30000000000ULL;
++		}
++		if (!q->response_sent) {
++			h = sn_out_header(q, SN_READ_REPLY);
++			h.sequence = q->read_request.sequence; h.total = q->read_request.total;
++			ret = sn_fragments_send(d, &h, q->read_snapshot, &q->response_offset, true);
++			if (!ret) {
++				q->response_sent = true;
++				q->response_deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
++			} else if (ret != -EAGAIN || now >= q->response_deadline) {
++				sn_qp_error(q, IB_WC_GENERAL_ERR); return;
++			}
++		}
++	}
++	if (!q->sq_count) return;
++	w = &q->sq[q->sq_head];
++	if (!q->active) {
++		if (q->next_sequence == U64_MAX) { sn_qp_error(q, IB_WC_GENERAL_ERR); return; }
++		if (w->opcode != SN_READ && sn_mr_copy(w->mr, w->address, q->outgoing, w->length, false)) {
++			sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
++		}
++		q->active = true; q->outgoing_sent = false;
++		q->outgoing_offset = q->retries = q->rnr_retries = 0;
++		memset(&q->read_receive, 0, sizeof(q->read_receive));
++		q->read_receive.expected = q->next_sequence;
++	}
++	if (q->outgoing_sent) {
++		if (now < q->deadline) return;
++		if (!q->rnr_wait && !sn_retry_take(&q->retries, q->attr.retry_cnt)) {
++			sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
++		}
++		q->rnr_wait = q->outgoing_sent = false;
++		q->outgoing_offset = 0;
++	}
++	h = sn_out_header(q, w->opcode);
++	h.sequence = q->next_sequence; h.total = w->length;
++	h.address = w->remote_address; h.rkey = w->rkey;
++	if (w->opcode == SN_READ) ret = sn_ring_send(d, &h, NULL, false);
++	else ret = sn_fragments_send(d, &h, q->outgoing, &q->outgoing_offset, false);
++	if (!ret) {
++		q->outgoing_sent = true;
++		q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
++	} else if (ret != -EAGAIN) sn_qp_error(q, IB_WC_GENERAL_ERR);
++watchdog:
++	if (q && ((q->sq_count && now >= q->progress_deadline) ||
++	    (q->receive.active && now >= q->assembly_deadline) ||
++	    (q->response_active && !sn_ready(&d->ready) && now >= q->response_deadline)))
++		sn_qp_error(q, IB_WC_RETRY_EXC_ERR);
++}

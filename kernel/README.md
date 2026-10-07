@@ -1,5 +1,17 @@
 # Kernel work
 
+## Separate experimental native verbs (default off)
+
+[`verbs/`](verbs/README.md) adds a real native NHI RDMA/uverbs service plus an
+opt-in core lifetime extension **after** the existing eight backport and twenty
+zero-copy patches. It does not replace or change USB4STREAM behavior. Its normal
+rdma-core provider is in `../providers/strix_nhi/`; limits, CPU-copy semantics,
+Linux build evidence and unrun device/DS4/hardware gates are documented in
+[`docs/NATIVE_VERBS.md`](../docs/NATIVE_VERBS.md). Existing install/lifecycle
+scripts do not activate it. Enabling its conditional core extension requires
+rebuilding the whole Thunderbolt module set together; the USB4STREAM-only
+module procedure below is not a native-verbs deployment procedure.
+
 Two ways to get USB4STREAM onto the 7.1.5 Strix Halo hosts. Pick one:
 
 ## Option A — boot Linux 7.2

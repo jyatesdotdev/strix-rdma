@@ -22,8 +22,20 @@ The full design and rationale live in [docs/PLAN.md](docs/PLAN.md)
   completions, and proven ROCm mapping of the same pages so tensors go
   GPU → DMA page → cable → DMA page → GPU. Native HIP-owned DMA-BUF pools are
   the remaining experimental variant.
-- This is *not* one-sided RDMA; the NHI has no rkeys/QPs/atomics and they
-  cannot be synthesized in a driver.
+- The production USB4STREAM path is not one-sided RDMA. The NHI does not
+  **offload** rkeys/QPs/atomics or verbs reliability. A driver can implement
+  bounded verbs semantics in software, without adding RNIC hardware features.
+
+A separate, default-off **experimental Linux native software-verbs** backend and
+rdma-core provider now live in `kernel/verbs/` and `providers/strix_nhi/`.
+They use independent NHI rings, real uverbs objects and CPU-copy staging for
+bounded SEND/RECV/READ/WRITE—not RoCE, TCP payload fallback or GPU-direct.
+**Validated on the lab nodes: full two-host SEND/RECV exchange, repeated
+module reloads, and unmodified ROCm DS4 tensor parallelism over the provider
+(377 MB placed, zero bad frames, working inference).** Not complete RC
+conformance or a performance claim. See [docs/NATIVE_VERBS.md](docs/NATIVE_VERBS.md)
+for limits, safety restrictions and the reproduction procedure in
+[kernel/verbs/README.md](kernel/verbs/README.md).
 
 ## Quick start
 
@@ -45,6 +57,10 @@ docs/            Design docs. PLAN.md is the master plan.
 kernel/          Kernel-side work: USB4STREAM backport to the hosts' 7.1.5
                  kernel, then the zero-copy UAPI patches on top.
   backport/      Extracted upstream patches for the backport.
+  verbs/         Separate default-off native RDMA service/core follow-on patches.
+providers/strix_nhi/
+                 Standard rdma-core v62 provider; no system-library replacement.
+tools/verbs/     Explicit-live standard-verbs CPU/DS4-shaped smoke (not default).
 tools/pingpong/  Userspace latency/bandwidth test against /dev/tbstreamX.
 tools/dmabuf-probe/
                  Privileged no-traffic DMA-BUF import probe runner

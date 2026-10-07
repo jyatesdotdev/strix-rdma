@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config INFINIBAND_STRIX_NHI
+	tristate "Experimental native NHI software verbs"
+	depends on INFINIBAND_USER_ACCESS && INFINIBAND_USER_MEM
+	depends on USB4 && USB4_NET && NET && INET && PCI
+	select INFINIBAND_VIRT_DMA
+	default n
+	help
+	  CPU-copy software RC SEND/RECV, READ and WRITE using independent
+	  Thunderbolt XDomain NHI rings. This is not RoCE or RNIC offload.
+	  Requires the Strix series20 Thunderbolt backports, a same-XDomain
+	  thunderbolt-net device, and explicit enable=1 at module load.
+	  Experimental: hardware and peer-loss qualification is outstanding.

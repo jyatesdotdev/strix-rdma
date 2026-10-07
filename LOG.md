@@ -1,6 +1,326 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-06 — native verbs: DS4 TP over the provider (hardware-validated)
+- **What:** The experimental native NHI verbs backend (`kernel/verbs/`,
+  `providers/strix_nhi/`) passed its full bring-up on the lab nodes (max/max2,
+  Fedora 43 / 7.2.8). Two-host SEND/RECV exchange PASS (0/1/3984-byte and 2 MiB
+  windows, 18.9 MB, ERR flush), repeated module reload cycles, and unmodified
+  ROCm DS4 tensor parallelism over the provider (`--transport rdma
+  --rdma-device strix_nhi0 --rdma-gid-index 0`): TP bound rank 0/1, 50/50
+  expert split, 377 MB placed through SEND/RECV, ~140k frames per direction,
+  zero bad frames, working 128-token inference, no kernel warnings.
+- **The three hardware bugs found in bring-up** (documented in
+  `kernel/verbs/README.md`): (1) `sof=0` broke multi-packet frame reassembly —
+  >252-byte frames arrived as CRC-flagged pieces with intact content; the fix
+  is tbnet's framing `sof=FRAME_START(1), eof=FRAME_END(2)`. (2)
+  `RING_FLAG_E2E` is required on both rings (unlike tbnet's RX-only) or large
+  transfers wedge on E2E credit accounting. (3) The XDomain in-HopID must stay
+  clear of thunderbolt-net's login (HopID 8) — allocate from 10 up — or TB-IP
+  re-login breaks and its carrier (which our rings gate on) never rises.
+- **Also in this effort:** kernel migration to 7.2.8 (the 20-patch zero-copy
+  series rebased; the 7.1 backport series is upstream in 7.2), and a redesign
+  of the session handshake to a wire-carried dual HELLO/HELLO_ACK +
+  BIND/BIND_ACK exchange (the property channel now carries only static prtc* +
+  a write-once `rxhop` rendezvous), which eliminated the stale-snapshot class.
+- **Next:** throughput/latency A/B against the stream path (the keep-native-vs
+  -stream decision data); hardware RDMA READ/WRITE (DS4's RoCE path is
+  SEND-only); hot-unplug and malformed-peer injection.
+
+## 2026-08-28 — `ae762ae` endurance v9 PASS (executed)
+- **What:** Operator-authorized one launch of reviewed v9 (SHA256SUMS
+  `dfdd7d04…d65e`). SUCCESS nonce `beb77d1b…a22e`. Evidence `843f15b1…84e1`
+  (212). All 6 identity SHA `cf044162…` len 83409, 16384/length, cached=0,
+  prompt 160021. Prefill TPS 0.9997 wall 1.0004 (gates pass). Decode t/s
+  8.75 vs 7.54 (0.862×, report-only). Median wall 2652 vs 2954 s (1.114×).
+  Coord 13587/3929/2797 all shared samples. Restoration PASS. Mutex gone.
+- **Why:** Endurance screen of exact-shared vs nospec at 16384 tokens /
+  ≥100k prompt on compile-oracle v2 binaries.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
+  `…/stage3-ae762ae-endurance-v9-capture`. Window:
+  `bench/results/2026-08-28-ds4-stage3-ae762ae-endurance-v9-window.md`.
+
+## 2026-08-27 — `ae762ae` route-overlap v5 PASS
+- **What:** Independently reviewed exact-digest route-overlap v5
+  (SHA256SUMS `39ce023b…6978`). Canonical base/span sequences identical
+  ordinary vs shared. Worker 471=456+15; coord 460=456+4; hist
+  `0:416,1:19,2:19,3:7,4:6,5:4`; continuation 22. Derived rows match
+  probe/ACTIVE. Weighted savings overall 0.338. Identity 1374/`5f38d237…`.
+  Restoration PASS. Evidence `fd7e8db2…28a7` (152/152).
+- **Why:** Measure exact-span shared-row routing overlap vs ordinary exact.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
+  `…/stage3-ae762ae-route-overlap-v5-capture`.
+
+## 2026-08-27 — `ae762ae` compile/oracle v2 PASS
+- **What:** Independently reviewed exact-digest compile-oracle v2
+  (SHA256SUMS `b0b9f9cf…cbfa`). Bilateral compile of `ae762ae` tree
+  `1e4aa17ee2…` (1494 files). Static 13/13 both hosts (shared 4, route 6,
+  dist-stats 3). dist-v3 92/92, TP/MXFP4/graph PASS, krow BITEXACT+PASS,
+  production-head k=2..5 BITEXACT ~2.07–5.18×. Candidate `ds4`
+  `edaa1727…` identical max/max2. Restoration PASS. Evidence
+  `6a956d40…bca1` (242/242). Mutex absent. Model HOLD.
+- **Why:** Route-probe (`e3976e3`) and dist proposal telemetry (`2856bf7`)
+  need a sealed bilateral candidate before any runtime probe/inference.
+- **Impact:** **COMPILE_ORACLES_PASS; model HOLD.** Capture:
+  `…/stage3-ae762ae-compile-oracle-v2-capture`.
+
+## 2026-08-27 — `223b182` shared-row inference v3 PASS
+- **What:** Independently reviewed exact-digest shared-inference v3
+  (SHA256SUMS `c528e99a…ee40`). 7 phases AB/BA/AB, krow v2 binaries. All 7
+  outputs 512/1374 SHA `5f38d237…` with identical
+  `(content,reasoning,role,finish,usage)`. Work tuple cycles=460 proposed=59
+  accepted_draft=53 on all 6 spec samples. Shared ACTIVE hist `{3:3,4:6,5:6}`
+  both roles, layers worker 22:42 / coord 0:21; one WARNING; zero REJECTED.
+  Median wall shared/exact 0.996x; decode t/s 1.004x. Restoration PASS.
+  Evidence `e1c472d7…40eb` (240/240).
+- **Why:** Measure exact-span shared-row batching vs exact baseline with
+  matched proposal work. Identity holds; wall is a wash (~1.07x vs nospec).
+- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
+  `…/stage3-223b182-shared-inference-v3-capture`.
+
+## 2026-08-27 — `f7edfcf` exact-spec inference v4 PASS (scheduler=0)
+- **What:** Independently reviewed exact-digest inference v4
+  (SHA256SUMS `ddf05eca…045f`). Exact arm `DS4_DSPARK_SCHEDULER=0` (baseline
+  absent). Sealed identity 1374/`5f38d237…`. Coordinator proposed=162
+  accepted_draft=132 (vs v3 59/53). Worker scheduler_skips=0. Prefill ~82 t/s;
+  decode 14.43 vs 11.19; wall 36.549 vs 46.820 (1.281x). Restoration PASS.
+  Evidence `e155f538…80e1` (130/130).
+- **Why:** v3 default scheduler skipped 351/460 cycles; this probe measures
+  density with scheduler off. More accepts, worse wall — proposer chain
+  ~5.4 s dominates.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
+  `…/stage3-f7edfcf-inference-v4-capture`.
+
+## 2026-08-27 — `f7edfcf` exact-spec inference v3 PASS
+- **What:** Independently reviewed exact-digest inference v3
+  (SHA256SUMS `9bc889d0…a81a`). Nospec vs DSpark with EXACT=1 + SPAN=1 +
+  KROW_REQUIRED=1 (baseline keys absent). Identity 512/512 both len 1374 SHA
+  `5f38d237…` (sealed v30/v32e). Coordinator proposed=59 accepted_draft=53.
+  Prefill 82.19 vs 81.80 t/s; decode 14.45 vs 13.42; wall 36.487 vs 39.205
+  (1.074x). Restoration PASS. Evidence `f9dbf4ba…3ace` (130/130).
+- **Why:** Measure whether production-head Q8 k-row speedup moves real exact
+  speculation. It does fire (59/53) and stays bit-identical; wall is still
+  ~7% slower than nospec in this one-sample screen.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
+  `…/stage3-f7edfcf-inference-v3-capture`.
+
+## 2026-08-27 — `f7edfcf` k-row oracle/bench v2 PASS
+- **What:** Independently reviewed exact-digest krow v2
+  (SHA256SUMS `9931cd08…bca4`). Bilateral compile of `f7edfcf` tree
+  `0e4a0176…`. Krow test BITEXACT+PASS both hosts. Production-head bench
+  `4096x129280` / `7168x129280` k=2..5 all BITEXACT; speedups ~2.1–5.2× vs
+  sequential. Candidate `ds4` `b9511e36…` identical max/max2. Restoration
+  PASS. Evidence `1b624100…097b` (218/218). Mutex absent. Model HOLD.
+- **Why:** Exact 2..5-row Q8 prequant path vs serial one-row, production vocab
+  head, required-mode banner.
+- **Impact:** **COMPILE_ORACLES_PASS; model HOLD.** Capture:
+  `…/stage3-f7edfcf-krow-v2-capture`.
+
+## 2026-08-27 — `11a0c28` inference v32e PASS (no MULTI_MODEL)
+- **What:** Independently reviewed exact-digest v32e
+  (SHA256SUMS `11bcfe5f…e012`). Nospec vs DSpark+SPEC_DISABLE with
+  `DS4_ROCM_Q8_F16_CACHE_MULTI_MODEL` **absent**. Identity 512/512, both
+  len 1374 SHA `5f38d237…` (byte-identical to sealed v30). Prefill 81.87 vs
+  82.02 t/s; wall 36.487 vs 36.561 (1.002x). No dist spec stats; worker
+  DSpark stats absent. Exact policy line both roles on support arm.
+  FD-exec `/proc/self/fd/3`. Restoration PASS. Evidence `c1a8f2d8…b658`
+  (130/130). Mutex/snapshots absent.
+- **Why:** Prove `11a0c28` preserves primary Q8-F16 without the v30 env override.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
+  `…/stage3-11a0c28-inference-v32e-capture`.
+
+## 2026-08-27 — `11a0c28` compile-oracle v31c PASS
+- **What:** Independently reviewed exact-digest v31c
+  (SHA256SUMS `5918272e…3d21`). Bilateral compile of `11a0c28` tree
+  `9fc5803e…`. Krow BITEXACT after support map + overall PASS on both hosts.
+  Production binaries identical max/max2 (`ds4` `5cb6ed4c…`, `ds4-server`
+  `46eebe15…`). Restoration PASS. Evidence `25a8ed7d…2702` (206/206).
+  Mutex absent. Inference HOLD.
+- **Why:** Runtime Q8-F16 primary-cache preservation needs a unique candidate
+  build before MULTI_MODEL-unset inference.
+- **Impact:** **COMPILE_ORACLES_PASS; model HOLD.** Capture:
+  `…/stage3-11a0c28-v31c-capture`. Inference freeze waits on this PASS review.
+
+## 2026-08-27 — `3798544` v30 Q8-F16 multi-model cache localization PASS
+- **What:** Independently reviewed exact-digest v30
+  (SHA256SUMS `2f4f5e17…bfc9`). Nospec vs DSpark+SPEC_DISABLE with
+  `DS4_ROCM_Q8_F16_CACHE_MULTI_MODEL=1` on both roles. Identity 512/512,
+  both len 1374 SHA `5f38d237…`. Prefill 82.24 vs 82.10 t/s; wall 36.554 vs
+  36.519 (1.001x). No dist spec stats. Capture layers 40,41,42. Restoration
+  PASS. Evidence `a7e0a85b…0bc1` (126/126).
+- **Why:** Loading DSpark disabled primary Q8→F16 caches unless MULTI_MODEL=1.
+  Same alternate SHA across v26/v27/v29 DSpark modes was Q8 arithmetic
+  fallback, not speculative seam.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Runtime fix (keep
+  primary Q8-F16 under multi-model) is local atop 29d1cf4; no host compile
+  until a frozen build bundle is reviewed. Capture:
+  `…/stage3-3798544-inference-v30-capture`.
+
+## 2026-08-27 — `3798544` DSpark measurement v24b PASS
+- **What:** Independently reviewed exact-digest v24b
+  (SHA256SUMS `0795ea7a…aeb8`). Identity 128/128. Exact 11.723s / 12.74 t/s
+  (ratio 1.030 vs this-run nospec 11.386s). Trust-all 7.671s / 21.36 t/s.
+  Exact wall/t/s **unchanged vs v23c**; ratio drop is nospec variance.
+  Restoration PASS. Evidence `fee5149e…4cbe`.
+- **Why:** Single-buffer + per-row heads keep correctness; this 128-token
+  sample does not show an exact-arm wall win vs v23c.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Window:
+  `bench/results/2026-08-27-ds4-stage3-3798544-inference-v24b-window.md`.
+
+## 2026-08-27 — `d177574` DSpark measurement v23c PASS
+- **What:** Independently reviewed exact-digest v23c
+  (SHA256SUMS `61a85f0c…73bb`). Identity 128/128 exact=nospec. Trust-all
+  ceiling 7.651s / 21.41 t/s (−26.7% wall, +47.8% decode vs nospec 10.434s
+  / 14.49). Exact 11.728s / 12.74 (+12.4% wall). dmesg 3/3. Restoration PASS.
+  Evidence `ec687180…7b8e`. Frozen checker re-run PASS.
+- **Why:** Verification cost, not draft capacity. Next: cheaper exact row
+  heads and/or accept rate >85%.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
+  `…/stage3-d177574-inference-v23c-capture`.
+  Window: `bench/results/2026-08-27-ds4-stage3-d177574-inference-v23c-window.md`.
+
+## 2026-08-27 — v23 `13e9aa7` compile-oracle RETIRED unexecuted
+- **What:** Frozen SHA256SUMS `28cdcdd1…003a` kept in archive, never launched.
+  Trust-all knob will land as a second commit; v23-final + v23b will freeze
+  on that single tip.
+- **Why:** Avoid two compile windows; measurement binaries must include
+  `DS4_DIST_SPEC_TRUST_ALL`.
+- **Impact:** No host action. Bundle remains
+  `…/stage3-13e9aa7-compile-oracle-v23`.
+
+## 2026-08-27 — `b7627f6` DSpark measurement v22b PASS
+- **What:** Independently reviewed exact-digest v22b
+  (SHA256SUMS `1f74d836…cbe7`). Token identity 128/128 temp=0 spec=nospec.
+  Spec fire `cycles=99 proposed=32 accepted_draft=29` (90.62%). No hard-error.
+  Wall 13.15s spec vs 10.74s nospec (~+22%). Decode t/s 11.16 vs 14.50.
+  Restoration PASS. Evidence `81f2d4af…42e5`. Frozen checker re-run PASS.
+- **Why:** Exact replay is correct; at block=5 drafting does not pay for
+  replay cost. Default-off. Optimize-next is batch-exact verify.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model window HOLD.** Capture:
+  `…/stage3-b7627f6-inference-v22b-capture`.
+  Window: `bench/results/2026-08-27-ds4-stage3-b7627f6-inference-v22b-window.md`.
+  Merge-ready: `wip-dspark-dist` → `perf-prefill-decode` / PR #861.
+
+## 2026-08-27 — `b7627f6` compile-oracle v22 PASS; v22b measurement frozen
+- **What:** v22 compile-oracle PASS (SHA256SUMS `a51f4dad…e8b0`, nonce
+  `80a879f9…`, evidence `199f80b2…`). distv3 92/92; binaries
+  `ds4` `cf57608c…30c9` / `ds4-server` `da6ed2c4…1784`.
+  v22b measurement frozen offline (SHA256SUMS `1f74d836…cbe7`):
+  those binaries, `{window="avg"}` t/s scrape, same DSpark gates as v21.
+- **Why:** Exact-replay + recover-after-failure compile; v21 unlabeled
+  metrics regex missed Prometheus labels.
+- **Impact:** Compile PASS; v22b not executed pending independent PASS.
+  Capture: `…/stage3-b7627f6-compile-oracle-v22-capture`.
+
+## 2026-08-26 — `dd18162` DSpark measurement v21 HOLD
+- **What:** Independently reviewed exact-digest v21 launched once.
+  Spec **fired** (`cycles=80 proposed=16 accepted_draft=14`, 87.5%).
+  Wall 9.19s dspark vs 10.27s nospec. Checker HOLDed: (1) dspark
+  `finish=error` at gen=92 (`distributed speculative decode failed`);
+  (2) metrics scrape missed labeled `ds4_*_tps{window=avg}`;
+  (3) identity 128 vs 92 is a consequence of (1). Restoration PASS.
+- **Why:** Dist spec must degrade a failed cycle to per-token, not kill
+  a committed-prefix request. Harness regex must match Prometheus labels.
+- **Impact:** **HOLD.** Capture:
+  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-dd18162-inference-v21-capture`.
+  Window: `bench/results/2026-08-26-ds4-stage3-dd18162-inference-v21-window.md`.
+  Next: worker fix commit → v22 compile-oracle → v22b re-measure.
+
+## 2026-08-26 — `dd18162` compile-oracle v20d PASS
+- **What:** Independently reviewed exact-digest v20d
+  (SHA256SUMS `0afa924c…c308`). First host compile of dist-spec / ROCm
+  `.cuh` tree. `test-dist-v3` 92/92 both hosts; TP/MXFP4/graph-172 PASS;
+  production binaries hash-stable and bilateral-identical (`ds4`
+  `c01d1367…8d1a`). Restoration PASS. Evidence `fc017bcc…d92f`.
+- **Why:** v20c attempts 1–3 false-ABSENT preflight from bash `set -e` +
+  `[ ! -e p ] && [ ! -L p ]`. v20d `require_absent` + snapshots + fresh
+  paths.
+- **Impact:** **COMPILE_ORACLES_PASS; model window HOLD.** Capture:
+  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-dd18162-compile-oracle-v20d-capture`.
+  Window: `bench/results/2026-08-26-ds4-stage3-dd18162-compile-oracle-v20d-window.md`.
+
+## 2026-08-26 — `93f75b9` q2 TP-speedup v19b PASS
+- **What:** Independently reviewed exact-digest v19b
+  (SHA256SUMS `ea723db2…5d58`). q2 SHA `ca22ae2f838e…61c0` both hosts.
+  Prefill 75.63s standalone vs 45.10/45.18s TP TCP/NHI (~1.68×).
+  Decode 21.64s vs 22.81/22.78s (~0.95×). Restoration PASS. Evidence
+  `fb46503c…c259`.
+- **Why:** Two-GPU TP helps compute-bound prefill; decode is serial plus
+  a small hop. TCP≈NHI again.
+- **Impact:** **PASS; model window HOLD.** Capture:
+  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-93f75b9-inference-v19-capture`.
+  Window: `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v19b-window.md`.
+
+## 2026-08-26 — `93f75b9` inference-perf v17 PASS (measurement)
+- **What:** Independently reviewed exact-digest v17
+  (SHA256SUMS `25bd8035…a5bb`). Baseline `84cc882` compile SKIP (TheRock
+  `-fPIC`/`R_X86_64_32` link of `ds4_gpu_args.o`). Three NHI configs ran
+  probes ×3: medians ~65.26/65.27/65.12 s prefill and ~25.84/25.98/25.77 s
+  decode. Mapped registration proven. Restoration PASS. Evidence `a32c3703…`.
+- **Why:** At this probe set the link is not the bottleneck; bits=8 and
+  MAPPED=1 sit in noise vs prod-eq NHI. Pre-MXFP4 A/B still needs a
+  buildable ancestor or a -fPIC rebuild of 84cc882.
+- **Impact:** **PASS; model window HOLD.** Capture:
+  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-93f75b9-inference-v17-capture`.
+  Window: `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v17-window.md`.
+
+## 2026-08-26 — `93f75b9` inference-validation v16 PASS
+- **What:** Independently reviewed exact-digest v16
+  (SHA256SUMS `49088770…4278`) ran P1 TCP, P2 NHI, P-prod, and P3a–P3d.
+  Frozen checker re-run over the sealed capture: `ok=true`, `failures=[]`.
+  Restoration PASS; pre/post identity byte-identical. Evidence manifest
+  `c293ece8…93dd1`.
+- **Why:** v16 was the G4 stats-line allowlist over HOLDed v15. Live window
+  confirmed G1' (reasoning_content TCP=NHI), G2 (~100% of production TCP),
+  G3 refusal-correctness (`tokens=5`, HTTP 500, zero dumps), G4 worker
+  `tcp`/`nhi-cpu-copy`. dmesg allowlist counted 5/5 NHI-teardown flush
+  timeouts on max2.
+- **Impact:** **INFERENCE_VALIDATION_PASS; model window HOLD.** Capture:
+  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-93f75b9-inference-v16-capture`.
+  Window: `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v16-window.md`.
+
+## 2026-08-26 — `93f75b9` inference-validation v14 FAIL-CLOSED at P3a; P1/P2/P-prod completed
+- **What:** Independently reviewed exact-digest v14
+  (SHA256SUMS `34f6a68a…6931`) launched once. P1 TCP, P2 NHI, and P-prod all
+  finished 27/27 HTTP 200. `reasoning_content` identical across TCP/NHI/prod.
+  Perf transport-neutral (~100% of production). P3a armed 1-token chat hit
+  `tokens=5` (template), designed dump refusal, 500, zero dumps; collect
+  aborted. max2 dmesg: two `tbstream TX ring 2 flush timed out in-flight=1`
+  lines. Restoration identity/API healthy; dmesg gate FAILED. v14 retired.
+- **Why:** API chat/completions cannot produce n_tokens==1. `/v1/completions`
+  still renders chat. NHI teardown leaves one in-flight TX descriptor.
+- **Impact:** **FAIL-CLOSED after answering G1'/G2 informally.** Evidence:
+  `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v14-window.md`.
+
+## 2026-08-26 — `93f75b9` inference-validation v13 FAIL-CLOSED at run_driver quoting
+- **What:** Independently reviewed exact-digest v13
+  (SHA256SUMS `26630cb8…eaac`) launched once. Quiescence, parity, and P1
+  candidate TP-TCP ready all passed (~25s). `run_driver` then failed closed:
+  multi-line JSON plan was single-quote-wrapped into the remote Python
+  payload (SyntaxError). original_rc=1. v13 retired; do not retry.
+- **Why:** v11/v12 never reached `run_driver` live. Offline plan-validator
+  covered extraction/validation, not the exact printf composition.
+- **Impact:** **FAIL-CLOSED; restoration PASS; model window HOLD.** TP-TCP
+  launch/ready is proven. Evidence:
+  `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v13-window.md`.
+  Follow-on: separately versioned v14 (base64 plan injection + composition
+  compile tests), not a v13 retry.
+
+## 2026-08-26 — `93f75b9` inference-validation v12 FAIL-CLOSED at P1 standalone OOM
+- **What:** Independently reviewed exact-digest v12
+  (SHA256SUMS `0c61bad1…631e7`) launched once. Host-conditional quiescence
+  PASS on both hosts. P1 candidate standalone then OOM'd after caching
+  112.63 GiB (`tensor-span:114` at offset ~120 GiB). Ready-poll 900s
+  original_rc=124. No G1/G2/G3/G4 evidence. v12 retired; do not retry.
+- **Why:** Full-model single-GPU device cache of this GGUF does not fit one
+  128 GB Strix Halo. The quiescence v11 defect was fixed; the remaining
+  failure is a design limit, not a harness bug.
+- **Impact:** **FAIL-CLOSED; restoration PASS; model window HOLD.** Production
+  verified healthy (API `deepseek-v4-flash`). Evidence:
+  `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v12-window.md`.
+  Follow-on: separately versioned v13 G1' (candidate v3 TCP vs v3 NHI),
+  not a v12 retry.
+
 ## 2026-08-25 — `93f75b9` bilateral compile/runtime-oracle v10 PASS
 - **What:** The independently reviewed, exact-digest frozen v10 bundle ran the
   stage-3 no-model compile/oracle sequence on `max` then `max2` from exact DS4
