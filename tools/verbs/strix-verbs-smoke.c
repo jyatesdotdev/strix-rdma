@@ -163,12 +163,18 @@ int main(int argc, char **argv)
 		.cap = { .max_send_wr = WINDOW, .max_recv_wr = WINDOW, .max_send_sge = 1, .max_recv_sge = 1 } };
 	unsigned char mine[META_SIZE], theirs[META_SIZE];
 	unsigned long long expected = 0;
+	unsigned bench_iters = 0;
 	int count, fd; bool listening;
 	if (argc == 2 && !strcmp(argv[1], "--selftest")) { selftest(); return 0; }
-	if (argc != 6 || strcmp(argv[1], "--live") ||
+	if ((argc != 6 && argc != 7) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port\n", argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations]\n", argv[0], argv[0]);
 		return 2;
+	}
+	if (argc == 7) {
+		char *end = NULL; unsigned long v = strtoul(argv[6], &end, 10);
+		require(end && !*end && v && v <= 100000, "iteration count");
+		bench_iters = (unsigned)v;
 	}
 	require(!strncmp(argv[2], "strix_nhi", 9) && argv[2][9] &&
 		strspn(argv[2]+9, "0123456789") == strlen(argv[2]+9), "explicit native device");
@@ -219,6 +225,41 @@ int main(int argc, char **argv)
 	verb(ibv_query_qp(qp, &attr, IBV_QP_STATE|IBV_QP_SQ_PSN|IBV_QP_RQ_PSN|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_MAX_QP_RD_ATOMIC|IBV_QP_MAX_DEST_RD_ATOMIC, &init), "query accepted QP attrs");
 	require(attr.qp_state == IBV_QPS_RTS && attr.sq_psn == local.psn && attr.rq_psn == peer.psn &&
 		attr.timeout == 14 && attr.retry_cnt == 3 && attr.rnr_retry == 3 && attr.max_rd_atomic == 1 && attr.max_dest_rd_atomic == 1, "preserved QP attributes");
+	if (bench_iters) { /* Timed DS4-shaped window-4 x 2MiB bidirectional loop; no verification. */
+		struct ibv_sge rs[WINDOW], ss[WINDOW];
+		struct ibv_recv_wr rw[WINDOW] = {}, *rbad = NULL;
+		struct ibv_send_wr sw[WINDOW] = {}, *sbad = NULL;
+		for (unsigned i = 0; i < WINDOW; i++) {
+			for (unsigned j = 0; j < 4096; j++) tx[i*CHUNK+j] = pattern(local.nonce, 1, i, j);
+			rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx+i*CHUNK), .length = CHUNK, .lkey = rx_mr->lkey };
+			ss[i] = (struct ibv_sge){ .addr = (uintptr_t)(tx+i*CHUNK), .length = CHUNK, .lkey = tx_mr->lkey };
+			rw[i] = (struct ibv_recv_wr){ .wr_id = i, .sg_list = &rs[i], .num_sge = 1,
+				.next = i+1 < WINDOW ? &rw[i+1] : NULL };
+			sw[i] = (struct ibv_send_wr){ .wr_id = 8+i, .sg_list = &ss[i], .num_sge = 1,
+				.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+				.next = i+1 < WINDOW ? &sw[i+1] : NULL };
+		}
+		barrier(fd, 1); /* align start */
+		int64_t t0 = milliseconds();
+		for (unsigned it = 0; it < bench_iters; it++) {
+			verb(ibv_post_recv(qp, rw, &rbad), "bench post receive");
+			verb(ibv_post_send(qp, sw, &sbad), "bench post send");
+			unsigned done = 0; int64_t deadline = milliseconds() + TIMEOUT_MS;
+			while (done != 2*WINDOW) {
+				struct ibv_wc wc[8]; int n = ibv_poll_cq(cq, 8, wc);
+				require(n >= 0 && milliseconds() < deadline, "bench poll/deadline");
+				for (int i = 0; i < n; i++)
+					require(wc[i].status == IBV_WC_SUCCESS, "bench WC status"), done++;
+			}
+		}
+		int64_t elapsed = milliseconds() - t0;
+		barrier(fd, 2); /* both finished */
+		double bytes = (double)bench_iters * WINDOW * CHUNK; /* per direction */
+		printf("BENCH %s: %u iters x %u x %u B, wall %lld ms, %.2f MiB/s, %.3f Gbps (per direction, bidirectional)\n",
+		       argv[3], bench_iters, WINDOW, CHUNK, (long long)elapsed,
+		       bytes / (1048576.0 * elapsed / 1000.0), bytes * 8.0 / (1e9 * elapsed / 1000.0));
+		goto done;
+	}
 	/* Rejected WRs must not consume a queue slot or create a CQE. */
 	{
 		struct ibv_sge sg = { .addr = (uintptr_t)tx, .length = CHUNK+1, .lkey = tx_mr->lkey };
@@ -296,10 +337,12 @@ int main(int argc, char **argv)
 		require(n == 4, "four synchronous flush completions");
 		for (int i = 0; i < n; i++) require(wc[i].status == IBV_WC_WR_FLUSH_ERR && wc[i].wr_id == 1000u+(unsigned)i, "ordered error flush");
 	}
+	done:
 	verb(ibv_destroy_qp(qp), "synchronous QP destroy");
 	verb(ibv_dereg_mr(tx_mr), "TX deregistration"); verb(ibv_dereg_mr(rx_mr), "RX deregistration");
 	free(tx); free(rx); verb(ibv_destroy_cq(cq), "CQ destroy"); verb(ibv_dealloc_pd(pd), "PD free");
 	verb(ibv_close_device(ctx), "context close"); close(fd);
-	printf("PASS native CPU SEND/RECV: %llu bytes received, DS4-shaped setup/window4, ERR flush; not full DS4 or complete RC qualification\n", expected);
+	if (!bench_iters)
+		printf("PASS native CPU SEND/RECV: %llu bytes received, DS4-shaped setup/window4, ERR flush; not full DS4 or complete RC qualification\n", expected);
 	return 0;
 }
