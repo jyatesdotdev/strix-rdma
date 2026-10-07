@@ -55,6 +55,10 @@ struct sn_qp {
 	bool active, outgoing_sent, response_active, response_sent, have_last_read, rnr_wait;
 	bool bound, credit_sent, destroying;
 	u64 next_bind;
+	unsigned int zc_state;
+	u32 zc_offset;
+	bool zc_expect;
+	u32 zc_total, zc_received;
 };
 struct packet { u8 data[SN_FRAME]; size_t bytes; };
 union ib_gid { u8 raw[16]; };
@@ -72,6 +76,13 @@ struct sn_device {
 	enum ib_wc_status last_error;
 	u64 bad_frames, send_bytes, write_bytes, read_bytes;
 	bool check_ids;
+	u32 caps;
+	/* Zero-copy model state: peer link, expected-burst landing zone, drop knob. */
+	bool peer_zc, zdata, zc_drop;
+	struct sn_device *zc_peer;
+	struct sn_mr *zc_mr;
+	u64 zc_addr;
+	u32 zc_len, zc_landed;
 };
 static u64 now;
 static u64 ktime_get_ns(void) { return now; }
@@ -122,7 +133,41 @@ static int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *pa
 	d->count++;
 	return 0; /* Local TX ownership is returned, never peer placement. */
 }
+/* Zero-copy data-plane models; defined after the engine include. */
+int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
+int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w);
+int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 #include "../verbs/protocol.c"
+/* Modeled zero-copy data plane: the sender copies payload from the active SQ
+ * WQE's MR straight into the peer's expected-burst landing zone and feeds the
+ * engine's byte counter; zc_drop simulates a burst lost on the wire. */
+int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
+{
+	struct sn_wqe *w = &q->sq[q->sq_head];
+	struct sn_device *p = d->zc_peer;
+	u32 off = q->zc_offset, n = w->length - off;
+
+	if (d->zc_drop) { q->zc_offset = w->length; return 0; }
+	assert(p && p->zc_mr && n <= p->zc_len - p->zc_landed);
+	memcpy(p->zc_mr->data + (p->zc_addr - p->zc_mr->base) + p->zc_landed,
+	       w->mr->data + (w->address - w->mr->base) + off, n);
+	p->zc_landed += n;
+	sn_engine_zc_bytes(p->qp, n);
+	q->zc_offset = w->length;
+	return 0;
+}
+int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w)
+{
+	d->zc_mr = w->mr; d->zc_addr = w->address;
+	d->zc_len = q->zc_total; d->zc_landed = 0;
+	return 0;
+}
+int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
+{
+	(void)q;
+	d->zc_landed = 0;
+	return 0;
+}
 static void sn_qp_error(struct sn_qp *q, enum ib_wc_status status)
 {
 	struct sn_device *d = q->ib.device;
@@ -152,6 +197,7 @@ static struct sn_device *endpoint(u32 qpn, u32 peer_qpn, u64 sequence, u64 peer_
 	q->attr.qp_access_flags = 7; q->attr.max_dest_rd_atomic = 1;
 	q->attr.min_rnr_timer = 12; q->attr.rnr_retry = q->attr.retry_cnt = 3; q->attr.timeout = 14;
 	q->attr.dest_qp_num = peer_qpn; q->attr.sq_psn = sequence; q->attr.rq_psn = peer_sequence;
+	d->caps = SN_CAPS_V1;
 	q->outgoing = calloc(1, SN_MESSAGE); q->incoming = calloc(1, SN_MESSAGE);
 	q->read_snapshot = calloc(1, SN_MESSAGE); q->read_incoming = calloc(1, SN_MESSAGE);
 	assert(q->outgoing && q->incoming && q->read_snapshot && q->read_incoming);
@@ -406,11 +452,102 @@ static void test_handshake(void)
 	release(a); release(b);
 	puts("ok 6 - wire handshake: HELLO readiness, BIND pairing, stale rejection, epoch reset");
 }
+static struct sn_device *zc_pair(struct sn_device **b)
+{
+	struct sn_device *a = endpoint(10, 20, 100, 200);
+	*b = endpoint(20, 10, 200, 100);
+	a->peer_zc = (*b)->peer_zc = true;
+	a->zdata = (*b)->zdata = true;
+	a->caps = (*b)->caps = SN_CAPS_V2;
+	a->zc_peer = *b; (*b)->zc_peer = a;
+	return a;
+}
+static void test_zc(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x5a, SN_MESSAGE);
+	receive(b, SN_MESSAGE); post(a, SN_SEND, SN_MESSAGE);
+	sn_engine_progress(a);
+	assert(a->count && !a->sends && !b->recvs && a->mr[0].users == 1 && a->qp->zc_state == SN_ZC_WAIT);
+	for (i = 0; i < 1000 && !a->sends; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(!a->mr[0].users && !b->mr[1].users);
+	assert(b->send_bytes == SN_MESSAGE);
+	release(a); release(b);
+	puts("ok 7 - zero-copy burst: descriptor, ZC_READY, header-less payload, single ACK");
+}
+static void test_zc_rnr(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x6b, SN_MESSAGE);
+	post(a, SN_SEND, SN_MESSAGE);
+	step(a, b, NULL, NULL); /* descriptor out; b queues RNR (no WQE yet) */
+	receive(b, SN_MESSAGE);
+	for (i = 0; i < 100 && !a->sends; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
+	assert(a->qp->rnr_retries == 1);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	release(a); release(b);
+	puts("ok 8 - zero-copy RNR: descriptor waits, burst follows the posted receive");
+}
+static void test_zc_retry_ready(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	int drop_ready = SN_ZC_READY;
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x7c, SN_MESSAGE);
+	receive(b, SN_MESSAGE); post(a, SN_SEND, SN_MESSAGE);
+	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, &drop_ready);
+	assert(a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	release(a); release(b);
+	puts("ok 9 - lost ZC_READY: descriptor retransmit, duplicate restart, completes");
+}
+static void test_zc_retry_burst(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x8d, SN_MESSAGE);
+	receive(b, SN_MESSAGE); post(a, SN_SEND, SN_MESSAGE);
+	sn_engine_progress(a);
+	deliver(a, b, NULL); deliver(b, a, NULL);
+	a->zc_drop = true;
+	sn_engine_progress(a);
+	a->zc_drop = false;
+	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(b->send_bytes == SN_MESSAGE);
+	release(a); release(b);
+	puts("ok 10 - lost burst: whole-message retry reposts from offset zero");
+}
+static void test_zc_fallback(void)
+{
+	struct sn_device *a = endpoint(10, 20, 100, 200), *b = endpoint(20, 10, 200, 100);
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x5a, SN_MESSAGE);
+	receive(b, SN_MESSAGE); post(a, SN_SEND, SN_MESSAGE);
+	for (i = 0; i < 1000 && !a->sends; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
+	assert(!b->zc_mr);
+	release(a); release(b);
+	puts("ok 11 - no ZDATA capability: large SEND stays on the staged path");
+}
 int main(void)
 {
-	puts("1..6");
+	puts("1..11");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
+	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
+	test_zc_fallback();
 	assert(!warnings);
 	return 0;
 }

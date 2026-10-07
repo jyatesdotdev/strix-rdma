@@ -54,7 +54,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/native_wire.h b/drivers/infiniband/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/native_wire.h
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,268 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_NATIVE_WIRE_H
 +#define STRIX_NHI_NATIVE_WIRE_H
@@ -91,11 +91,22 @@ new file mode 100644
 +enum sn_opcode {
 +	SN_SEND = 1, SN_WRITE = 2, SN_READ = 3, SN_READ_REPLY = 4,
 +	SN_ACK = 5, SN_READ_ACK = 6, SN_CREDIT = 7,
-+	SN_HELLO = 8, SN_HELLO_ACK = 9, SN_BIND = 10, SN_BIND_ACK = 11
++	SN_HELLO = 8, SN_HELLO_ACK = 9, SN_BIND = 10, SN_BIND_ACK = 11,
++	SN_ZC_SEND = 12, SN_ZC_READY = 13
 +};
 +/* HELLO/HELLO_ACK capability bits in total: v1 is SEND/WRITE/READ. */
 +#define SN_CAPS_V1 0x7U
-+#define SN_CAPS_KNOWN SN_CAPS_V1
++#define SN_CAP_ZDATA 0x8U
++#define SN_CAPS_V2 0xfU
++#define SN_CAPS_KNOWN SN_CAPS_V2
++/* Zero-copy burst states (sn_qp.zc_state). */
++#define SN_ZC_NONE	0
++#define SN_ZC_WAIT	1
++#define SN_ZC_SENDING	2
++#define SN_ZC_SENT	3
++/* SENDs larger than this use the header-less data-ring path when the peer
++ * advertised SN_CAP_ZDATA. */
++#define SN_ZC_THRESHOLD	65536
 +enum sn_status {
 +	SN_OK = 0, SN_RNR = 1, SN_ACCESS = 2, SN_LENGTH = 3,
 +	SN_PROTOCOL = 4
@@ -178,6 +189,15 @@ new file mode 100644
 +		return sn_qp_fields_valid(h) && !h->length && !h->offset && !h->status &&
 +		       !h->ack_sequence && h->rkey &&
 +		       h->address <= ~(sn_u64)0 - h->total;
++	case SN_ZC_SEND:
++		/* Zero-copy burst descriptor: total carries the whole message; payload
++		 * follows as header-less frames on the data ring. */
++		return sn_qp_fields_valid(h) && h->total && h->sequence && !h->length &&
++		       !h->offset && !h->address && !h->rkey && !h->status && !h->ack_sequence;
++	case SN_ZC_READY:
++		/* ack_sequence carries the burst operation serial. */
++		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
++		       !h->address && !h->rkey && !h->sequence && !h->status;
 +	case SN_ACK:
 +		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
 +		       !h->address && !h->rkey && !h->sequence && h->status <= SN_PROTOCOL;
@@ -415,7 +435,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,178 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -446,6 +466,10 @@ new file mode 100644
 +	u64 base, size, pinned;
 +	u32 access;
 +	unsigned int users;
++	/* Scatterlist DMA-mapped for the NHI device at registration (zero-copy
++	 * data-ring frames point directly at these addresses). 0 when unmapped. */
++	int map_nents;
++	struct device *map_dev;
 +};
 +struct sn_cq {
 +	struct ib_cq ib;
@@ -478,6 +502,12 @@ new file mode 100644
 +	bool bound, all_signaled, destroying, credit_sent;
 +	/* Next BIND retransmission while unbound (ktime ns). */
 +	u64 next_bind;
++	/* Zero-copy burst state: the sender walks NONE -> WAIT -> SENDING -> SENT;
++	 * the receiver tracks the expected header-less payload by byte count. */
++	unsigned int zc_state;
++	u32 zc_offset;
++	bool zc_expect;
++	u32 zc_total, zc_received;
 +};
 +struct sn_slot {
 +	struct ring_frame frame;
@@ -498,7 +528,18 @@ new file mode 100644
 +	struct tb_ring *tx_ring, *rx_ring;
 +	struct sn_slot tx[SN_RING_SIZE], rx[SN_RING_SIZE];
 +	unsigned int tx_head, tx_tail, rx_tail;
++	/* Zero-copy data ring pair (header-less payload frames landing directly
++	 * in MR pages). Present only when a second ring HopID is available
++	 * (thunderbolt-net absent); otherwise the driver is staged-only. */
++	struct tb_ring *data_tx_ring, *data_rx_ring;
++	struct sn_slot data_tx[SN_RING_SIZE], data_rx[SN_RING_SIZE];
++	unsigned int data_tx_head, data_tx_tail, data_rx_head, data_rx_tail;
++	u32 zdata_posted;	/* bytes of the expected burst posted to data_rx_ring */
++	bool zdata;
 +	int in_hop, out_hop;
++	/* Zero-copy data-plane HopIDs (second path tuple); -1 when unavailable. */
++	int in_hop2, out_hop2;
++	bool zc_unavail;
 +	bool paths_active, rings_started, rx_primed, dead, registered, net_gone;
 +	bool reset_rings, static_published;
 +	bool have_context, have_pd;
@@ -520,6 +561,10 @@ new file mode 100644
 +	unsigned long renotify_after;
 +	/* Next HELLO retransmission (ktime ns); session handshake is timer-driven. */
 +	u64 next_hello;
++	/* Peer advertised SN_CAP_ZDATA in its HELLO caps. */
++	bool peer_zc;
++	/* Our HELLO caps: SN_CAPS_V1 plus SN_CAP_ZDATA when the data rings are up. */
++	u32 caps;
 +};
 +static inline struct sn_device *sn_dev(struct ib_device *ib)
 +{
@@ -549,6 +594,22 @@ new file mode 100644
 +int sn_rings_start(struct sn_device *d);
 +int sn_rings_stop(struct sn_device *d);
 +void sn_ring_receive(struct sn_device *d);
++bool sn_ring_pending(struct sn_device *d);
++void sn_data_receive(struct sn_device *d);
++dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len);
++
++/* Zero-copy data-plane platform hooks (kernel: ring.c; tests: modeled).
++ * sn_data_send_burst queues header-less payload frames for the active SQ op
++ * from its MR, returning 0 when the whole message is queued, -EAGAIN when
++ * the data ring is full. sn_data_recv_start posts the matched receive WQE's
++ * MR pages for the expected burst; sn_data_recv_restart re-posts them from
++ * offset zero for a retried burst. */
++int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
++int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w);
++int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
++void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes);
++int sn_data_rings_start(struct sn_device *d);
++int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m);
 +void sn_engine_receive(struct sn_device *d, const void *frame, size_t bytes);
 +void sn_engine_progress(struct sn_device *d);
 +void sn_engine_reset(struct sn_qp *q);
@@ -557,12 +618,13 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,405 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
 +#include <linux/random.h>
 +#include <linux/pci.h>
++#include <linux/sched.h>
 +#include <linux/rtnetlink.h>
 +#include <net/net_namespace.h>
 +#include <rdma/ib_user_verbs.h>
@@ -572,6 +634,15 @@ new file mode 100644
 +static bool enable;
 +module_param(enable, bool, 0400);
 +MODULE_PARM_DESC(enable, "Explicitly enable experimental native NHI software verbs");
++
++/* Worker scheduling: drain this many passes per wake before yielding the
++ * lock to uverbs; then busy-poll up to this many microseconds before
++ * sleeping. Bursts reschedule at zero delay; the 1 ms requeue is a backstop
++ * for missed callbacks only. */
++#define SN_PASS_BUDGET	8
++#define SN_IDLE_SPIN_US	128
++
++static bool sn_spin_wait(struct sn_device *d);
 +static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 +				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
 +static struct tb_property_dir *sn_directory;
@@ -601,6 +672,10 @@ new file mode 100644
 +	if (!dir) return -ENOMEM;
 +	ret = tb_property_add_immediate(dir, "rxhop", d->in_hop);
 +	if (ret) { tb_property_free_dir(dir); return ret; }
++	if (d->in_hop2 >= 0) {
++		ret = tb_property_add_immediate(dir, "rxhop2", d->in_hop2);
++		if (ret) { tb_property_free_dir(dir); return ret; }
++	}
 +	mutex_lock(&svc->lock);
 +	old = svc->local_properties;
 +	svc->local_properties = dir;
@@ -608,7 +683,7 @@ new file mode 100644
 +	tb_property_free_dir(old);
 +	return tb_service_try_native_properties_changed(svc);
 +}
-+static int sn_remote_rxhop(struct sn_device *d, u64 *hop)
++static int sn_remote_rxhop(struct sn_device *d, const char *key, u64 *hop)
 +{
 +	struct tb_service *svc = d->service;
 +	struct tb_property *p;
@@ -616,7 +691,7 @@ new file mode 100644
 +
 +	mutex_lock(&svc->lock);
 +	if (svc->remote_properties && uuid_equal(svc->remote_properties->uuid, &sn_uuid)) {
-+		p = tb_property_find(svc->remote_properties, "rxhop", TB_PROPERTY_TYPE_VALUE);
++		p = tb_property_find(svc->remote_properties, key, TB_PROPERTY_TYPE_VALUE);
 +		if (p) { *hop = p->value.immediate; ret = 0; }
 +	}
 +	mutex_unlock(&svc->lock);
@@ -629,7 +704,7 @@ new file mode 100644
 +	int ret;
 +
 +	if (d->out_hop < 0) {
-+		ret = sn_remote_rxhop(d, &hop);
++		ret = sn_remote_rxhop(d, "rxhop", &hop);
 +		if (ret) return ret;
 +		if (hop < 8 || hop > xd->remote_max_hopid) return -EPROTO;
 +		ret = tb_xdomain_alloc_out_hopid(xd, hop);
@@ -637,15 +712,34 @@ new file mode 100644
 +		if (ret != hop) { tb_xdomain_release_out_hopid(xd, ret); return -EBUSY; }
 +		d->out_hop = ret;
 +	}
++	if (d->out_hop2 < 0 && d->in_hop2 >= 0) {
++		ret = sn_remote_rxhop(d, "rxhop2", &hop);
++		if (!ret && hop >= 8 && hop <= xd->remote_max_hopid) {
++			ret = tb_xdomain_alloc_out_hopid(xd, hop);
++			if (ret >= 0) {
++				if (ret != hop) { tb_xdomain_release_out_hopid(xd, ret); return -EBUSY; }
++				d->out_hop2 = ret;
++			}
++		}
++	}
 +	if (!d->rings_started && d->ready.carrier)
 +		return sn_rings_start(d);
++	/* Retry a pending data-tuple enable after an earlier busy core. */
++	if (d->rings_started && !d->zdata && !d->zc_unavail && d->data_tx_ring) {
++		ret = sn_data_rings_start(d);
++		if (ret == -ENOMEM)
++			d->zc_unavail = true;
++		else if (ret && ret != -EAGAIN && ret != -ENODEV)
++			return ret;
++	}
 +	return 0;
 +}
 +static void sn_work(struct work_struct *work)
 +{
 +	struct sn_device *d = container_of(to_delayed_work(work), struct sn_device, work);
-+	bool active, was_active;
-+	int ret;
++	bool active, was_active, progress;
++	unsigned long long rx0, tx0;
++	int ret, budget;
 +
 +	mutex_lock(&d->lock);
 +	if (d->dead) { mutex_unlock(&d->lock); return; }
@@ -678,15 +772,48 @@ new file mode 100644
 +	active = !d->dead && sn_ready(&d->ready);
 +	if ((!d->ready.carrier || d->dead) && d->tx_ring)
 +		sn_rings_stop(d);
-+	sn_ring_receive(d);
-+	sn_engine_progress(d);
++	/* Drain-until-idle with a bounded budget, then release the lock so uverbs
++	 * (poll_cq etc.) gets in during sustained bursts. Bursts reschedule at
++	 * zero delay; idle work falls through to the bounded spin below. */
++	budget = SN_PASS_BUDGET;
++	do {
++		rx0 = d->rx_frames; tx0 = d->tx_frames;
++		sn_ring_receive(d);
++		sn_data_receive(d);
++		sn_engine_progress(d);
++		progress = d->rx_frames != rx0 || d->tx_frames != tx0;
++	} while (progress && --budget);
 +	mutex_unlock(&d->lock);
 +	if (was_active != active && d->registered) {
 +		struct ib_event event = {.device = &d->ib,
 +			.event = active ? IB_EVENT_PORT_ACTIVE : IB_EVENT_PORT_ERR};
 +		event.element.port_num = 1; ib_dispatch_event(&event);
 +	}
-+	if (!READ_ONCE(d->dead)) queue_delayed_work(system_unbound_wq, &d->work, msecs_to_jiffies(1));
++	if (READ_ONCE(d->dead)) return;
++	if (progress || sn_spin_wait(d))
++		sn_schedule(d);
++	else
++		queue_delayed_work(system_unbound_wq, &d->work, msecs_to_jiffies(1));
++}
++/* Bounded busy-poll before sleeping: while the peer is mid-burst the next
++ * frame is imminent, and the CPU is otherwise idle waiting on it anyway
++ * (NAPI-style). Returns true if work appeared; callbacks wake us at zero
++ * delay regardless, so the 1 ms requeue above is only a backstop. */
++static bool sn_spin_wait(struct sn_device *d)
++{
++	int i;
++
++	for (i = 0; i < SN_IDLE_SPIN_US; i++) {
++		if (READ_ONCE(d->dead))
++			return false;
++		if (sn_ring_pending(d) || READ_ONCE(d->control_count))
++			return true;
++		cpu_relax();
++		if (!(i & 31))
++			cond_resched();
++		udelay(1);
++	}
++	return false;
 +}
 +static struct net_device *sn_find_netdev(struct tb_service *svc)
 +{
@@ -758,6 +885,8 @@ new file mode 100644
 +	if (!d) { dev_put(netdev); return -ENOMEM; }
 +	d->service = svc; d->netdev = netdev;
 +	d->in_hop = d->out_hop = -1;
++	d->in_hop2 = d->out_hop2 = -1;
++	d->caps = SN_CAPS_V1;
 +	mutex_init(&d->lock); spin_lock_init(&d->ring_lock);
 +	INIT_LIST_HEAD(&d->mrs); INIT_DELAYED_WORK(&d->work, sn_work);
 +	do { d->ready.local_epoch = get_random_u64(); } while (!d->ready.local_epoch);
@@ -769,6 +898,11 @@ new file mode 100644
 +	ret = tb_xdomain_alloc_in_hopid(xd, 10);
 +	if (ret < 0) goto free;
 +	d->in_hop = ret;
++	/* A second HopID for the zero-copy data plane; absence is not fatal
++	 * (staged-only when thunderbolt-net holds the low HopIDs). */
++	ret = tb_xdomain_alloc_in_hopid(xd, d->in_hop + 1);
++	if (ret >= 0)
++		d->in_hop2 = ret;
 +	d->ib.node_type = RDMA_NODE_IB_CA;
 +	d->ib.phys_port_cnt = 1; d->ib.num_comp_vectors = 1;
 +	memcpy(&d->ib.node_guid, d->gid.raw + 8, 8);
@@ -796,6 +930,7 @@ new file mode 100644
 +	unregister_netdevice_notifier(&d->net_notifier);
 +hop:
 +	tb_xdomain_release_in_hopid(xd, d->in_hop);
++	if (d->in_hop2 >= 0) tb_xdomain_release_in_hopid(xd, d->in_hop2);
 +free:
 +	dev_put(d->netdev);
 +	ib_dealloc_device(&d->ib);
@@ -835,7 +970,11 @@ new file mode 100644
 +	while (tb_service_try_native_properties_changed(svc) == -EAGAIN)
 +		msleep(1);
 +	if (d->out_hop >= 0) tb_xdomain_release_out_hopid(xd, d->out_hop);
++	if (d->out_hop2 >= 0) tb_xdomain_release_out_hopid(xd, d->out_hop2);
 +	tb_xdomain_release_in_hopid(xd, d->in_hop);
++	if (d->in_hop2 >= 0) tb_xdomain_release_in_hopid(xd, d->in_hop2);
++	if (d->data_tx_ring) tb_ring_free(d->data_tx_ring);
++	if (d->data_rx_ring) tb_ring_free(d->data_rx_ring);
 +	dev_put(d->netdev); /* NULL after NETDEV_UNREGISTER released it */
 +	ib_dealloc_device(&d->ib);
 +}
@@ -889,7 +1028,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,440 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -917,6 +1056,82 @@ new file mode 100644
 +		s->done = false;
 +	spin_unlock_irqrestore(&d->ring_lock, flags);
 +	return done;
++}
++static bool sn_slot_peek(struct sn_device *d, struct sn_slot *s)
++{
++	unsigned long flags;
++	bool done;
++
++	spin_lock_irqsave(&d->ring_lock, flags);
++	done = s->done;
++	spin_unlock_irqrestore(&d->ring_lock, flags);
++	return done;
++}
++/* Lock-free hint for the idle spin: any completed ring work pending? */
++bool sn_ring_pending(struct sn_device *d)
++{
++	if (!READ_ONCE(d->rings_started))
++		return false;
++	return sn_slot_peek(d, &d->rx[d->rx_tail % SN_RING_SIZE]) ||
++	       sn_slot_peek(d, &d->tx[d->tx_tail % SN_RING_SIZE]);
++}
++
++/* ---- Zero-copy data plane: header-less payload frames over a second ring
++ * pair, DMA'd directly from/to the application's registered-MR pages. */
++
++static void sn_data_slots_init(struct sn_device *d, struct sn_slot *slots)
++{
++	int i;
++
++	for (i = 0; i < SN_RING_SIZE; i++) {
++		slots[i].device = d;
++		slots[i].frame.callback = sn_ring_callback;
++		slots[i].buffer = NULL;	/* frames point at MR pages, not coherent buffers */
++	}
++}
++/* Allocate and start the data ring pair and enable its path tuple (slot 1).
++ * Returns -EAGAIN for a busy core (retry next pass), -ENOMEM when no second
++ * ring HopID exists (thunderbolt-net present: stay staged-only), 0 on success. */
++int sn_data_rings_start(struct sn_device *d)
++{
++	struct tb_xdomain *xd = tb_service_parent(d->service);
++	int ret;
++
++	lockdep_assert_held(&d->lock);
++	if (d->zdata)
++		return 0;
++	if (d->out_hop2 < 0 || d->in_hop2 < 0)
++		return -ENOMEM;
++	if (!d->data_tx_ring) {
++		d->data_tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, SN_RING_SIZE,
++						 RING_FLAG_FRAME | RING_FLAG_E2E);
++		if (!d->data_tx_ring)
++			return -ENOMEM;
++		d->data_rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, SN_RING_SIZE,
++			RING_FLAG_FRAME | RING_FLAG_E2E, d->data_tx_ring->hop,
++			BIT(1), BIT(2), NULL, NULL);
++		if (!d->data_rx_ring) {
++			tb_ring_free(d->data_tx_ring); d->data_tx_ring = NULL;
++			return -ENOMEM;
++		}
++		sn_data_slots_init(d, d->data_tx);
++		sn_data_slots_init(d, d->data_rx);
++		tb_ring_start(d->data_tx_ring);
++		tb_ring_start(d->data_rx_ring);
++	}
++	ret = tb_xdomain_try_enable_native_paths(xd, d->out_hop2,
++		d->data_tx_ring->hop, d->in_hop2, d->data_rx_ring->hop);
++	if (ret)
++		return ret;	/* EAGAIN retries next pass; rings stay allocated. */
++	d->zdata = true;
++	d->caps = SN_CAPS_V1 | SN_CAP_ZDATA;
++	return 0;
++}
++static void sn_data_rings_stop(struct sn_device *d)
++{
++	lockdep_assert_held(&d->lock);
++	if (d->data_tx_ring) tb_ring_stop(d->data_tx_ring);
++	if (d->data_rx_ring) tb_ring_stop(d->data_rx_ring);
 +}
 +static int sn_slots_alloc(struct sn_device *d, struct tb_ring *r, struct sn_slot *slots)
 +{
@@ -988,6 +1203,16 @@ new file mode 100644
 +	if (ret) goto fail;
 +	d->paths_active = true;
 +	d->ready.rx_primed = d->ready.rings_started = d->ready.paths_active = 1;
++	/* The zero-copy data plane starts with the control rings so the HELLO
++	 * capabilities advertise the actual local state from the first frame.
++	 * Missing second HopID/tuple slot keeps the driver staged-only. */
++	if (!d->zc_unavail && d->out_hop2 >= 0 && d->in_hop2 >= 0) {
++		ret = sn_data_rings_start(d);
++		if (ret == -ENOMEM)
++			d->zc_unavail = true;
++		else if (ret && ret != -EAGAIN && ret != -ENODEV)
++			goto fail;
++	}
 +	return 0;
 +fail:
 +	sn_rings_stop(d);
@@ -1001,6 +1226,8 @@ new file mode 100644
 +	d->ready.paths_active = d->ready.rings_started = d->ready.rx_primed = 0;
 +	/* No peer close packet. tb_ring_stop disables local DMA and synchronously
 +	 * joins cancellation callbacks. Only then may staging memory be freed. */
++	if (d->data_tx_ring) tb_ring_stop(d->data_tx_ring);
++	if (d->data_rx_ring) tb_ring_stop(d->data_rx_ring);
 +	if (d->rings_started) {
 +		tb_ring_stop(d->tx_ring);
 +		tb_ring_stop(d->rx_ring);
@@ -1013,6 +1240,11 @@ new file mode 100644
 +		if (ret && ret != -ENODEV) return ret;
 +		d->paths_active = false;
 +	}
++	if (d->data_tx_ring) { tb_ring_free(d->data_tx_ring); d->data_tx_ring = NULL; }
++	if (d->data_rx_ring) { tb_ring_free(d->data_rx_ring); d->data_rx_ring = NULL; }
++	d->zdata = false;
++	d->caps = SN_CAPS_V1;
++	d->data_tx_head = d->data_tx_tail = d->data_rx_head = d->data_rx_tail = 0;
 +	d->rx_primed = false;
 +	sn_slots_free(d->tx_ring, d->tx);
 +	sn_slots_free(d->rx_ring, d->rx);
@@ -1083,6 +1315,159 @@ new file mode 100644
 +		if (tb_ring_rx(d->rx_ring, &s->frame) && d->qp)
 +			sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
 +	}
++}
++/* Sender: queue header-less payload frames for the active SQ op from its MR.
++ * Frames never span a physical page; the burst address must be page-aligned
++ * (checked by the engine's eligibility). Returns 0 when the whole message is
++ * queued, -EAGAIN when the data TX ring is full. */
++int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
++{
++	struct sn_wqe *w = &q->sq[q->sq_head];
++	int ret;
++
++	lockdep_assert_held(&d->lock);
++	if (!d->zdata || d->dead || d->reset_rings)
++		return -ENOLINK;
++	ret = sn_mr_ensure_mapped(d, w->mr);
++	if (ret)
++		return ret;
++	dma_sync_sg_for_device(w->mr->map_dev, w->mr->umem->sgt_append.sgt.sgl,
++		w->mr->umem->sgt_append.sgt.orig_nents, DMA_TO_DEVICE);
++	while (d->data_tx_head != d->data_tx_tail &&
++	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE])) {
++		if (d->data_tx[d->data_tx_tail % SN_RING_SIZE].canceled)
++			return -EIO;
++		d->data_tx_tail++;
++	}
++	while (q->zc_offset < w->length) {
++		struct sn_slot *s;
++		dma_addr_t dma;
++		u32 max, size;
++
++		if (d->data_tx_head - d->data_tx_tail >= SN_RING_SIZE - 1)
++			return -EAGAIN;
++		dma = sn_mr_dma(w->mr, w->address + q->zc_offset, &max);
++		if (!dma || !max)
++			return -EFAULT;
++		size = min3(max, (u32)SN_FRAME, w->length - q->zc_offset);
++		s = &d->data_tx[d->data_tx_head % SN_RING_SIZE];
++		s->frame.buffer = NULL;
++		s->frame.buffer_phy = dma;
++		s->frame.size = size & 0xfff;
++		s->frame.flags = 0;
++		s->frame.sof = 1;
++		s->frame.eof = 2;
++		s->canceled = false;
++		ret = tb_ring_tx(d->data_tx_ring, &s->frame);
++		if (ret)
++			return ret;
++		d->data_tx_head++;
++		d->tx_frames++;
++		q->zc_offset += size;
++	}
++	return 0;
++}
++/* Post more of the expected burst's MR pages to the data RX ring. */
++static int sn_zdata_repost(struct sn_device *d, struct sn_qp *q)
++{
++	struct sn_wqe *w = &q->rq[q->rq_head];
++
++	lockdep_assert_held(&d->lock);
++	while (d->zdata_posted < q->zc_total &&
++	       d->data_rx_head - d->data_rx_tail < SN_RING_SIZE - 1) {
++		struct sn_slot *s;
++		dma_addr_t dma;
++		u32 max, size;
++		int ret;
++
++		dma = sn_mr_dma(w->mr, w->address + d->zdata_posted, &max);
++		if (!dma || !max)
++			return -EFAULT;
++		size = min(max, min((u32)SN_FRAME, q->zc_total - d->zdata_posted));
++		s = &d->data_rx[d->data_rx_head % SN_RING_SIZE];
++		s->frame.buffer = NULL;
++		s->frame.buffer_phy = dma;
++		s->frame.size = 0;
++		s->frame.flags = 0;
++		s->canceled = false;
++		ret = tb_ring_rx(d->data_rx_ring, &s->frame);
++		if (ret)
++			return ret;
++		d->data_rx_head++;
++		d->zdata_posted += size;
++	}
++	return 0;
++}
++int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w)
++{
++	int ret;
++
++	lockdep_assert_held(&d->lock);
++	ret = sn_mr_ensure_mapped(d, w->mr);
++	if (ret)
++		return ret;
++	dma_sync_sg_for_device(w->mr->map_dev, w->mr->umem->sgt_append.sgt.sgl,
++		w->mr->umem->sgt_append.sgt.orig_nents, DMA_FROM_DEVICE);
++	d->zdata_posted = 0;
++	return sn_zdata_repost(d, q);
++}
++/* A retried burst restarts from offset zero: flush the data RX ring (partial
++ * postings from the previous attempt) and repost from the beginning. */
++int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
++{
++	lockdep_assert_held(&d->lock);
++	tb_ring_stop(d->data_rx_ring);
++	tb_ring_start(d->data_rx_ring);
++	/* tb_ring_stop joined the cancellation callbacks synchronously; drain
++	 * them without reposting so head/tail stay consistent. */
++	while (d->data_rx_tail != d->data_rx_head) {
++		struct sn_slot *s = &d->data_rx[d->data_rx_tail % SN_RING_SIZE];
++		if (!sn_slot_done(d, s)) break;
++		d->data_rx_tail++;
++	}
++	d->zdata_posted = 0;
++	return sn_zdata_repost(d, q);
++}
++void sn_data_receive(struct sn_device *d)
++{
++	int i;
++
++	lockdep_assert_held(&d->lock);
++	if (!d->zdata || d->dead)
++		return;
++	for (i = 0; i < SN_RING_SIZE; i++) {
++		struct sn_slot *s = &d->data_rx[d->data_rx_tail % SN_RING_SIZE];
++		u32 size;
++
++		if (!sn_slot_done(d, s)) break;
++		d->data_rx_tail++;
++		if (s->canceled) continue;
++		dma_rmb();
++		size = tb_ring_frame_size(&s->frame);
++		if (s->frame.flags & (RING_DESC_CRC_ERROR | RING_DESC_BUFFER_OVERRUN)) {
++			/* E2E makes this unreachable; byte accounting cannot recover. */
++			if (d->qp)
++				sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
++			continue;
++		}
++		d->rx_frames++;
++		if (d->qp && d->qp->zc_expect) {
++			/* Sync the burst pages for the CPU just before the completing
++			 * byte count makes the receive WQE visible. */
++			if (d->qp->zc_received + size == d->qp->zc_total) {
++				struct sn_wqe *w = &d->qp->rq[d->qp->rq_head];
++
++				if (w->mr && w->mr->map_nents)
++					dma_sync_sg_for_cpu(w->mr->map_dev,
++						w->mr->umem->sgt_append.sgt.sgl,
++						w->mr->umem->sgt_append.sgt.orig_nents,
++						DMA_FROM_DEVICE);
++			}
++			sn_engine_zc_bytes(d->qp, size);
++		}
++	}
++	if (d->qp && d->qp->zc_expect)
++		sn_zdata_repost(d, d->qp);
 +}
 diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/strix_nhi/verbs.c
 new file mode 100644
@@ -1577,7 +1962,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/mr.c b/drivers/infiniband/hw/strix_
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/mr.c
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,158 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/scatterlist.h>
 +#include "strix_nhi.h"
@@ -1628,6 +2013,47 @@ new file mode 100644
 +			m->umem->sgt_append.sgt.orig_nents, buffer, length, skip);
 +	return copied == length ? 0 : -EFAULT;
 +}
++/* Lazily DMA-map the MR's pinned pages for the NHI device (first zero-copy
++ * use); unmapped again at deregistration. The mapping device is the ring DMA
++ * device, same as the coherent staging buffers. */
++int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m)
++{
++	struct device *dev;
++	int n;
++
++	lockdep_assert_held(&d->lock);
++	if (m->map_nents)
++		return 0;
++	if (!d->rx_ring)
++		return -ENODEV;
++	dev = tb_ring_dma_device(d->rx_ring);
++	n = dma_map_sg(dev, m->umem->sgt_append.sgt.sgl,
++		m->umem->sgt_append.sgt.orig_nents, DMA_BIDIRECTIONAL);
++	if (!n)
++		return -ENOMEM;
++	m->map_dev = dev;
++	m->map_nents = n;
++	return 0;
++}
++/* NHI DMA address for an iova inside the MR, and the contiguous bytes
++ * available there (bounded by the DMA segment). Never spans segments. */
++dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len)
++{
++	struct scatterlist *sg;
++	u64 skip = address - m->base + ib_umem_offset(m->umem), off = 0;
++	int i;
++
++	*max_len = 0;
++	for_each_sg(m->umem->sgt_append.sgt.sgl, sg, m->map_nents, i) {
++		if (skip < off + sg->length) {
++			u64 inner = skip - off;
++			*max_len = sg->length - inner;
++			return sg_dma_address(sg) + inner;
++		}
++		off += sg->length;
++	}
++	return 0;
++}
 +struct ib_mr *sn_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 +			   u64 iova, int access, struct ib_dmah *dmah,
 +			   struct ib_udata *udata)
@@ -1665,6 +2091,7 @@ new file mode 100644
 +	m->ib.rkey = m->ib.lkey;
 +	m->base = iova; m->size = length; m->pinned = pinned; m->access = access;
 +	m->ib.iova = iova; m->ib.length = length;
++	m->map_nents = 0; m->map_dev = NULL;
 +	list_add_tail(&m->entry, &d->mrs);
 +	d->mr_count++; d->pinned += pinned;
 +	mutex_unlock(&d->lock);
@@ -1686,6 +2113,9 @@ new file mode 100644
 +	}
 +	list_del(&m->entry);
 +	d->mr_count--; d->pinned -= m->pinned;
++	if (m->map_nents)
++		dma_unmap_sg(m->map_dev, m->umem->sgt_append.sgt.sgl,
++			m->umem->sgt_append.sgt.orig_nents, DMA_BIDIRECTIONAL);
 +	ib_umem_release(m->umem);
 +	mutex_unlock(&d->lock);
 +	kfree(m);
@@ -1695,7 +2125,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,582 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -1713,6 +2143,7 @@ new file mode 100644
 +	d->ready.peer_ready = 0;
 +	d->ready.local_echo = 0;
 +	d->ready.peer_echo = 0;
++	d->peer_zc = false;
 +	d->control_count = 0;
 +	if (q && q->bound) sn_qp_error(q, IB_WC_GENERAL_ERR);
 +}
@@ -1739,8 +2170,9 @@ new file mode 100644
 +		sn_session_reset(d);
 +	d->ready.peer_epoch = h->src_epoch;
 +	d->ready.local_echo = h->src_epoch;
++	d->peer_zc = !!(h->total & SN_CAP_ZDATA);
 +	r.opcode = SN_HELLO_ACK; r.src_epoch = d->ready.local_epoch;
-+	r.dst_epoch = h->src_epoch; r.total = SN_CAPS_V1;
++	r.dst_epoch = h->src_epoch; r.total = d->caps;
 +	sn_control_queue(d, &r);
 +}
 +static void sn_receive_hello_ack(struct sn_device *d, const struct sn_header *h)
@@ -1755,10 +2187,11 @@ new file mode 100644
 +		if (d->ready.peer_epoch && d->ready.peer_echo) sn_session_reset(d);
 +		d->ready.peer_epoch = h->src_epoch;
 +	}
++	d->peer_zc = !!(h->total & SN_CAP_ZDATA);
 +	if (d->ready.local_echo != h->src_epoch) {
 +		d->ready.local_echo = h->src_epoch;
 +		r.opcode = SN_HELLO_ACK; r.src_epoch = d->ready.local_epoch;
-+		r.dst_epoch = h->src_epoch; r.total = SN_CAPS_V1;
++		r.dst_epoch = h->src_epoch; r.total = d->caps;
 +		sn_control_queue(d, &r);
 +	}
 +	d->ready.peer_echo = d->ready.local_epoch;
@@ -1814,6 +2247,13 @@ new file mode 100644
 +	h.src_epoch = q->binding.local_epoch; h.dst_epoch = q->binding.peer_epoch;
 +	return h;
 +}
++/* Large SENDs go header-less on the data ring when the peer advertised
++ * SN_CAP_ZDATA; everything else uses the staged control-ring path. */
++static bool sn_zc_eligible(struct sn_device *d, struct sn_wqe *w)
++{
++	return d->zdata && d->peer_zc && w->opcode == SN_SEND &&
++	       w->length > SN_ZC_THRESHOLD && !(w->address & (SN_FRAME - 1));
++}
 +/* Returns nonzero after a full control queue failed the QP; the flush has
 + * already retired every SQ/RQ WQE, so callers must not touch them again. */
 +static int sn_ack(struct sn_qp *q, u32 opcode, u64 sequence, u32 status)
@@ -1842,6 +2282,8 @@ new file mode 100644
 +	sn_mr_put(q->remote_mr); q->remote_mr = NULL;
 +	q->active = q->response_active = q->outgoing_sent = q->response_sent = false;
 +	q->have_last_read = q->rnr_wait = q->credit_sent = false;
++	q->zc_state = SN_ZC_NONE; q->zc_offset = 0;
++	q->zc_expect = false; q->zc_total = q->zc_received = 0;
 +	memset(&q->receive, 0, sizeof(q->receive));
 +	memset(&q->read_receive, 0, sizeof(q->read_receive));
 +}
@@ -1857,6 +2299,7 @@ new file mode 100644
 +	q->sq_head = (q->sq_head + 1) % SN_QUEUE_DEPTH; q->sq_count--;
 +	q->next_sequence++;
 +	q->active = q->outgoing_sent = q->rnr_wait = false;
++	q->zc_state = SN_ZC_NONE; q->zc_offset = 0;
 +	q->progress_deadline = ktime_get_ns() + 30000000000ULL;
 +	if (ret) sn_qp_error(q, IB_WC_GENERAL_ERR);
 +}
@@ -1920,6 +2363,84 @@ new file mode 100644
 +	sn_operation_commit(&q->receive, status);
 +	sn_ack(q, SN_ACK, h->sequence, status);
 +	sn_mr_put(q->remote_mr); q->remote_mr = NULL;
++}
++/* Receiver: a zero-copy burst descriptor arrived on the control ring. The
++ * payload will land header-less on the data ring directly in the matched
++ * receive WQE's MR; only accounting happens here. */
++static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
++{
++	struct sn_device *d = sn_dev(q->ib.device);
++	struct sn_wqe *w;
++
++	if (q->receive.have_replay && h->sequence == q->receive.replay.sequence) {
++		if (!sn_same_operation(&q->receive.replay, h)) {
++			sn_ack(q, SN_ACK, h->sequence, SN_PROTOCOL);
++			sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
++		}
++		sn_ack(q, SN_ACK, h->sequence, q->receive.replay_status);
++		return;
++	}
++	if (h->sequence != q->receive.expected) return;
++	if (q->receive.active) {
++		/* Duplicate descriptor: the sender is retrying. Restart the burst
++		 * from offset zero; partially landed bytes are rewritten identically. */
++		if (!sn_same_operation(&q->receive.operation, h) || !q->zc_expect) {
++			sn_ack(q, SN_ACK, h->sequence, SN_PROTOCOL);
++			sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
++		}
++		q->zc_received = 0;
++		if (!sn_data_recv_restart(d, q))
++			sn_ack(q, SN_ZC_READY, h->sequence, 0);
++		return;
++	}
++	if (!q->rq_count) { sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
++	w = &q->rq[q->rq_head];
++	if (h->total > w->length || (w->address & (SN_FRAME - 1))) {
++		sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
++		sn_mr_put(w->mr); w->mr = NULL;
++		q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
++		sn_request_error(q, h, SN_LENGTH);
++		sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
++	}
++	q->assembly_deadline = ktime_get_ns() + 30000000000ULL;
++	q->response_active = false;
++	q->receive.operation = *h; q->receive.received = 0; q->receive.active = 1;
++	q->zc_expect = true; q->zc_total = h->total; q->zc_received = 0;
++	if (sn_data_recv_start(d, q, w)) {
++		q->receive.active = 0; q->zc_expect = false;
++		sn_qp_error(q, IB_WC_GENERAL_ERR); return;
++	}
++	sn_ack(q, SN_ZC_READY, h->sequence, 0);
++}
++/* Sender: the receiver posted its MR pages; the burst may start. */
++static void sn_receive_zc_ready(struct sn_qp *q, const struct sn_header *h)
++{
++	if (q->zc_state != SN_ZC_WAIT || h->ack_sequence != q->next_sequence) return;
++	q->zc_state = SN_ZC_SENDING;
++}
++/* Data-ring drain hook: header-less payload bytes landed for the expected
++ * burst. Called by the platform receive path under d->lock. */
++void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
++{
++	struct sn_wqe *w;
++	int ret;
++
++	if (!q->zc_expect) return;
++	q->zc_received += bytes;
++	if (q->zc_received > q->zc_total) { sn_qp_error(q, IB_WC_GENERAL_ERR); return; }
++	if (q->zc_received < q->zc_total) return;
++	w = &q->rq[q->rq_head];
++	ret = sn_complete(q, w, true, IB_WC_SUCCESS, q->zc_total);
++	sn_mr_put(w->mr); w->mr = NULL;
++	q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
++	if (ret) {
++		sn_request_error(q, &q->receive.operation, SN_ACCESS);
++		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
++	}
++	sn_dev(q->ib.device)->send_bytes += q->zc_total;
++	sn_operation_commit(&q->receive, SN_OK);
++	q->zc_expect = false;
++	sn_ack(q, SN_ACK, q->receive.replay.sequence, SN_OK);
 +}
 +static void sn_receive_request(struct sn_qp *q, const struct sn_header *h, const u8 *payload)
 +{
@@ -2023,6 +2544,8 @@ new file mode 100644
 +	}
 +	switch (h.opcode) {
 +	case SN_ACK: case SN_READ_ACK: sn_receive_ack(q, &h); break;
++	case SN_ZC_READY: sn_receive_zc_ready(q, &h); break;
++	case SN_ZC_SEND: sn_receive_zc(q, &h); break;
 +	case SN_READ_REPLY: sn_receive_read_reply(q, &h, frame + SN_HEADER); break;
 +	case SN_SEND: case SN_WRITE: case SN_READ:
 +		sn_receive_request(q, &h, frame + SN_HEADER); break;
@@ -2058,7 +2581,7 @@ new file mode 100644
 +	    now >= d->next_hello) {
 +		h = (struct sn_header){0};
 +		h.opcode = SN_HELLO; h.src_epoch = d->ready.local_epoch;
-+		h.dst_epoch = d->ready.peer_epoch; h.total = SN_CAPS_V1;
++		h.dst_epoch = d->ready.peer_epoch; h.total = d->caps;
 +		sn_ring_send(d, &h, NULL, true);
 +		d->next_hello = now + SN_HELLO_INTERVAL_NS;
 +	}
@@ -2123,7 +2646,7 @@ new file mode 100644
 +	w = &q->sq[q->sq_head];
 +	if (!q->active) {
 +		if (q->next_sequence == U64_MAX) { sn_qp_error(q, IB_WC_GENERAL_ERR); return; }
-+		if (w->opcode != SN_READ && sn_mr_copy(w->mr, w->address, q->outgoing, w->length, false)) {
++		if (w->opcode != SN_READ && !sn_zc_eligible(d, w) && sn_mr_copy(w->mr, w->address, q->outgoing, w->length, false)) {
 +			sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
 +		}
 +		q->active = true; q->outgoing_sent = false;
@@ -2138,10 +2661,41 @@ new file mode 100644
 +		}
 +		q->rnr_wait = q->outgoing_sent = false;
 +		q->outgoing_offset = 0;
++		q->zc_state = SN_ZC_NONE;
++	}
++	if (q->zc_state == SN_ZC_WAIT) {
++		if (now < q->deadline) return;
++		if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
++			sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
++		}
++		q->zc_state = SN_ZC_NONE;
 +	}
 +	h = sn_out_header(q, w->opcode);
 +	h.sequence = q->next_sequence; h.total = w->length;
 +	h.address = w->remote_address; h.rkey = w->rkey;
++	if (sn_zc_eligible(d, w)) {
++		switch (q->zc_state) {
++		case SN_ZC_NONE:
++			h.opcode = SN_ZC_SEND; h.address = 0; h.rkey = 0;
++			ret = sn_ring_send(d, &h, NULL, false);
++			if (!ret) {
++				q->zc_state = SN_ZC_WAIT; q->zc_offset = 0;
++				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
++			}
++			break;
++		case SN_ZC_SENDING:
++			ret = sn_data_send_burst(d, q);
++			if (!ret) {
++				q->zc_state = SN_ZC_SENT; q->outgoing_sent = true;
++				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
++			}
++			break;
++		default:
++			ret = 0; break;
++		}
++		if (ret && ret != -EAGAIN) sn_qp_error(q, IB_WC_GENERAL_ERR);
++		goto watchdog;
++	}
 +	if (w->opcode == SN_READ) ret = sn_ring_send(d, &h, NULL, false);
 +	else ret = sn_fragments_send(d, &h, q->outgoing, &q->outgoing_offset, false);
 +	if (!ret) {

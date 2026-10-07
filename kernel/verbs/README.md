@@ -265,7 +265,8 @@ fix domain removal from another thread. The new APIs solve this in the owning
 software CM; the native worker remains independent and never waits for tb->lock.
 
 - `tb_xdomain_try_enable_native_paths` uses mutex_trylock, rejects firmware CM,
-  unplug/removal, and admits at most one exact native tuple per XDomain. EAGAIN
+  unplug/removal, and admits at most two exact native tuples per XDomain (a
+  control ring pair and a zero-copy data ring pair). EAGAIN
   changes no core state. Existing clients keep the original blocking API.
 - The core retains the exact tuple, not a raw tunnel pointer. Driver ring/HopID
   ownership prevents tuple reuse until release. Other core invalid-tunnel cleanup

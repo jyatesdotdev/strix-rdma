@@ -48,6 +48,47 @@ int sn_mr_copy(struct sn_mr *m, u64 address, void *buffer, u32 length, bool to_m
 			m->umem->sgt_append.sgt.orig_nents, buffer, length, skip);
 	return copied == length ? 0 : -EFAULT;
 }
+/* Lazily DMA-map the MR's pinned pages for the NHI device (first zero-copy
+ * use); unmapped again at deregistration. The mapping device is the ring DMA
+ * device, same as the coherent staging buffers. */
+int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m)
+{
+	struct device *dev;
+	int n;
+
+	lockdep_assert_held(&d->lock);
+	if (m->map_nents)
+		return 0;
+	if (!d->rx_ring)
+		return -ENODEV;
+	dev = tb_ring_dma_device(d->rx_ring);
+	n = dma_map_sg(dev, m->umem->sgt_append.sgt.sgl,
+		m->umem->sgt_append.sgt.orig_nents, DMA_BIDIRECTIONAL);
+	if (!n)
+		return -ENOMEM;
+	m->map_dev = dev;
+	m->map_nents = n;
+	return 0;
+}
+/* NHI DMA address for an iova inside the MR, and the contiguous bytes
+ * available there (bounded by the DMA segment). Never spans segments. */
+dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len)
+{
+	struct scatterlist *sg;
+	u64 skip = address - m->base + ib_umem_offset(m->umem), off = 0;
+	int i;
+
+	*max_len = 0;
+	for_each_sg(m->umem->sgt_append.sgt.sgl, sg, m->map_nents, i) {
+		if (skip < off + sg->length) {
+			u64 inner = skip - off;
+			*max_len = sg->length - inner;
+			return sg_dma_address(sg) + inner;
+		}
+		off += sg->length;
+	}
+	return 0;
+}
 struct ib_mr *sn_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 			   u64 iova, int access, struct ib_dmah *dmah,
 			   struct ib_udata *udata)
@@ -85,6 +126,7 @@ struct ib_mr *sn_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	m->ib.rkey = m->ib.lkey;
 	m->base = iova; m->size = length; m->pinned = pinned; m->access = access;
 	m->ib.iova = iova; m->ib.length = length;
+	m->map_nents = 0; m->map_dev = NULL;
 	list_add_tail(&m->entry, &d->mrs);
 	d->mr_count++; d->pinned += pinned;
 	mutex_unlock(&d->lock);
@@ -106,6 +148,9 @@ int sn_dereg_mr(struct ib_mr *ib, struct ib_udata *udata)
 	}
 	list_del(&m->entry);
 	d->mr_count--; d->pinned -= m->pinned;
+	if (m->map_nents)
+		dma_unmap_sg(m->map_dev, m->umem->sgt_append.sgt.sgl,
+			m->umem->sgt_append.sgt.orig_nents, DMA_BIDIRECTIONAL);
 	ib_umem_release(m->umem);
 	mutex_unlock(&d->lock);
 	kfree(m);

@@ -34,11 +34,22 @@ typedef uint64_t sn_u64;
 enum sn_opcode {
 	SN_SEND = 1, SN_WRITE = 2, SN_READ = 3, SN_READ_REPLY = 4,
 	SN_ACK = 5, SN_READ_ACK = 6, SN_CREDIT = 7,
-	SN_HELLO = 8, SN_HELLO_ACK = 9, SN_BIND = 10, SN_BIND_ACK = 11
+	SN_HELLO = 8, SN_HELLO_ACK = 9, SN_BIND = 10, SN_BIND_ACK = 11,
+	SN_ZC_SEND = 12, SN_ZC_READY = 13
 };
 /* HELLO/HELLO_ACK capability bits in total: v1 is SEND/WRITE/READ. */
 #define SN_CAPS_V1 0x7U
-#define SN_CAPS_KNOWN SN_CAPS_V1
+#define SN_CAP_ZDATA 0x8U
+#define SN_CAPS_V2 0xfU
+#define SN_CAPS_KNOWN SN_CAPS_V2
+/* Zero-copy burst states (sn_qp.zc_state). */
+#define SN_ZC_NONE	0
+#define SN_ZC_WAIT	1
+#define SN_ZC_SENDING	2
+#define SN_ZC_SENT	3
+/* SENDs larger than this use the header-less data-ring path when the peer
+ * advertised SN_CAP_ZDATA. */
+#define SN_ZC_THRESHOLD	65536
 enum sn_status {
 	SN_OK = 0, SN_RNR = 1, SN_ACCESS = 2, SN_LENGTH = 3,
 	SN_PROTOCOL = 4
@@ -121,6 +132,15 @@ static inline int sn_header_valid(const struct sn_header *h)
 		return sn_qp_fields_valid(h) && !h->length && !h->offset && !h->status &&
 		       !h->ack_sequence && h->rkey &&
 		       h->address <= ~(sn_u64)0 - h->total;
+	case SN_ZC_SEND:
+		/* Zero-copy burst descriptor: total carries the whole message; payload
+		 * follows as header-less frames on the data ring. */
+		return sn_qp_fields_valid(h) && h->total && h->sequence && !h->length &&
+		       !h->offset && !h->address && !h->rkey && !h->status && !h->ack_sequence;
+	case SN_ZC_READY:
+		/* ack_sequence carries the burst operation serial. */
+		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
+		       !h->address && !h->rkey && !h->sequence && !h->status;
 	case SN_ACK:
 		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
 		       !h->address && !h->rkey && !h->sequence && h->status <= SN_PROTOCOL;

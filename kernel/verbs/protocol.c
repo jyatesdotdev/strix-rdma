@@ -15,6 +15,7 @@ static void sn_session_reset(struct sn_device *d)
 	d->ready.peer_ready = 0;
 	d->ready.local_echo = 0;
 	d->ready.peer_echo = 0;
+	d->peer_zc = false;
 	d->control_count = 0;
 	if (q && q->bound) sn_qp_error(q, IB_WC_GENERAL_ERR);
 }
@@ -41,8 +42,9 @@ static void sn_receive_hello(struct sn_device *d, const struct sn_header *h)
 		sn_session_reset(d);
 	d->ready.peer_epoch = h->src_epoch;
 	d->ready.local_echo = h->src_epoch;
+	d->peer_zc = !!(h->total & SN_CAP_ZDATA);
 	r.opcode = SN_HELLO_ACK; r.src_epoch = d->ready.local_epoch;
-	r.dst_epoch = h->src_epoch; r.total = SN_CAPS_V1;
+	r.dst_epoch = h->src_epoch; r.total = d->caps;
 	sn_control_queue(d, &r);
 }
 static void sn_receive_hello_ack(struct sn_device *d, const struct sn_header *h)
@@ -57,10 +59,11 @@ static void sn_receive_hello_ack(struct sn_device *d, const struct sn_header *h)
 		if (d->ready.peer_epoch && d->ready.peer_echo) sn_session_reset(d);
 		d->ready.peer_epoch = h->src_epoch;
 	}
+	d->peer_zc = !!(h->total & SN_CAP_ZDATA);
 	if (d->ready.local_echo != h->src_epoch) {
 		d->ready.local_echo = h->src_epoch;
 		r.opcode = SN_HELLO_ACK; r.src_epoch = d->ready.local_epoch;
-		r.dst_epoch = h->src_epoch; r.total = SN_CAPS_V1;
+		r.dst_epoch = h->src_epoch; r.total = d->caps;
 		sn_control_queue(d, &r);
 	}
 	d->ready.peer_echo = d->ready.local_epoch;
@@ -116,6 +119,13 @@ static struct sn_header sn_out_header(struct sn_qp *q, u32 opcode)
 	h.src_epoch = q->binding.local_epoch; h.dst_epoch = q->binding.peer_epoch;
 	return h;
 }
+/* Large SENDs go header-less on the data ring when the peer advertised
+ * SN_CAP_ZDATA; everything else uses the staged control-ring path. */
+static bool sn_zc_eligible(struct sn_device *d, struct sn_wqe *w)
+{
+	return d->zdata && d->peer_zc && w->opcode == SN_SEND &&
+	       w->length > SN_ZC_THRESHOLD && !(w->address & (SN_FRAME - 1));
+}
 /* Returns nonzero after a full control queue failed the QP; the flush has
  * already retired every SQ/RQ WQE, so callers must not touch them again. */
 static int sn_ack(struct sn_qp *q, u32 opcode, u64 sequence, u32 status)
@@ -144,6 +154,8 @@ void sn_engine_reset(struct sn_qp *q)
 	sn_mr_put(q->remote_mr); q->remote_mr = NULL;
 	q->active = q->response_active = q->outgoing_sent = q->response_sent = false;
 	q->have_last_read = q->rnr_wait = q->credit_sent = false;
+	q->zc_state = SN_ZC_NONE; q->zc_offset = 0;
+	q->zc_expect = false; q->zc_total = q->zc_received = 0;
 	memset(&q->receive, 0, sizeof(q->receive));
 	memset(&q->read_receive, 0, sizeof(q->read_receive));
 }
@@ -159,6 +171,7 @@ static void sn_send_complete(struct sn_qp *q)
 	q->sq_head = (q->sq_head + 1) % SN_QUEUE_DEPTH; q->sq_count--;
 	q->next_sequence++;
 	q->active = q->outgoing_sent = q->rnr_wait = false;
+	q->zc_state = SN_ZC_NONE; q->zc_offset = 0;
 	q->progress_deadline = ktime_get_ns() + 30000000000ULL;
 	if (ret) sn_qp_error(q, IB_WC_GENERAL_ERR);
 }
@@ -222,6 +235,84 @@ static void sn_request_error(struct sn_qp *q, const struct sn_header *h, u32 sta
 	sn_operation_commit(&q->receive, status);
 	sn_ack(q, SN_ACK, h->sequence, status);
 	sn_mr_put(q->remote_mr); q->remote_mr = NULL;
+}
+/* Receiver: a zero-copy burst descriptor arrived on the control ring. The
+ * payload will land header-less on the data ring directly in the matched
+ * receive WQE's MR; only accounting happens here. */
+static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
+{
+	struct sn_device *d = sn_dev(q->ib.device);
+	struct sn_wqe *w;
+
+	if (q->receive.have_replay && h->sequence == q->receive.replay.sequence) {
+		if (!sn_same_operation(&q->receive.replay, h)) {
+			sn_ack(q, SN_ACK, h->sequence, SN_PROTOCOL);
+			sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
+		}
+		sn_ack(q, SN_ACK, h->sequence, q->receive.replay_status);
+		return;
+	}
+	if (h->sequence != q->receive.expected) return;
+	if (q->receive.active) {
+		/* Duplicate descriptor: the sender is retrying. Restart the burst
+		 * from offset zero; partially landed bytes are rewritten identically. */
+		if (!sn_same_operation(&q->receive.operation, h) || !q->zc_expect) {
+			sn_ack(q, SN_ACK, h->sequence, SN_PROTOCOL);
+			sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
+		}
+		q->zc_received = 0;
+		if (!sn_data_recv_restart(d, q))
+			sn_ack(q, SN_ZC_READY, h->sequence, 0);
+		return;
+	}
+	if (!q->rq_count) { sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
+	w = &q->rq[q->rq_head];
+	if (h->total > w->length || (w->address & (SN_FRAME - 1))) {
+		sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
+		sn_mr_put(w->mr); w->mr = NULL;
+		q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
+		sn_request_error(q, h, SN_LENGTH);
+		sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
+	}
+	q->assembly_deadline = ktime_get_ns() + 30000000000ULL;
+	q->response_active = false;
+	q->receive.operation = *h; q->receive.received = 0; q->receive.active = 1;
+	q->zc_expect = true; q->zc_total = h->total; q->zc_received = 0;
+	if (sn_data_recv_start(d, q, w)) {
+		q->receive.active = 0; q->zc_expect = false;
+		sn_qp_error(q, IB_WC_GENERAL_ERR); return;
+	}
+	sn_ack(q, SN_ZC_READY, h->sequence, 0);
+}
+/* Sender: the receiver posted its MR pages; the burst may start. */
+static void sn_receive_zc_ready(struct sn_qp *q, const struct sn_header *h)
+{
+	if (q->zc_state != SN_ZC_WAIT || h->ack_sequence != q->next_sequence) return;
+	q->zc_state = SN_ZC_SENDING;
+}
+/* Data-ring drain hook: header-less payload bytes landed for the expected
+ * burst. Called by the platform receive path under d->lock. */
+void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
+{
+	struct sn_wqe *w;
+	int ret;
+
+	if (!q->zc_expect) return;
+	q->zc_received += bytes;
+	if (q->zc_received > q->zc_total) { sn_qp_error(q, IB_WC_GENERAL_ERR); return; }
+	if (q->zc_received < q->zc_total) return;
+	w = &q->rq[q->rq_head];
+	ret = sn_complete(q, w, true, IB_WC_SUCCESS, q->zc_total);
+	sn_mr_put(w->mr); w->mr = NULL;
+	q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
+	if (ret) {
+		sn_request_error(q, &q->receive.operation, SN_ACCESS);
+		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
+	}
+	sn_dev(q->ib.device)->send_bytes += q->zc_total;
+	sn_operation_commit(&q->receive, SN_OK);
+	q->zc_expect = false;
+	sn_ack(q, SN_ACK, q->receive.replay.sequence, SN_OK);
 }
 static void sn_receive_request(struct sn_qp *q, const struct sn_header *h, const u8 *payload)
 {
@@ -325,6 +416,8 @@ void sn_engine_receive(struct sn_device *d, const void *frame, size_t bytes)
 	}
 	switch (h.opcode) {
 	case SN_ACK: case SN_READ_ACK: sn_receive_ack(q, &h); break;
+	case SN_ZC_READY: sn_receive_zc_ready(q, &h); break;
+	case SN_ZC_SEND: sn_receive_zc(q, &h); break;
 	case SN_READ_REPLY: sn_receive_read_reply(q, &h, frame + SN_HEADER); break;
 	case SN_SEND: case SN_WRITE: case SN_READ:
 		sn_receive_request(q, &h, frame + SN_HEADER); break;
@@ -360,7 +453,7 @@ void sn_engine_progress(struct sn_device *d)
 	    now >= d->next_hello) {
 		h = (struct sn_header){0};
 		h.opcode = SN_HELLO; h.src_epoch = d->ready.local_epoch;
-		h.dst_epoch = d->ready.peer_epoch; h.total = SN_CAPS_V1;
+		h.dst_epoch = d->ready.peer_epoch; h.total = d->caps;
 		sn_ring_send(d, &h, NULL, true);
 		d->next_hello = now + SN_HELLO_INTERVAL_NS;
 	}
@@ -425,7 +518,7 @@ void sn_engine_progress(struct sn_device *d)
 	w = &q->sq[q->sq_head];
 	if (!q->active) {
 		if (q->next_sequence == U64_MAX) { sn_qp_error(q, IB_WC_GENERAL_ERR); return; }
-		if (w->opcode != SN_READ && sn_mr_copy(w->mr, w->address, q->outgoing, w->length, false)) {
+		if (w->opcode != SN_READ && !sn_zc_eligible(d, w) && sn_mr_copy(w->mr, w->address, q->outgoing, w->length, false)) {
 			sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
 		}
 		q->active = true; q->outgoing_sent = false;
@@ -440,10 +533,41 @@ void sn_engine_progress(struct sn_device *d)
 		}
 		q->rnr_wait = q->outgoing_sent = false;
 		q->outgoing_offset = 0;
+		q->zc_state = SN_ZC_NONE;
+	}
+	if (q->zc_state == SN_ZC_WAIT) {
+		if (now < q->deadline) return;
+		if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
+			sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
+		}
+		q->zc_state = SN_ZC_NONE;
 	}
 	h = sn_out_header(q, w->opcode);
 	h.sequence = q->next_sequence; h.total = w->length;
 	h.address = w->remote_address; h.rkey = w->rkey;
+	if (sn_zc_eligible(d, w)) {
+		switch (q->zc_state) {
+		case SN_ZC_NONE:
+			h.opcode = SN_ZC_SEND; h.address = 0; h.rkey = 0;
+			ret = sn_ring_send(d, &h, NULL, false);
+			if (!ret) {
+				q->zc_state = SN_ZC_WAIT; q->zc_offset = 0;
+				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
+			}
+			break;
+		case SN_ZC_SENDING:
+			ret = sn_data_send_burst(d, q);
+			if (!ret) {
+				q->zc_state = SN_ZC_SENT; q->outgoing_sent = true;
+				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
+			}
+			break;
+		default:
+			ret = 0; break;
+		}
+		if (ret && ret != -EAGAIN) sn_qp_error(q, IB_WC_GENERAL_ERR);
+		goto watchdog;
+	}
 	if (w->opcode == SN_READ) ret = sn_ring_send(d, &h, NULL, false);
 	else ret = sn_fragments_send(d, &h, q->outgoing, &q->outgoing_offset, false);
 	if (!ret) {

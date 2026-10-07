@@ -35,7 +35,7 @@ for method in enable disable notify; do
         echo "core try-$method must not wait for tb->lock" >&2; exit 1
     fi
 done
-grep -F '__tb_disconnect_xdomain_paths(xd->tb, xd, xd->native_tx_path,' "$core" >/dev/null
+grep -F 'xd->native_tx_path[slot]' "$core" >/dev/null
 grep -F 'smp_store_release(&xd->native_dma_removed, true)' "$core" >/dev/null
 grep -F 'smp_load_acquire(&xd->native_dma_removed)' "$tmp/disable" >/dev/null
 awk '

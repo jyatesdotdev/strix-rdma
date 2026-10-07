@@ -58,8 +58,14 @@ enum ib_cq_notify_flags { UNUSED_NOTIFY_ENUM };
 struct ib_event { struct ib_device *device; enum ib_event_type event;
 	union { struct ib_cq *cq; struct ib_qp *qp; } element; };
 struct ib_wc { u64 wr_id; enum ib_wc_status status; struct ib_qp *qp; unsigned opcode, byte_len; };
+struct device { int dummy; };
+struct scatterlist { int dummy; };
+enum dma_data_direction { DMA_BIDIRECTIONAL, DMA_TO_DEVICE, DMA_FROM_DEVICE };
+struct fake_umem { struct { struct { struct scatterlist *sgl; int orig_nents; } sgt; } sgt_append; };
+static void dma_unmap_sg(struct device *dev, struct scatterlist *sg, int n, enum dma_data_direction dir)
+{ (void)dev; (void)sg; (void)n; (void)dir; }
 struct sn_mr { struct ib_mr ib; struct list_head entry; u64 base, size, pinned;
-	u32 access, users; void *umem; };
+	u32 access, users; int map_nents; struct device *map_dev; struct fake_umem *umem; };
 struct sn_wqe { struct sn_mr *mr; u64 id, address, remote_address; u32 length, flags, opcode, rkey; };
 struct sn_cq { struct ib_cq ib; struct ib_wc entries[SN_MAX_CQE]; unsigned head, count, notify; bool failed; };
 struct sn_qp { struct ib_qp ib; struct { int qp_state; unsigned max_rd_atomic; } attr;
@@ -80,7 +86,7 @@ static struct sn_cq *sn_cq(struct ib_cq *p) { return container_of(p, struct sn_c
 static void mutex_lock(int *p) { assert(!*p); *p = 1; }
 static void mutex_unlock(int *p) { assert(*p); *p = 0; }
 static unsigned unpins, completions, events, scheduled;
-static void ib_umem_release(void *p) { assert(p); unpins++; }
+static void ib_umem_release(struct fake_umem *p) { assert(p); unpins++; }
 static void sn_schedule(struct sn_device *d) { assert(!d->lock); scheduled++; }
 static void sn_engine_reset(struct sn_qp *q) { (void)q; }
 static u64 ktime_get_ns(void) { return 100; }
@@ -103,7 +109,8 @@ static void setup(void)
 	mr = calloc(1, sizeof(*mr)); assert(mr);
 	mr->ib.device = &d.ib; mr->ib.pd = &pd; mr->ib.lkey = 17;
 	mr->base = 1000; mr->size = SN_MR_BYTES; mr->pinned = SN_MR_BYTES;
-	mr->access = IB_ACCESS_LOCAL_WRITE; mr->umem = mr;
+	mr->access = IB_ACCESS_LOCAL_WRITE;
+	mr->umem = calloc(1, sizeof(*mr->umem)); assert(mr->umem);
 	list_add_tail(&mr->entry, &d.mrs); d.mr_count = 1; d.pinned = mr->pinned;
 	unpins = completions = events = scheduled = 0;
 }

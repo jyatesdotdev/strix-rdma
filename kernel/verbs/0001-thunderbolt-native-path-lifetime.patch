@@ -26,8 +26,8 @@ diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
 +#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
 +	/* Native service tuple is owned under tb->lock until exact cleanup.
 +	 * native_dma_removed is release/acquire published after core cleanup. */
-+	int native_tx_path, native_tx_ring, native_rx_path, native_rx_ring;
-+	bool native_dma_active;
++	int native_tx_path[2], native_tx_ring[2], native_rx_path[2], native_rx_ring[2];
++	unsigned int native_dma_count;
 +	bool native_dma_stopping;
 +	bool native_dma_removed;
 +#endif
@@ -181,7 +181,7 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
 +		return -EAGAIN;
 +	if (xd->native_dma_stopping || xd->native_dma_removed || xd->is_unplugged)
 +		ret = -ENODEV;
-+	else if (xd->native_dma_active)
++	else if (xd->native_dma_count == ARRAY_SIZE(xd->native_tx_path))
 +		ret = -EBUSY;
 +	else if (transmit_path < 8 || receive_path < 8 ||
 +		 transmit_ring < 1 || receive_ring < 1)
@@ -190,11 +190,11 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
 +		ret = __tb_approve_xdomain_paths(tb, xd, transmit_path,
 +				transmit_ring, receive_path, receive_ring);
 +		if (!ret) {
-+			xd->native_tx_path = transmit_path;
-+			xd->native_tx_ring = transmit_ring;
-+			xd->native_rx_path = receive_path;
-+			xd->native_rx_ring = receive_ring;
-+			xd->native_dma_active = true;
++			unsigned int slot = xd->native_dma_count++;
++			xd->native_tx_path[slot] = transmit_path;
++			xd->native_tx_ring[slot] = transmit_ring;
++			xd->native_rx_path[slot] = receive_path;
++			xd->native_rx_ring[slot] = receive_ring;
 +		}
  	}
 +	mutex_unlock(&tb->lock);
@@ -205,13 +205,15 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
 +static void tb_release_native_paths(struct tb_xdomain *xd)
 +{
 +	lockdep_assert_held(&xd->tb->lock);
-+	if (xd->native_dma_active) {
-+		/* The tuple cannot be reused: its service still owns both rings and
-+		 * both HopID reservations. Earlier core invalid-tunnel cleanup may
-+		 * already have removed it; exact matching is then a safe no-op. */
-+		__tb_disconnect_xdomain_paths(xd->tb, xd, xd->native_tx_path,
-+			xd->native_tx_ring, xd->native_rx_path, xd->native_rx_ring);
-+		xd->native_dma_active = false;
++	/* Tuples cannot be reused: their service still owns both rings and both
++	 * HopID reservations each. Earlier core invalid-tunnel cleanup may already
++	 * have removed them; exact matching is then a safe no-op. */
++	while (xd->native_dma_count) {
++		unsigned int slot = --xd->native_dma_count;
++
++		__tb_disconnect_xdomain_paths(xd->tb, xd,
++			xd->native_tx_path[slot], xd->native_tx_ring[slot],
++			xd->native_rx_path[slot], xd->native_rx_ring[slot]);
 +	}
 +}
 +

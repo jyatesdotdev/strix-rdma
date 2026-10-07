@@ -3,6 +3,7 @@
 #include <linux/delay.h>
 #include <linux/random.h>
 #include <linux/pci.h>
+#include <linux/sched.h>
 #include <linux/rtnetlink.h>
 #include <net/net_namespace.h>
 #include <rdma/ib_user_verbs.h>
@@ -12,6 +13,15 @@
 static bool enable;
 module_param(enable, bool, 0400);
 MODULE_PARM_DESC(enable, "Explicitly enable experimental native NHI software verbs");
+
+/* Worker scheduling: drain this many passes per wake before yielding the
+ * lock to uverbs; then busy-poll up to this many microseconds before
+ * sleeping. Bursts reschedule at zero delay; the 1 ms requeue is a backstop
+ * for missed callbacks only. */
+#define SN_PASS_BUDGET	8
+#define SN_IDLE_SPIN_US	128
+
+static bool sn_spin_wait(struct sn_device *d);
 static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
 static struct tb_property_dir *sn_directory;
@@ -41,6 +51,10 @@ int sn_publish(struct sn_device *d)
 	if (!dir) return -ENOMEM;
 	ret = tb_property_add_immediate(dir, "rxhop", d->in_hop);
 	if (ret) { tb_property_free_dir(dir); return ret; }
+	if (d->in_hop2 >= 0) {
+		ret = tb_property_add_immediate(dir, "rxhop2", d->in_hop2);
+		if (ret) { tb_property_free_dir(dir); return ret; }
+	}
 	mutex_lock(&svc->lock);
 	old = svc->local_properties;
 	svc->local_properties = dir;
@@ -48,7 +62,7 @@ int sn_publish(struct sn_device *d)
 	tb_property_free_dir(old);
 	return tb_service_try_native_properties_changed(svc);
 }
-static int sn_remote_rxhop(struct sn_device *d, u64 *hop)
+static int sn_remote_rxhop(struct sn_device *d, const char *key, u64 *hop)
 {
 	struct tb_service *svc = d->service;
 	struct tb_property *p;
@@ -56,7 +70,7 @@ static int sn_remote_rxhop(struct sn_device *d, u64 *hop)
 
 	mutex_lock(&svc->lock);
 	if (svc->remote_properties && uuid_equal(svc->remote_properties->uuid, &sn_uuid)) {
-		p = tb_property_find(svc->remote_properties, "rxhop", TB_PROPERTY_TYPE_VALUE);
+		p = tb_property_find(svc->remote_properties, key, TB_PROPERTY_TYPE_VALUE);
 		if (p) { *hop = p->value.immediate; ret = 0; }
 	}
 	mutex_unlock(&svc->lock);
@@ -69,7 +83,7 @@ static int sn_refresh(struct sn_device *d)
 	int ret;
 
 	if (d->out_hop < 0) {
-		ret = sn_remote_rxhop(d, &hop);
+		ret = sn_remote_rxhop(d, "rxhop", &hop);
 		if (ret) return ret;
 		if (hop < 8 || hop > xd->remote_max_hopid) return -EPROTO;
 		ret = tb_xdomain_alloc_out_hopid(xd, hop);
@@ -77,15 +91,34 @@ static int sn_refresh(struct sn_device *d)
 		if (ret != hop) { tb_xdomain_release_out_hopid(xd, ret); return -EBUSY; }
 		d->out_hop = ret;
 	}
+	if (d->out_hop2 < 0 && d->in_hop2 >= 0) {
+		ret = sn_remote_rxhop(d, "rxhop2", &hop);
+		if (!ret && hop >= 8 && hop <= xd->remote_max_hopid) {
+			ret = tb_xdomain_alloc_out_hopid(xd, hop);
+			if (ret >= 0) {
+				if (ret != hop) { tb_xdomain_release_out_hopid(xd, ret); return -EBUSY; }
+				d->out_hop2 = ret;
+			}
+		}
+	}
 	if (!d->rings_started && d->ready.carrier)
 		return sn_rings_start(d);
+	/* Retry a pending data-tuple enable after an earlier busy core. */
+	if (d->rings_started && !d->zdata && !d->zc_unavail && d->data_tx_ring) {
+		ret = sn_data_rings_start(d);
+		if (ret == -ENOMEM)
+			d->zc_unavail = true;
+		else if (ret && ret != -EAGAIN && ret != -ENODEV)
+			return ret;
+	}
 	return 0;
 }
 static void sn_work(struct work_struct *work)
 {
 	struct sn_device *d = container_of(to_delayed_work(work), struct sn_device, work);
-	bool active, was_active;
-	int ret;
+	bool active, was_active, progress;
+	unsigned long long rx0, tx0;
+	int ret, budget;
 
 	mutex_lock(&d->lock);
 	if (d->dead) { mutex_unlock(&d->lock); return; }
@@ -118,15 +151,48 @@ static void sn_work(struct work_struct *work)
 	active = !d->dead && sn_ready(&d->ready);
 	if ((!d->ready.carrier || d->dead) && d->tx_ring)
 		sn_rings_stop(d);
-	sn_ring_receive(d);
-	sn_engine_progress(d);
+	/* Drain-until-idle with a bounded budget, then release the lock so uverbs
+	 * (poll_cq etc.) gets in during sustained bursts. Bursts reschedule at
+	 * zero delay; idle work falls through to the bounded spin below. */
+	budget = SN_PASS_BUDGET;
+	do {
+		rx0 = d->rx_frames; tx0 = d->tx_frames;
+		sn_ring_receive(d);
+		sn_data_receive(d);
+		sn_engine_progress(d);
+		progress = d->rx_frames != rx0 || d->tx_frames != tx0;
+	} while (progress && --budget);
 	mutex_unlock(&d->lock);
 	if (was_active != active && d->registered) {
 		struct ib_event event = {.device = &d->ib,
 			.event = active ? IB_EVENT_PORT_ACTIVE : IB_EVENT_PORT_ERR};
 		event.element.port_num = 1; ib_dispatch_event(&event);
 	}
-	if (!READ_ONCE(d->dead)) queue_delayed_work(system_unbound_wq, &d->work, msecs_to_jiffies(1));
+	if (READ_ONCE(d->dead)) return;
+	if (progress || sn_spin_wait(d))
+		sn_schedule(d);
+	else
+		queue_delayed_work(system_unbound_wq, &d->work, msecs_to_jiffies(1));
+}
+/* Bounded busy-poll before sleeping: while the peer is mid-burst the next
+ * frame is imminent, and the CPU is otherwise idle waiting on it anyway
+ * (NAPI-style). Returns true if work appeared; callbacks wake us at zero
+ * delay regardless, so the 1 ms requeue above is only a backstop. */
+static bool sn_spin_wait(struct sn_device *d)
+{
+	int i;
+
+	for (i = 0; i < SN_IDLE_SPIN_US; i++) {
+		if (READ_ONCE(d->dead))
+			return false;
+		if (sn_ring_pending(d) || READ_ONCE(d->control_count))
+			return true;
+		cpu_relax();
+		if (!(i & 31))
+			cond_resched();
+		udelay(1);
+	}
+	return false;
 }
 static struct net_device *sn_find_netdev(struct tb_service *svc)
 {
@@ -198,6 +264,8 @@ static int sn_probe(struct tb_service *svc, const struct tb_service_id *id)
 	if (!d) { dev_put(netdev); return -ENOMEM; }
 	d->service = svc; d->netdev = netdev;
 	d->in_hop = d->out_hop = -1;
+	d->in_hop2 = d->out_hop2 = -1;
+	d->caps = SN_CAPS_V1;
 	mutex_init(&d->lock); spin_lock_init(&d->ring_lock);
 	INIT_LIST_HEAD(&d->mrs); INIT_DELAYED_WORK(&d->work, sn_work);
 	do { d->ready.local_epoch = get_random_u64(); } while (!d->ready.local_epoch);
@@ -209,6 +277,11 @@ static int sn_probe(struct tb_service *svc, const struct tb_service_id *id)
 	ret = tb_xdomain_alloc_in_hopid(xd, 10);
 	if (ret < 0) goto free;
 	d->in_hop = ret;
+	/* A second HopID for the zero-copy data plane; absence is not fatal
+	 * (staged-only when thunderbolt-net holds the low HopIDs). */
+	ret = tb_xdomain_alloc_in_hopid(xd, d->in_hop + 1);
+	if (ret >= 0)
+		d->in_hop2 = ret;
 	d->ib.node_type = RDMA_NODE_IB_CA;
 	d->ib.phys_port_cnt = 1; d->ib.num_comp_vectors = 1;
 	memcpy(&d->ib.node_guid, d->gid.raw + 8, 8);
@@ -236,6 +309,7 @@ notifier:
 	unregister_netdevice_notifier(&d->net_notifier);
 hop:
 	tb_xdomain_release_in_hopid(xd, d->in_hop);
+	if (d->in_hop2 >= 0) tb_xdomain_release_in_hopid(xd, d->in_hop2);
 free:
 	dev_put(d->netdev);
 	ib_dealloc_device(&d->ib);
@@ -275,7 +349,11 @@ static void sn_remove(struct tb_service *svc)
 	while (tb_service_try_native_properties_changed(svc) == -EAGAIN)
 		msleep(1);
 	if (d->out_hop >= 0) tb_xdomain_release_out_hopid(xd, d->out_hop);
+	if (d->out_hop2 >= 0) tb_xdomain_release_out_hopid(xd, d->out_hop2);
 	tb_xdomain_release_in_hopid(xd, d->in_hop);
+	if (d->in_hop2 >= 0) tb_xdomain_release_in_hopid(xd, d->in_hop2);
+	if (d->data_tx_ring) tb_ring_free(d->data_tx_ring);
+	if (d->data_rx_ring) tb_ring_free(d->data_rx_ring);
 	dev_put(d->netdev); /* NULL after NETDEV_UNREGISTER released it */
 	ib_dealloc_device(&d->ib);
 }
