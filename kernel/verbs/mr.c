@@ -80,12 +80,12 @@ dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len)
 
 	*max_len = 0;
 	for_each_sg(m->umem->sgt_append.sgt.sgl, sg, m->map_nents, i) {
-		if (skip < off + sg->length) {
+		if (skip < off + sg_dma_len(sg)) {
 			u64 inner = skip - off;
-			*max_len = sg->length - inner;
+			*max_len = sg_dma_len(sg) - inner;
 			return sg_dma_address(sg) + inner;
 		}
-		off += sg->length;
+		off += sg_dma_len(sg);
 	}
 	return 0;
 }
