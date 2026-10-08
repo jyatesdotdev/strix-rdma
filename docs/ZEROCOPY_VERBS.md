@@ -26,12 +26,23 @@ suite, ASan/UBSan clean):
 - Core (`0001` patch): native path-lifetime API now admits **two** exact
   tuples (control + data); the 7-test core-contract model passes.
 
-Kernel glue, now **compile-verified on 7.2.8** (both modules build clean).
-Hardware test pending a lab window: the zero-copy data plane needs
-thunderbolt-net absent (its ring HopID), which in turn needs the production
-stream group released to reload the core module. Also note the driver's probe
-is now TB-IP-optional: with no thunderbolt-net the wire handshake alone proves
-link liveness and the carrier gate is satisfied internally.
+## Hardware bring-up status (in progress)
+
+- The zero-copy data plane **comes up cleanly**: with thunderbolt-net absent on
+  both nodes, the service probes without a netdev, the wire handshake
+  completes (PORT_ACTIVE), the second path tuple enables, and both sides
+  report `zdata=1` (data rings live, SN_CAP_ZDATA exchanged).
+- **Open issue: max2 hard-hangs when the ZC burst path activates** (twice:
+  once at bring-up, once at the first 2 MiB burst). Silent hang, no oops —
+  prime suspect is an NHI wedge from two E2E ring pairs on one link, or a
+  tunnel conflict. Crash capture was previously unconfigured; panic_on_oops
+  is now set and netconsole is being set up so the next hang leaves a trace.
+- Found while setting this up: the nodes' initramfs carries the **stock**
+  thunderbolt module (no custom symbols) — after any reboot the stack must be
+  reloaded from the updates build before strix_nhi/thunderbolt_stream load.
+  And thunderbolt_net **auto-loads** via its module alias when the XDomain
+  appears — for no-TB-IP mode it must be blacklisted (`strix-zc-test.conf` on
+  max2) or NetworkManager will bring it back and the carrier gate wedges.
 
 - `ring.c`: data ring pair alloc/start/stop/free (`sn_data_rings_start`),
   `sn_data_send_burst` (header-less frames straight from the send MR's DMA
