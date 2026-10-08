@@ -3,90 +3,28 @@ Subject: [PATCH 1/2] thunderbolt: add nonblocking native path ownership for serv
 
 The native service worker must not wait for tb->lock while domain removal
 holds that lock and waits for service work. Add opt-in software-CM-only
-try operations and retire the exact admitted tuple before synchronous
+try operations and retire the exact admitted tuples before synchronous
 XDomain removal. Existing path APIs retain their blocking behavior.
 
-EAGAIN never transfers ownership. ENODEV from native disable is release-
-published only after core cleanup; DMA ring stop/join remains the client's
-responsibility. Domain stop retires native paths before generic tunnels.
-With CONFIG_INFINIBAND_STRIX_NHI disabled the new fields and APIs are
-compiled out. Three behavior-preserving pieces remain: the
-__tb_approve_xdomain_paths/tb_approve_xdomain_paths lock split, a tb_cm_ops
-forward declaration and a call to the empty tb_xdomain_remove_native_paths
-stub.
+Up to two exact tuples are admitted per XDomain: the control ring pair and
+the zero-copy data ring pair. EAGAIN never transfers ownership. ENODEV from
+native disable is release-published only after core cleanup; DMA ring
+stop/join remains the client's responsibility. Domain stop retires native
+paths before generic tunnels. With CONFIG_INFINIBAND_STRIX_NHI disabled the
+new fields and APIs are compiled out. Three behavior-preserving pieces
+remain: the __tb_approve_xdomain_paths/tb_approve_xdomain_paths lock split,
+a tb_cm_ops forward declaration and a call to the empty
+tb_xdomain_remove_native_paths stub.
 
 ---
-diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
---- a/include/linux/thunderbolt.h
-+++ b/include/linux/thunderbolt.h
-@@ -279,6 +279,14 @@
- 	u8 target_link_width;
- 	u8 link;
- 	u8 depth;
-+#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
-+	/* Native service tuple is owned under tb->lock until exact cleanup.
-+	 * native_dma_removed is release/acquire published after core cleanup. */
-+	int native_tx_path[2], native_tx_ring[2], native_rx_path[2], native_rx_ring[2];
-+	unsigned int native_dma_count;
-+	bool native_dma_stopping;
-+	bool native_dma_removed;
-+#endif
- };
- 
- int tb_xdomain_lane_bonding_enable(struct tb_xdomain *xd);
-@@ -294,6 +302,12 @@
- 			     int transmit_ring, int receive_path,
- 			     int receive_ring);
- 
-+#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
-+int tb_xdomain_try_enable_native_paths(struct tb_xdomain *xd, int transmit_path,
-+		int transmit_ring, int receive_path, int receive_ring);
-+int tb_xdomain_try_disable_native_paths(struct tb_xdomain *xd);
-+#endif
-+
- static inline int tb_xdomain_disable_all_paths(struct tb_xdomain *xd)
- {
- 	return tb_xdomain_disable_paths(xd, -1, -1, -1, -1);
-@@ -491,6 +505,9 @@
- }
- 
- void tb_service_properties_changed(struct tb_service *svc);
-+#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
-+int tb_service_try_native_properties_changed(struct tb_service *svc);
-+#endif
- 
- /**
-  * struct tb_nhi - thunderbolt native host interface
-diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
---- a/drivers/thunderbolt/tb.h
-+++ b/drivers/thunderbolt/tb.h
-@@ -1263,6 +1263,11 @@
- 				    const uuid_t *remote_uuid);
- void tb_xdomain_add(struct tb_xdomain *xd);
- void tb_xdomain_remove(struct tb_xdomain *xd);
-+#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
-+void tb_xdomain_remove_native_paths(struct tb_xdomain *xd);
-+#else
-+static inline void tb_xdomain_remove_native_paths(struct tb_xdomain *xd) { }
-+#endif
- struct tb_xdomain *tb_xdomain_find_by_link_depth(struct tb *tb, u8 link,
- 						 u8 depth);
- 
-diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
---- a/drivers/thunderbolt/xdomain.c
-+++ b/drivers/thunderbolt/xdomain.c
-@@ -2155,6 +2155,10 @@
-  */
- void tb_xdomain_remove(struct tb_xdomain *xd)
- {
-+	/* Software-CM callers hold tb->lock, including domain stop, scan,
-+	 * unplug and resume cleanup. Retire native paths before any callback
-+	 * or cancel_sync can wait for a service worker. ICM is a no-op here. */
-+	tb_xdomain_remove_native_paths(xd);
- 	tb_xdomain_debugfs_remove(xd);
- 
- 	stop_handshake(xd);
+ drivers/thunderbolt/tb.c      | 178 +++++++++++++++++++++++++++++++++-
+ drivers/thunderbolt/tb.h      |   5 +
+ drivers/thunderbolt/xdomain.c |   4 +
+ include/linux/thunderbolt.h   |  17 ++++
+ 4 files changed, 200 insertions(+), 4 deletions(-)
+
 diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index f43f2d952..bde165923 100644
 --- a/drivers/thunderbolt/tb.c
 +++ b/drivers/thunderbolt/tb.c
 @@ -16,6 +16,8 @@
@@ -98,7 +36,7 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
  #define TB_TIMEOUT		100	/* ms */
  #define TB_RELEASE_BW_TIMEOUT	10000	/* ms */
  
-@@ -2316,7 +2318,7 @@
+@@ -2316,7 +2318,7 @@ static int tb_tunnel_pci(struct tb *tb, struct tb_switch *sw)
  	return 0;
  }
  
@@ -107,7 +45,7 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
  				    int transmit_path, int transmit_ring,
  				    int receive_path, int receive_ring)
  {
-@@ -2330,7 +2332,7 @@
+@@ -2330,7 +2332,7 @@ static int tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
  	dst_port = tb_port_at(xd->route, sw);
  	nhi_port = tb_switch_find_port(tb->root_switch, TB_TYPE_NHI);
  
@@ -116,7 +54,7 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
  
  	/*
  	 * When tunneling DMA paths the link should not enter CL states
-@@ -2353,15 +2355,25 @@
+@@ -2353,18 +2355,28 @@ static int tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
  	}
  
  	list_add_tail(&tunnel->list, &tcm->tunnel_list);
@@ -128,30 +66,29 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
  err_clx:
  	tb_enable_clx(sw);
 -	mutex_unlock(&tb->lock);
-+
-+	return ret;
-+}
-+
+ 
+ 	return ret;
+ }
+ 
 +static int tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
 +		int transmit_path, int transmit_ring, int receive_path, int receive_ring)
 +{
 +	int ret;
- 
++
 +	mutex_lock(&tb->lock);
 +	ret = __tb_approve_xdomain_paths(tb, xd, transmit_path, transmit_ring,
 +				       receive_path, receive_ring);
 +	mutex_unlock(&tb->lock);
- 	return ret;
- }
- 
-@@ -2407,10 +2419,143 @@
- 					      transmit_ring, receive_path,
- 					      receive_ring);
- 		mutex_unlock(&tb->lock);
-+	}
-+	return 0;
++	return ret;
 +}
 +
+ static void __tb_disconnect_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
+ 					  int transmit_path, int transmit_ring,
+ 					  int receive_path, int receive_ring)
+@@ -2411,6 +2423,141 @@ static int tb_disconnect_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
+ 	return 0;
+ }
+ 
 +#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
 +/**
 + * tb_xdomain_try_enable_native_paths() - Nonblocking native DMA path admission
@@ -196,7 +133,7 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
 +			xd->native_rx_path[slot] = receive_path;
 +			xd->native_rx_ring[slot] = receive_ring;
 +		}
- 	}
++	}
 +	mutex_unlock(&tb->lock);
 +	return ret;
 +}
@@ -240,10 +177,10 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
 +		return -EAGAIN;
 +	tb_release_native_paths(xd);
 +	mutex_unlock(&tb->lock);
- 	return 0;
- }
++	return 0;
++}
 +EXPORT_SYMBOL_GPL(tb_xdomain_try_disable_native_paths);
- 
++
 +/**
 + * tb_service_try_native_properties_changed() - Publish without racing removal
 + * @svc: Native service whose local properties changed
@@ -290,7 +227,7 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
  /* hotplug handling */
  
  /*
-@@ -2930,6 +3075,20 @@
+@@ -2938,6 +3085,20 @@ static void tb_handle_event(struct tb *tb, enum tb_cfg_pkg_type type,
  	tb_queue_hotplug(tb, route, pkg->port, pkg->unplug);
  }
  
@@ -311,7 +248,7 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
  static void tb_stop(struct tb *tb)
  {
  	struct tb_cm *tcm = tb_priv(tb);
-@@ -2937,6 +3096,11 @@
+@@ -2945,6 +3106,11 @@ static void tb_stop(struct tb *tb)
  	struct tb_tunnel *n;
  
  	cancel_delayed_work(&tcm->remove_work);
@@ -323,7 +260,7 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
  	/* tunnels are only present after everything has been initialized */
  	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
  		/*
-@@ -2948,6 +3112,10 @@
+@@ -2956,6 +3122,10 @@ static void tb_stop(struct tb *tb)
  			tb_tunnel_deactivate(tunnel);
  		tb_tunnel_put(tunnel);
  	}
@@ -332,5 +269,81 @@ diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
 +	if (IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI))
 +		INIT_LIST_HEAD(&tcm->tunnel_list);
  	tb_switch_remove(tb->root_switch);
+ 	tb->root_switch = NULL;
  	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index ec9192b61..bf9e638ac 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -1265,6 +1265,11 @@ struct tb_xdomain *tb_xdomain_alloc(struct tb *tb, struct device *parent,
+ void tb_xdomain_add(struct tb_xdomain *xd);
+ void tb_xdomain_remove(struct tb_xdomain *xd);
+ void tb_xdomain_unregister(struct tb_xdomain *xd);
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++void tb_xdomain_remove_native_paths(struct tb_xdomain *xd);
++#else
++static inline void tb_xdomain_remove_native_paths(struct tb_xdomain *xd) { }
++#endif
+ struct tb_xdomain *tb_xdomain_find_by_link_depth(struct tb *tb, u8 link,
+ 						 u8 depth);
+ 
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index 86b2f7474..7a92cf535 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -2223,6 +2223,10 @@ static int unregister_service(struct device *dev, void *data)
+  */
+ void tb_xdomain_remove(struct tb_xdomain *xd)
+ {
++	/* Software-CM callers hold tb->lock, including domain stop, scan,
++	 * unplug and resume cleanup. Retire native paths before any callback
++	 * or cancel_sync can wait for a service worker. ICM is a no-op here. */
++	tb_xdomain_remove_native_paths(xd);
+ 	tb_xdomain_debugfs_remove(xd);
+ 
+ 	mutex_lock(&xd->lock);
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index a9ecfbe8b..0c1324183 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -284,6 +284,14 @@ struct tb_xdomain {
+ 	atomic_t ntunnels;
+ 	u8 link;
+ 	u8 depth;
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++	/* Native service tuple is owned under tb->lock until exact cleanup.
++	 * native_dma_removed is release/acquire published after core cleanup. */
++	int native_tx_path[2], native_tx_ring[2], native_rx_path[2], native_rx_ring[2];
++	unsigned int native_dma_count;
++	bool native_dma_stopping;
++	bool native_dma_removed;
++#endif
+ };
+ 
+ int tb_xdomain_lane_bonding_enable(struct tb_xdomain *xd);
+@@ -299,6 +307,12 @@ int tb_xdomain_disable_paths(struct tb_xdomain *xd, int transmit_path,
+ 			     int transmit_ring, int receive_path,
+ 			     int receive_ring);
+ 
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++int tb_xdomain_try_enable_native_paths(struct tb_xdomain *xd, int transmit_path,
++		int transmit_ring, int receive_path, int receive_ring);
++int tb_xdomain_try_disable_native_paths(struct tb_xdomain *xd);
++#endif
++
+ static inline int tb_xdomain_disable_all_paths(struct tb_xdomain *xd)
+ {
+ 	return tb_xdomain_disable_paths(xd, -1, -1, -1, -1);
+@@ -496,6 +510,9 @@ static inline struct tb_xdomain *tb_service_parent(struct tb_service *svc)
  }
+ 
+ void tb_service_properties_changed(struct tb_service *svc);
++#if IS_ENABLED(CONFIG_INFINIBAND_STRIX_NHI)
++int tb_service_try_native_properties_changed(struct tb_service *svc);
++#endif
+ 
+ /**
+  * struct tb_nhi - thunderbolt native host interface
+-- 
+2.55.0
+

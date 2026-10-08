@@ -618,7 +618,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,405 @@
+@@ -0,0 +1,411 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -744,7 +744,9 @@ new file mode 100644
 +	mutex_lock(&d->lock);
 +	if (d->dead) { mutex_unlock(&d->lock); return; }
 +	was_active = sn_ready(&d->ready);
-+	d->ready.carrier = d->netdev && netif_running(d->netdev) && netif_carrier_ok(d->netdev);
++	/* TB-IP is optional: without it the wire handshake alone proves link and
++	 * peer liveness (the XDomain's existence means the link enumerated). */
++	d->ready.carrier = d->netdev ? netif_running(d->netdev) && netif_carrier_ok(d->netdev) : true;
 +	ret = 0;
 +	/* Latch even a down/up event entirely between worker passes. Do not
 +	 * overwrite the loss with current carrier and reuse the old DMA paths. */
@@ -880,7 +882,8 @@ new file mode 100644
 +	    to_pci_dev(xd->tb->nhi->dev)->device))
 +		return -EOPNOTSUPP;
 +	netdev = sn_find_netdev(svc);
-+	if (!netdev) return -EPROBE_DEFER;
++	/* TB-IP is optional: absent it the wire handshake alone proves link and
++	 * peer liveness, and the zero-copy data plane gets its ring HopID. */
 +	d = ib_alloc_device(sn_device, ib);
 +	if (!d) { dev_put(netdev); return -ENOMEM; }
 +	d->service = svc; d->netdev = netdev;
@@ -913,13 +916,16 @@ new file mode 100644
 +		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) | BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ) |
 +		BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
 +	ib_set_device_ops(&d->ib, &sn_verbs_ops);
-+	ret = ib_device_set_netdev(&d->ib, netdev, 1);
-+	if (ret) goto hop;
-+	/* After set_netdev: an unregistration that already raced past the lookup
-+	 * is rebroadcast by netdev_wait_allrefs_any while references remain. */
-+	d->net_notifier.notifier_call = sn_net_event;
-+	ret = register_netdevice_notifier(&d->net_notifier);
-+	if (ret) goto hop;
++	if (netdev) {
++		ret = ib_device_set_netdev(&d->ib, netdev, 1);
++		if (ret) goto hop;
++		/* After set_netdev: an unregistration that already raced past the
++		 * lookup is rebroadcast by netdev_wait_allrefs_any while references
++		 * remain. */
++		d->net_notifier.notifier_call = sn_net_event;
++		ret = register_netdevice_notifier(&d->net_notifier);
++		if (ret) goto hop;
++	}
 +	ret = ib_register_device(&d->ib, "strix_nhi%d", NULL);
 +	if (ret) goto notifier;
 +	d->registered = true;
@@ -927,7 +933,7 @@ new file mode 100644
 +	sn_schedule(d);
 +	return 0;
 +notifier:
-+	unregister_netdevice_notifier(&d->net_notifier);
++	if (netdev) unregister_netdevice_notifier(&d->net_notifier);
 +hop:
 +	tb_xdomain_release_in_hopid(xd, d->in_hop);
 +	if (d->in_hop2 >= 0) tb_xdomain_release_in_hopid(xd, d->in_hop2);
@@ -947,7 +953,7 @@ new file mode 100644
 +	d->dead = true; d->ready.peer_ready = 0;
 +	if (d->qp) sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
 +	mutex_unlock(&d->lock);
-+	unregister_netdevice_notifier(&d->net_notifier);
++	if (d->netdev) unregister_netdevice_notifier(&d->net_notifier);
 +	cancel_delayed_work_sync(&d->work);
 +	/* No object lock or workqueue is held while waiting for local core
 +	 * ownership. Core-removal callbacks observe its release-published
@@ -1028,7 +1034,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,441 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1121,6 +1127,9 @@ new file mode 100644
 +	}
 +	ret = tb_xdomain_try_enable_native_paths(xd, d->out_hop2,
 +		d->data_tx_ring->hop, d->in_hop2, d->data_rx_ring->hop);
++	/* EBUSY means an old single-tuple core; stay staged-only. */
++	if (ret == -EBUSY)
++		return -ENOMEM;
 +	if (ret)
 +		return ret;	/* EAGAIN retries next pass; rings stay allocated. */
 +	d->zdata = true;
@@ -1351,7 +1360,6 @@ new file mode 100644
 +			return -EFAULT;
 +		size = min3(max, (u32)SN_FRAME, w->length - q->zc_offset);
 +		s = &d->data_tx[d->data_tx_head % SN_RING_SIZE];
-+		s->frame.buffer = NULL;
 +		s->frame.buffer_phy = dma;
 +		s->frame.size = size & 0xfff;
 +		s->frame.flags = 0;
@@ -1385,7 +1393,6 @@ new file mode 100644
 +			return -EFAULT;
 +		size = min(max, min((u32)SN_FRAME, q->zc_total - d->zdata_posted));
 +		s = &d->data_rx[d->data_rx_head % SN_RING_SIZE];
-+		s->frame.buffer = NULL;
 +		s->frame.buffer_phy = dma;
 +		s->frame.size = 0;
 +		s->frame.flags = 0;

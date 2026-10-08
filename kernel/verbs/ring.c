@@ -90,6 +90,9 @@ int sn_data_rings_start(struct sn_device *d)
 	}
 	ret = tb_xdomain_try_enable_native_paths(xd, d->out_hop2,
 		d->data_tx_ring->hop, d->in_hop2, d->data_rx_ring->hop);
+	/* EBUSY means an old single-tuple core; stay staged-only. */
+	if (ret == -EBUSY)
+		return -ENOMEM;
 	if (ret)
 		return ret;	/* EAGAIN retries next pass; rings stay allocated. */
 	d->zdata = true;
@@ -320,7 +323,6 @@ int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
 			return -EFAULT;
 		size = min3(max, (u32)SN_FRAME, w->length - q->zc_offset);
 		s = &d->data_tx[d->data_tx_head % SN_RING_SIZE];
-		s->frame.buffer = NULL;
 		s->frame.buffer_phy = dma;
 		s->frame.size = size & 0xfff;
 		s->frame.flags = 0;
@@ -354,7 +356,6 @@ static int sn_zdata_repost(struct sn_device *d, struct sn_qp *q)
 			return -EFAULT;
 		size = min(max, min((u32)SN_FRAME, q->zc_total - d->zdata_posted));
 		s = &d->data_rx[d->data_rx_head % SN_RING_SIZE];
-		s->frame.buffer = NULL;
 		s->frame.buffer_phy = dma;
 		s->frame.size = 0;
 		s->frame.flags = 0;

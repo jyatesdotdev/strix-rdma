@@ -123,7 +123,9 @@ static void sn_work(struct work_struct *work)
 	mutex_lock(&d->lock);
 	if (d->dead) { mutex_unlock(&d->lock); return; }
 	was_active = sn_ready(&d->ready);
-	d->ready.carrier = d->netdev && netif_running(d->netdev) && netif_carrier_ok(d->netdev);
+	/* TB-IP is optional: without it the wire handshake alone proves link and
+	 * peer liveness (the XDomain's existence means the link enumerated). */
+	d->ready.carrier = d->netdev ? netif_running(d->netdev) && netif_carrier_ok(d->netdev) : true;
 	ret = 0;
 	/* Latch even a down/up event entirely between worker passes. Do not
 	 * overwrite the loss with current carrier and reuse the old DMA paths. */
@@ -259,7 +261,8 @@ static int sn_probe(struct tb_service *svc, const struct tb_service_id *id)
 	    to_pci_dev(xd->tb->nhi->dev)->device))
 		return -EOPNOTSUPP;
 	netdev = sn_find_netdev(svc);
-	if (!netdev) return -EPROBE_DEFER;
+	/* TB-IP is optional: absent it the wire handshake alone proves link and
+	 * peer liveness, and the zero-copy data plane gets its ring HopID. */
 	d = ib_alloc_device(sn_device, ib);
 	if (!d) { dev_put(netdev); return -ENOMEM; }
 	d->service = svc; d->netdev = netdev;
@@ -292,13 +295,16 @@ static int sn_probe(struct tb_service *svc, const struct tb_service_id *id)
 		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) | BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ) |
 		BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
 	ib_set_device_ops(&d->ib, &sn_verbs_ops);
-	ret = ib_device_set_netdev(&d->ib, netdev, 1);
-	if (ret) goto hop;
-	/* After set_netdev: an unregistration that already raced past the lookup
-	 * is rebroadcast by netdev_wait_allrefs_any while references remain. */
-	d->net_notifier.notifier_call = sn_net_event;
-	ret = register_netdevice_notifier(&d->net_notifier);
-	if (ret) goto hop;
+	if (netdev) {
+		ret = ib_device_set_netdev(&d->ib, netdev, 1);
+		if (ret) goto hop;
+		/* After set_netdev: an unregistration that already raced past the
+		 * lookup is rebroadcast by netdev_wait_allrefs_any while references
+		 * remain. */
+		d->net_notifier.notifier_call = sn_net_event;
+		ret = register_netdevice_notifier(&d->net_notifier);
+		if (ret) goto hop;
+	}
 	ret = ib_register_device(&d->ib, "strix_nhi%d", NULL);
 	if (ret) goto notifier;
 	d->registered = true;
@@ -306,7 +312,7 @@ static int sn_probe(struct tb_service *svc, const struct tb_service_id *id)
 	sn_schedule(d);
 	return 0;
 notifier:
-	unregister_netdevice_notifier(&d->net_notifier);
+	if (netdev) unregister_netdevice_notifier(&d->net_notifier);
 hop:
 	tb_xdomain_release_in_hopid(xd, d->in_hop);
 	if (d->in_hop2 >= 0) tb_xdomain_release_in_hopid(xd, d->in_hop2);
@@ -326,7 +332,7 @@ static void sn_remove(struct tb_service *svc)
 	d->dead = true; d->ready.peer_ready = 0;
 	if (d->qp) sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
 	mutex_unlock(&d->lock);
-	unregister_netdevice_notifier(&d->net_notifier);
+	if (d->netdev) unregister_netdevice_notifier(&d->net_notifier);
 	cancel_delayed_work_sync(&d->work);
 	/* No object lock or workqueue is held while waiting for local core
 	 * ownership. Core-removal callbacks observe its release-published

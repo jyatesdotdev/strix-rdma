@@ -12,7 +12,7 @@ before sleeping; bursts reschedule at zero delay and the 1 ms requeue is a
 backstop for missed callbacks only.
 
 ## Phase 2/3 — zero-copy data plane (engine offline-verified; kernel glue
-## compile-pending on the nodes)
+## compiles on 7.2.8; hardware test pending lab window)
 
 Implemented and offline-validated (11/11 engine tests incl. 5 ZC tests, 31/31
 suite, ASan/UBSan clean):
@@ -26,8 +26,12 @@ suite, ASan/UBSan clean):
 - Core (`0001` patch): native path-lifetime API now admits **two** exact
   tuples (control + data); the 7-test core-contract model passes.
 
-Kernel glue, written but **not yet compile-verified** (nodes unreachable at
-writing time; verify on the lab nodes before hardware use):
+Kernel glue, now **compile-verified on 7.2.8** (both modules build clean).
+Hardware test pending a lab window: the zero-copy data plane needs
+thunderbolt-net absent (its ring HopID), which in turn needs the production
+stream group released to reload the core module. Also note the driver's probe
+is now TB-IP-optional: with no thunderbolt-net the wire handshake alone proves
+link liveness and the carrier gate is satisfied internally.
 
 - `ring.c`: data ring pair alloc/start/stop/free (`sn_data_rings_start`),
   `sn_data_send_burst` (header-less frames straight from the send MR's DMA
