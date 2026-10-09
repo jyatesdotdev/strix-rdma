@@ -19,7 +19,12 @@ MODULE_PARM_DESC(enable, "Explicitly enable experimental native NHI software ver
  * sleeping. Bursts reschedule at zero delay; the 1 ms requeue is a backstop
  * for missed callbacks only. */
 #define SN_PASS_BUDGET	8
-#define SN_IDLE_SPIN_US	128
+/* Long enough to bridge the inter-burst handshake gaps and the budget-chunk
+ * boundaries so the worker stays resident instead of sleeping and paying the
+ * ~1 ms workqueue wakeup latency (which dominates sustained throughput and
+ * causes large run-to-run variance). Runs without d->lock held, so uverbs
+ * poll_cq is never starved. */
+#define SN_IDLE_SPIN_US	4000
 
 static bool sn_spin_wait(struct sn_device *d);
 static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
