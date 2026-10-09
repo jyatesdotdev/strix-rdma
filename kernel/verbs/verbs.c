@@ -458,6 +458,18 @@ static ssize_t native_stats_show(struct device *dev, struct device_attribute *at
 	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\n",
 		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 		d->write_bytes, d->read_bytes);
+	if (d->qp) {
+		struct sn_qp *q = d->qp;
+
+		n += sysfs_emit_at(buf, n,
+			"zdata %d\ndata_tx %u/%u\ndata_rx %u/%u\nzdata_posted %u\n"
+			"qp_sq %u\nqp_rq %u\nqp_zc_state %u\nqp_zc_offset %u\n"
+			"qp_zc_expect %d\nqp_zc_received %u/%u\nqp_next_seq %llu\n",
+			d->zdata, d->data_tx_head, d->data_tx_tail,
+			d->data_rx_head, d->data_rx_tail, d->zdata_posted,
+			q->sq_count, q->rq_count, q->zc_state, q->zc_offset,
+			q->zc_expect, q->zc_received, q->zc_total, q->next_sequence);
+	}
 	mutex_unlock(&d->lock);
 	return n;
 }
