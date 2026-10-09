@@ -313,6 +313,7 @@ void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
 	}
 	sn_dev(q->ib.device)->send_bytes += q->zc_total;
+	sn_dev(q->ib.device)->zc_bursts++;
 	sn_operation_commit(&q->receive, SN_OK);
 	q->zc_expect = false;
 	sn_ack(q, SN_ACK, q->receive.replay.sequence, SN_OK);
@@ -536,6 +537,7 @@ void sn_engine_progress(struct sn_device *d)
 		}
 		q->rnr_wait = q->outgoing_sent = false;
 		q->outgoing_offset = 0;
+		if (q->zc_state != SN_ZC_NONE) d->zc_timeouts++;
 		q->zc_state = SN_ZC_NONE;
 	}
 	if (q->zc_state == SN_ZC_WAIT) {

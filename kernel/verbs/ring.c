@@ -409,6 +409,7 @@ void sn_data_abort(struct sn_device *d)
 	lockdep_assert_held(&d->lock);
 	if (!d->zdata || !d->data_rx_ring || !d->data_tx_ring)
 		return;
+	d->zc_aborts++;
 	tb_ring_stop(d->data_tx_ring);
 	tb_ring_start(d->data_tx_ring);
 	tb_ring_stop(d->data_rx_ring);

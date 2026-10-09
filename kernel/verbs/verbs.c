@@ -455,9 +455,9 @@ static ssize_t native_stats_show(struct device *dev, struct device_attribute *at
 	ssize_t n;
 
 	mutex_lock(&d->lock);
-	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\n",
+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_timeouts %llu\nzc_aborts %llu\n",
 		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
-		d->write_bytes, d->read_bytes);
+		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_timeouts, d->zc_aborts);
 	if (d->qp) {
 		struct sn_qp *q = d->qp;
 

@@ -435,7 +435,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,182 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -546,6 +546,7 @@ new file mode 100644
 +	unsigned int cq_count, mr_count;
 +	u64 pinned, key_serial, qpn_serial;
 +	u64 tx_frames, rx_frames, bad_frames, send_bytes, write_bytes, read_bytes;
++	u64 zc_bursts, zc_aborts, zc_timeouts;
 +	struct list_head mrs;
 +	struct sn_qp *qp;
 +	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
@@ -1042,7 +1043,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,467 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1454,6 +1455,7 @@ new file mode 100644
 +	lockdep_assert_held(&d->lock);
 +	if (!d->zdata || !d->data_rx_ring || !d->data_tx_ring)
 +		return;
++	d->zc_aborts++;
 +	tb_ring_stop(d->data_tx_ring);
 +	tb_ring_start(d->data_tx_ring);
 +	tb_ring_stop(d->data_rx_ring);
@@ -1971,9 +1973,9 @@ new file mode 100644
 +	ssize_t n;
 +
 +	mutex_lock(&d->lock);
-+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\n",
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_timeouts %llu\nzc_aborts %llu\n",
 +		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
-+		d->write_bytes, d->read_bytes);
++		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_timeouts, d->zc_aborts);
 +	if (d->qp) {
 +		struct sn_qp *q = d->qp;
 +
@@ -2177,7 +2179,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,587 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -2493,6 +2495,7 @@ new file mode 100644
 +		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
 +	}
 +	sn_dev(q->ib.device)->send_bytes += q->zc_total;
++	sn_dev(q->ib.device)->zc_bursts++;
 +	sn_operation_commit(&q->receive, SN_OK);
 +	q->zc_expect = false;
 +	sn_ack(q, SN_ACK, q->receive.replay.sequence, SN_OK);
@@ -2716,6 +2719,7 @@ new file mode 100644
 +		}
 +		q->rnr_wait = q->outgoing_sent = false;
 +		q->outgoing_offset = 0;
++		if (q->zc_state != SN_ZC_NONE) d->zc_timeouts++;
 +		q->zc_state = SN_ZC_NONE;
 +	}
 +	if (q->zc_state == SN_ZC_WAIT) {

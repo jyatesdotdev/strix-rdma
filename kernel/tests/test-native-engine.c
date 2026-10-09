@@ -75,6 +75,7 @@ struct sn_device {
 	unsigned int head, count, sends, recvs, errors, placements, read_samples;
 	enum ib_wc_status last_error;
 	u64 bad_frames, send_bytes, write_bytes, read_bytes;
+	u64 zc_bursts, zc_timeouts, zc_aborts;
 	bool check_ids;
 	u32 caps;
 	/* Zero-copy model state: peer link, expected-burst landing zone, drop knob. */

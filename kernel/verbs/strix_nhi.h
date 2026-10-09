@@ -108,6 +108,7 @@ struct sn_device {
 	unsigned int cq_count, mr_count;
 	u64 pinned, key_serial, qpn_serial;
 	u64 tx_frames, rx_frames, bad_frames, send_bytes, write_bytes, read_bytes;
+	u64 zc_bursts, zc_aborts, zc_timeouts;
 	struct list_head mrs;
 	struct sn_qp *qp;
 	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
