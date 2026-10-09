@@ -52,7 +52,7 @@ static void sn_data_slots_init(struct sn_device *d, struct sn_slot *slots)
 {
 	int i;
 
-	for (i = 0; i < SN_DATA_RING_SIZE; i++) {
+	for (i = 0; i < SN_RING_SIZE; i++) {
 		slots[i].device = d;
 		slots[i].frame.callback = sn_ring_callback;
 		slots[i].buffer = NULL;	/* frames point at MR pages, not coherent buffers */
@@ -72,18 +72,11 @@ int sn_data_rings_start(struct sn_device *d)
 	if (d->out_hop2 < 0 || d->in_hop2 < 0)
 		return -ENOMEM;
 	if (!d->data_tx_ring) {
-		d->data_tx = kcalloc(SN_DATA_RING_SIZE, sizeof(*d->data_tx), GFP_KERNEL);
-		d->data_rx = kcalloc(SN_DATA_RING_SIZE, sizeof(*d->data_rx), GFP_KERNEL);
-		if (!d->data_tx || !d->data_rx) {
-			kfree(d->data_tx); d->data_tx = NULL;
-			kfree(d->data_rx); d->data_rx = NULL;
-			return -ENOMEM;
-		}
-		d->data_tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, SN_DATA_RING_SIZE,
+		d->data_tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, SN_RING_SIZE,
 						 RING_FLAG_FRAME | RING_FLAG_E2E);
 		if (!d->data_tx_ring)
 			return -ENOMEM;
-		d->data_rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, SN_DATA_RING_SIZE,
+		d->data_rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, SN_RING_SIZE,
 			RING_FLAG_FRAME | RING_FLAG_E2E, d->data_tx_ring->hop,
 			BIT(1), BIT(2), NULL, NULL);
 		if (!d->data_rx_ring) {
@@ -221,8 +214,6 @@ int sn_rings_stop(struct sn_device *d)
 	}
 	if (d->data_tx_ring) { tb_ring_free(d->data_tx_ring); d->data_tx_ring = NULL; }
 	if (d->data_rx_ring) { tb_ring_free(d->data_rx_ring); d->data_rx_ring = NULL; }
-	kfree(d->data_tx); d->data_tx = NULL;
-	kfree(d->data_rx); d->data_rx = NULL;
 	d->zdata = false;
 	d->caps = SN_CAPS_V1;
 	d->data_tx_head = d->data_tx_tail = d->data_rx_head = d->data_rx_tail = 0;
@@ -315,8 +306,8 @@ int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
 	dma_sync_sg_for_device(w->mr->map_dev, w->mr->umem->sgt_append.sgt.sgl,
 		w->mr->umem->sgt_append.sgt.orig_nents, DMA_TO_DEVICE);
 	while (d->data_tx_head != d->data_tx_tail &&
-	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_DATA_RING_SIZE])) {
-		if (d->data_tx[d->data_tx_tail % SN_DATA_RING_SIZE].canceled)
+	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE])) {
+		if (d->data_tx[d->data_tx_tail % SN_RING_SIZE].canceled)
 			return -EIO;
 		d->data_tx_tail++;
 	}
@@ -325,13 +316,13 @@ int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
 		dma_addr_t dma;
 		u32 max, size;
 
-		if (d->data_tx_head - d->data_tx_tail >= SN_DATA_RING_SIZE - 1)
+		if (d->data_tx_head - d->data_tx_tail >= SN_RING_SIZE - 1)
 			return -EAGAIN;
 		dma = sn_mr_dma(w->mr, w->address + q->zc_offset, &max);
 		if (!dma || !max)
 			return -EFAULT;
 		size = min3(max, (u32)SN_FRAME, w->length - q->zc_offset);
-		s = &d->data_tx[d->data_tx_head % SN_DATA_RING_SIZE];
+		s = &d->data_tx[d->data_tx_head % SN_RING_SIZE];
 		s->frame.buffer_phy = dma;
 		s->frame.size = size & 0xfff;
 		s->frame.flags = 0;
@@ -354,7 +345,7 @@ static int sn_zdata_repost(struct sn_device *d, struct sn_qp *q)
 
 	lockdep_assert_held(&d->lock);
 	while (d->zdata_posted < q->zc_total &&
-	       d->data_rx_head - d->data_rx_tail < SN_DATA_RING_SIZE - 1) {
+	       d->data_rx_head - d->data_rx_tail < SN_RING_SIZE - 1) {
 		struct sn_slot *s;
 		dma_addr_t dma;
 		u32 max, size;
@@ -364,7 +355,7 @@ static int sn_zdata_repost(struct sn_device *d, struct sn_qp *q)
 		if (!dma || !max)
 			return -EFAULT;
 		size = min(max, min((u32)SN_FRAME, q->zc_total - d->zdata_posted));
-		s = &d->data_rx[d->data_rx_head % SN_DATA_RING_SIZE];
+		s = &d->data_rx[d->data_rx_head % SN_RING_SIZE];
 		s->frame.buffer_phy = dma;
 		s->frame.size = 0;
 		s->frame.flags = 0;
@@ -400,7 +391,7 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 	/* tb_ring_stop joined the cancellation callbacks synchronously; drain
 	 * them without reposting so head/tail stay consistent. */
 	while (d->data_rx_tail != d->data_rx_head) {
-		struct sn_slot *s = &d->data_rx[d->data_rx_tail % SN_DATA_RING_SIZE];
+		struct sn_slot *s = &d->data_rx[d->data_rx_tail % SN_RING_SIZE];
 		if (!sn_slot_done(d, s)) break;
 		d->data_rx_tail++;
 	}
@@ -414,8 +405,8 @@ void sn_data_receive(struct sn_device *d)
 	lockdep_assert_held(&d->lock);
 	if (!d->zdata || d->dead)
 		return;
-	for (i = 0; i < SN_DATA_RING_SIZE; i++) {
-		struct sn_slot *s = &d->data_rx[d->data_rx_tail % SN_DATA_RING_SIZE];
+	for (i = 0; i < SN_RING_SIZE; i++) {
+		struct sn_slot *s = &d->data_rx[d->data_rx_tail % SN_RING_SIZE];
 		u32 size;
 
 		if (!sn_slot_done(d, s)) break;

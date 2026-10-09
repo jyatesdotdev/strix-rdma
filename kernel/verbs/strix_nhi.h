@@ -12,11 +12,6 @@
 
 #define SN_ABI 1
 #define SN_RING_SIZE 64
-/* Data rings are far larger than the control rings: the burst pipeline is
- * latency-bound (ring_bytes / worker drain latency), and 64 x 4096 B (256 KiB)
- * caps sustained throughput at ~250 MiB/s. 1024 x 4096 B (4 MiB) hides the
- * ~1 ms workqueue latency well above the wire rate. */
-#define SN_DATA_RING_SIZE 1024
 #define SN_CONTROL_RESERVE 8
 #define SN_SERVICE "strixv1"
 #define SN_CONTROL_BYTES 112
@@ -99,7 +94,7 @@ struct sn_device {
 	 * in MR pages). Present only when a second ring HopID is available
 	 * (thunderbolt-net absent); otherwise the driver is staged-only. */
 	struct tb_ring *data_tx_ring, *data_rx_ring;
-	struct sn_slot *data_tx, *data_rx;
+	struct sn_slot data_tx[SN_RING_SIZE], data_rx[SN_RING_SIZE];
 	unsigned int data_tx_head, data_tx_tail, data_rx_head, data_rx_tail;
 	u32 zdata_posted;	/* bytes of the expected burst posted to data_rx_ring */
 	bool zdata;
