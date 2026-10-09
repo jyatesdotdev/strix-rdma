@@ -207,12 +207,9 @@ static int sn_thread(void *arg)
 				cond_resched();
 				continue;
 			}
-			if (pending) {
-				/* Pending but the pass made no progress: stay responsive
-				 * without burning the CPU in a hard loop. */
-				cond_resched();
-				continue;
-			}
+			/* No progress this pass. Fall through to the bounded cold path
+			 * rather than re-passing immediately: a pending hint that the
+			 * pass cannot act on must not pin the CPU. */
 		}
 		/* Cold: hold the CPU briefly so an imminent frame (a ping-pong
 		 * reply lands tens of microseconds away) is caught without a

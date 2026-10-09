@@ -41,20 +41,17 @@ bool sn_ring_pending(struct sn_device *d)
 {
 	if (!READ_ONCE(d->rings_started))
 		return false;
-	if (sn_slot_peek(d, &d->rx[d->rx_tail % SN_RING_SIZE]) ||
-	    sn_slot_peek(d, &d->tx[d->tx_tail % SN_RING_SIZE]))
+	/* Only RX completions are latency-critical pending work. A completed TX
+	 * slot is bookkeeping: the send path reaps it before it needs the space.
+	 * Treating it as pending would pin the poller between sends. */
+	if (sn_slot_peek(d, &d->rx[d->rx_tail % SN_RING_SIZE]))
 		return true;
 	/* The zero-copy burst path lands on the second ring pair; the poller
 	 * must see it too or it sleeps mid-burst and pays a wake-up per frame.
 	 * Both are hints: a stale read only costs one callback-driven wake. */
-	if (READ_ONCE(d->zdata)) {
-		if (d->data_rx_tail != d->data_rx_head &&
-		    sn_slot_peek(d, &d->data_rx[d->data_rx_tail % SN_RING_SIZE]))
-			return true;
-		if (d->data_tx_tail != d->data_tx_head &&
-		    sn_slot_peek(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE]))
-			return true;
-	}
+	if (READ_ONCE(d->zdata) && d->data_rx_tail != d->data_rx_head &&
+	    sn_slot_peek(d, &d->data_rx[d->data_rx_tail % SN_RING_SIZE]))
+		return true;
 	return false;
 }
 
