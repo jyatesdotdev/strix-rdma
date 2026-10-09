@@ -39,6 +39,12 @@ static int64_t milliseconds(void)
 	require(!clock_gettime(CLOCK_MONOTONIC, &ts), "clock_gettime");
 	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
+static int64_t microseconds(void)
+{
+	struct timespec ts;
+	require(!clock_gettime(CLOCK_MONOTONIC, &ts), "clock_gettime");
+	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
 static void wait_fd(int fd, short events, int64_t deadline)
 {
 	struct pollfd p = { .fd = fd, .events = events };
@@ -163,15 +169,22 @@ int main(int argc, char **argv)
 		.cap = { .max_send_wr = WINDOW, .max_recv_wr = WINDOW, .max_send_sge = 1, .max_recv_sge = 1 } };
 	unsigned char mine[META_SIZE], theirs[META_SIZE];
 	unsigned long long expected = 0;
-	unsigned bench_iters = 0;
+	unsigned bench_iters = 0, ping_iters = 0;
 	int count, fd; bool listening;
 	if (argc == 2 && !strcmp(argv[1], "--selftest")) { selftest(); return 0; }
-	if ((argc != 6 && argc != 7) || strcmp(argv[1], "--live") ||
+	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations]\n", argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters]]\n", argv[0], argv[0]);
 		return 2;
 	}
-	if (argc == 7) {
+	if (argc >= 7 && !strcmp(argv[6], "ping")) {
+		if (argc == 8) {
+			char *end = NULL; unsigned long v = strtoul(argv[7], &end, 10);
+			require(end && !*end && v && v <= 1000000, "ping iteration count");
+			ping_iters = (unsigned)v;
+		} else
+			ping_iters = 1000;
+	} else if (argc == 7) {
 		char *end = NULL; unsigned long v = strtoul(argv[6], &end, 10);
 		require(end && !*end && v && v <= 100000, "iteration count");
 		bench_iters = (unsigned)v;
@@ -225,6 +238,56 @@ int main(int argc, char **argv)
 	verb(ibv_query_qp(qp, &attr, IBV_QP_STATE|IBV_QP_SQ_PSN|IBV_QP_RQ_PSN|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_MAX_QP_RD_ATOMIC|IBV_QP_MAX_DEST_RD_ATOMIC, &init), "query accepted QP attrs");
 	require(attr.qp_state == IBV_QPS_RTS && attr.sq_psn == local.psn && attr.rq_psn == peer.psn &&
 		attr.timeout == 14 && attr.retry_cnt == 3 && attr.rnr_retry == 3 && attr.max_rd_atomic == 1 && attr.max_dest_rd_atomic == 1, "preserved QP attributes");
+	if (ping_iters) { /* Small-message (256 B, staged path) ping-pong RTT. */
+		struct ibv_sge rs = { .addr = (uintptr_t)rx, .length = 256, .lkey = rx_mr->lkey };
+		struct ibv_sge ss = { .addr = (uintptr_t)tx, .length = 256, .lkey = tx_mr->lkey };
+		struct ibv_recv_wr rw = { .wr_id = 1, .sg_list = &rs, .num_sge = 1 }, *rbad = NULL;
+		struct ibv_send_wr sw = { .wr_id = 2, .sg_list = &ss, .num_sge = 1,
+			.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED }, *sbad = NULL;
+		int64_t best = INT64_MAX, worst = 0, total = 0;
+		barrier(fd, 1); /* align start */
+		for (unsigned it = 0; it < ping_iters; it++) {
+			if (listening) {
+				verb(ibv_post_recv(qp, &rw, &rbad), "ping post receive");
+				unsigned done = 0; int64_t deadline = milliseconds() + TIMEOUT_MS;
+				while (!done) {
+					struct ibv_wc wc; int n = ibv_poll_cq(cq, 1, &wc);
+					require(n >= 0 && milliseconds() < deadline, "ping poll/deadline");
+					if (n && wc.status == IBV_WC_SUCCESS && wc.opcode == IBV_WC_RECV) done = 1;
+					require(n == 0 || wc.status == IBV_WC_SUCCESS, "ping WC status");
+				}
+				verb(ibv_post_send(qp, &sw, &sbad), "ping post echo");
+				done = 0; deadline = milliseconds() + TIMEOUT_MS;
+				while (!done) {
+					struct ibv_wc wc; int n = ibv_poll_cq(cq, 1, &wc);
+					require(n >= 0 && milliseconds() < deadline, "echo poll/deadline");
+					if (n && wc.status == IBV_WC_SUCCESS && wc.opcode == IBV_WC_SEND) done = 1;
+					require(n == 0 || wc.status == IBV_WC_SUCCESS, "echo WC status");
+				}
+			} else {
+				verb(ibv_post_recv(qp, &rw, &rbad), "ping post receive");
+				int64_t start = microseconds();
+				verb(ibv_post_send(qp, &sw, &sbad), "ping post send");
+				bool got_echo = false, sent = false;
+				int64_t deadline = milliseconds() + TIMEOUT_MS;
+				while (!(got_echo && sent)) {
+					struct ibv_wc wc[2]; int n = ibv_poll_cq(cq, 2, wc);
+					require(n >= 0 && milliseconds() < deadline, "ping poll/deadline");
+					for (int i = 0; i < n; i++) {
+						require(wc[i].status == IBV_WC_SUCCESS, "ping WC status");
+						if (wc[i].opcode == IBV_WC_RECV) got_echo = true; else sent = true;
+					}
+				}
+				int64_t rtt = microseconds() - start;
+				total += rtt; if (rtt < best) best = rtt; if (rtt > worst) worst = rtt;
+			}
+		}
+		barrier(fd, 2); /* both finished */
+		if (!listening)
+			printf("PINGPONG %u iters x 256 B: avg %.1f us, min %lld us, max %lld us (round-trip)\n",
+			       ping_iters, (double)total / ping_iters, (long long)best, (long long)worst);
+		goto done;
+	}
 	if (bench_iters) { /* Timed DS4-shaped window-4 x 2MiB bidirectional loop; no verification. */
 		struct ibv_sge rs[WINDOW], ss[WINDOW];
 		struct ibv_recv_wr rw[WINDOW] = {}, *rbad = NULL;
