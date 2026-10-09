@@ -169,6 +169,9 @@ dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len);
 int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w);
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
+/* Abort an in-progress burst and reclaim both data rings (called from
+ * sn_engine_reset so an aborted burst cannot poison the rings). */
+void sn_data_abort(struct sn_device *d);
 void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes);
 int sn_data_rings_start(struct sn_device *d);
 int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m);

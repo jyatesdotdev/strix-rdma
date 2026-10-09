@@ -137,6 +137,7 @@ static int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *pa
 int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w);
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
+void sn_data_abort(struct sn_device *d);
 #include "../verbs/protocol.c"
 /* Modeled zero-copy data plane: the sender copies payload from the active SQ
  * WQE's MR straight into the peer's expected-burst landing zone and feeds the
@@ -168,6 +169,7 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 	d->zc_landed = 0;
 	return 0;
 }
+void sn_data_abort(struct sn_device *d) { (void)d; }
 static void sn_qp_error(struct sn_qp *q, enum ib_wc_status status)
 {
 	struct sn_device *d = q->ib.device;

@@ -158,6 +158,9 @@ void sn_engine_reset(struct sn_qp *q)
 	q->zc_expect = false; q->zc_total = q->zc_received = 0;
 	memset(&q->receive, 0, sizeof(q->receive));
 	memset(&q->read_receive, 0, sizeof(q->read_receive));
+	/* Reclaim the data rings so this aborted burst cannot leave posted RX
+	 * buffers or stale TX payload behind to deadlock later bursts. */
+	sn_data_abort(sn_dev(q->ib.device));
 }
 static void sn_send_complete(struct sn_qp *q)
 {

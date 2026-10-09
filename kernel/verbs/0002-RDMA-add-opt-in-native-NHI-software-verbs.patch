@@ -435,7 +435,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,181 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -607,6 +607,9 @@ new file mode 100644
 +int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
 +int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w);
 +int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
++/* Abort an in-progress burst and reclaim both data rings (called from
++ * sn_engine_reset so an aborted burst cannot poison the rings). */
++void sn_data_abort(struct sn_device *d);
 +void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes);
 +int sn_data_rings_start(struct sn_device *d);
 +int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m);
@@ -1039,7 +1042,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,466 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1439,6 +1442,31 @@ new file mode 100644
 +	}
 +	d->zdata_posted = 0;
 +	return sn_zdata_repost(d, q);
++}
++/* Abort any in-progress zero-copy burst: stop+start both data rings (stop
++ * synchronously joins the cancellation callbacks), drain every completed /
++ * canceled slot so head/tail resync, and drop any slot that was queued but
++ * never transmitted or filled. Without this an aborted burst leaves posted
++ * RX buffers (and stale TX payload) in the rings, which then fill and
++ * deadlock every subsequent burst. */
++void sn_data_abort(struct sn_device *d)
++{
++	lockdep_assert_held(&d->lock);
++	if (!d->zdata || !d->data_rx_ring || !d->data_tx_ring)
++		return;
++	tb_ring_stop(d->data_tx_ring);
++	tb_ring_start(d->data_tx_ring);
++	tb_ring_stop(d->data_rx_ring);
++	tb_ring_start(d->data_rx_ring);
++	while (d->data_tx_tail != d->data_tx_head &&
++	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE]))
++		d->data_tx_tail++;
++	while (d->data_rx_tail != d->data_rx_head &&
++	       sn_slot_done(d, &d->data_rx[d->data_rx_tail % SN_RING_SIZE]))
++		d->data_rx_tail++;
++	d->data_tx_head = d->data_tx_tail;
++	d->data_rx_head = d->data_rx_tail;
++	d->zdata_posted = 0;
 +}
 +void sn_data_receive(struct sn_device *d)
 +{
@@ -2149,7 +2177,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,582 @@
+@@ -0,0 +1,585 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -2310,6 +2338,9 @@ new file mode 100644
 +	q->zc_expect = false; q->zc_total = q->zc_received = 0;
 +	memset(&q->receive, 0, sizeof(q->receive));
 +	memset(&q->read_receive, 0, sizeof(q->read_receive));
++	/* Reclaim the data rings so this aborted burst cannot leave posted RX
++	 * buffers or stale TX payload behind to deadlock later bursts. */
++	sn_data_abort(sn_dev(q->ib.device));
 +}
 +static void sn_send_complete(struct sn_qp *q)
 +{

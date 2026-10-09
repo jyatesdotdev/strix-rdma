@@ -398,6 +398,31 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 	d->zdata_posted = 0;
 	return sn_zdata_repost(d, q);
 }
+/* Abort any in-progress zero-copy burst: stop+start both data rings (stop
+ * synchronously joins the cancellation callbacks), drain every completed /
+ * canceled slot so head/tail resync, and drop any slot that was queued but
+ * never transmitted or filled. Without this an aborted burst leaves posted
+ * RX buffers (and stale TX payload) in the rings, which then fill and
+ * deadlock every subsequent burst. */
+void sn_data_abort(struct sn_device *d)
+{
+	lockdep_assert_held(&d->lock);
+	if (!d->zdata || !d->data_rx_ring || !d->data_tx_ring)
+		return;
+	tb_ring_stop(d->data_tx_ring);
+	tb_ring_start(d->data_tx_ring);
+	tb_ring_stop(d->data_rx_ring);
+	tb_ring_start(d->data_rx_ring);
+	while (d->data_tx_tail != d->data_tx_head &&
+	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE]))
+		d->data_tx_tail++;
+	while (d->data_rx_tail != d->data_rx_head &&
+	       sn_slot_done(d, &d->data_rx[d->data_rx_tail % SN_RING_SIZE]))
+		d->data_rx_tail++;
+	d->data_tx_head = d->data_tx_tail;
+	d->data_rx_head = d->data_rx_tail;
+	d->zdata_posted = 0;
+}
 void sn_data_receive(struct sn_device *d)
 {
 	int i;
