@@ -1093,7 +1093,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,480 @@
+@@ -0,0 +1,474 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1207,12 +1207,6 @@ new file mode 100644
 +	d->zdata = true;
 +	d->caps = SN_CAPS_V1 | SN_CAP_ZDATA;
 +	return 0;
-+}
-+static void sn_data_rings_stop(struct sn_device *d)
-+{
-+	lockdep_assert_held(&d->lock);
-+	if (d->data_tx_ring) tb_ring_stop(d->data_tx_ring);
-+	if (d->data_rx_ring) tb_ring_stop(d->data_rx_ring);
 +}
 +static int sn_slots_alloc(struct sn_device *d, struct tb_ring *r, struct sn_slot *slots)
 +{

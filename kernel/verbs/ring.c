@@ -112,12 +112,6 @@ int sn_data_rings_start(struct sn_device *d)
 	d->caps = SN_CAPS_V1 | SN_CAP_ZDATA;
 	return 0;
 }
-static void sn_data_rings_stop(struct sn_device *d)
-{
-	lockdep_assert_held(&d->lock);
-	if (d->data_tx_ring) tb_ring_stop(d->data_tx_ring);
-	if (d->data_rx_ring) tb_ring_stop(d->data_rx_ring);
-}
 static int sn_slots_alloc(struct sn_device *d, struct tb_ring *r, struct sn_slot *slots)
 {
 	int i;
