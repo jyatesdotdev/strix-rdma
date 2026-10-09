@@ -14,22 +14,24 @@ static bool enable;
 module_param(enable, bool, 0400);
 MODULE_PARM_DESC(enable, "Explicitly enable experimental native NHI software verbs");
 
-/* Worker scheduling: drain this many passes per wake before yielding the
- * lock to uverbs; then busy-poll up to this many microseconds before
- * sleeping. Bursts reschedule at zero delay; the 1 ms requeue is a backstop
- * for missed callbacks only. */
+/* Poller scheduling: drain this many passes per wake before yielding the
+ * lock to uverbs, and busy-poll up to this many microseconds while cold
+ * before sleeping. The 1 ms sleep keeps the maintenance tick (refresh,
+ * rendezvous publish, handshake) that the old workqueue backstop provided. */
 #define SN_PASS_BUDGET	8
 #define SN_IDLE_SPIN_US	128
 
-static bool sn_spin_wait(struct sn_device *d);
 static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
 static struct tb_property_dir *sn_directory;
 
+/* Wake the resident poller. Safe from any context (ring callbacks run in the
+ * NHI's ring work, uverbs calls run in process context) and a no-op once the
+ * thread has been stopped, so it needs no teardown ordering of its own. */
 void sn_schedule(struct sn_device *d)
 {
 	if (READ_ONCE(d->registered) && !READ_ONCE(d->dead))
-		mod_delayed_work(system_unbound_wq, &d->work, 0);
+		wake_up(&d->poll_wait);
 }
 static void sn_gid_from_uuid(union ib_gid *gid, const uuid_t *uuid)
 {
@@ -113,15 +115,16 @@ static int sn_refresh(struct sn_device *d)
 	}
 	return 0;
 }
-static void sn_work(struct work_struct *work)
+/* One maintenance + drain pass. Returns true while the link is still busy, so
+ * the poller re-passes immediately instead of sleeping. */
+static bool sn_pass(struct sn_device *d)
 {
-	struct sn_device *d = container_of(to_delayed_work(work), struct sn_device, work);
 	bool active, was_active, progress;
 	unsigned long long rx0, tx0;
 	int ret, budget;
 
 	mutex_lock(&d->lock);
-	if (d->dead) { mutex_unlock(&d->lock); return; }
+	if (d->dead) { mutex_unlock(&d->lock); return false; }
 	was_active = sn_ready(&d->ready);
 	/* TB-IP is optional: without it the wire handshake alone proves link and
 	 * peer liveness (the XDomain's existence means the link enumerated). */
@@ -170,31 +173,63 @@ static void sn_work(struct work_struct *work)
 			.event = active ? IB_EVENT_PORT_ACTIVE : IB_EVENT_PORT_ERR};
 		event.element.port_num = 1; ib_dispatch_event(&event);
 	}
-	if (READ_ONCE(d->dead)) return;
-	if (progress || sn_spin_wait(d))
-		sn_schedule(d);
-	else
-		queue_delayed_work(system_unbound_wq, &d->work, msecs_to_jiffies(1));
+	if (READ_ONCE(d->dead)) return false;
+	return progress;
 }
-/* Bounded busy-poll before sleeping: while the peer is mid-burst the next
- * frame is imminent, and the CPU is otherwise idle waiting on it anyway
- * (NAPI-style). Returns true if work appeared; callbacks wake us at zero
- * delay regardless, so the 1 ms requeue above is only a backstop. */
-static bool sn_spin_wait(struct sn_device *d)
+/* Resident poller (NAPI-shaped, but in process context so the pass may keep
+ * taking d->lock for the CQ and control-ring work).
+ *
+ * Receive latency was bounded by workqueue dispatch: the NHI interrupt queued
+ * ring_work, whose frame callback queued this driver's work item, so every
+ * frame paid two scheduling hops. Measured against a 36 us hardware floor
+ * that produced a 0.8-6.4 ms ping-pong tail, and under sustained bursts the
+ * ms-scale drain gaps filled the 64-slot data ring and stalled the pipeline.
+ *
+ * A thread that never leaves the CPU while the link is busy removes both hops.
+ * It spins on the lockless pending check while cold (cheap: no mutex), and
+ * otherwise sleeps up to 1 ms -- the same maintenance tick the old backstop
+ * gave -- waking immediately when a ring callback or a uverbs call kicks it. */
+static int sn_thread(void *arg)
 {
-	int i;
+	struct sn_device *d = arg;
+	unsigned int idle = 0;
+	bool maintenance = true;
 
-	for (i = 0; i < SN_IDLE_SPIN_US; i++) {
-		if (READ_ONCE(d->dead))
-			return false;
-		if (sn_ring_pending(d) || READ_ONCE(d->control_count))
-			return true;
-		cpu_relax();
-		if (!(i & 31))
-			cond_resched();
-		udelay(1);
+	while (!kthread_should_stop()) {
+		bool pending = sn_ring_pending(d) || READ_ONCE(d->control_count);
+
+		if (pending || maintenance) {
+			maintenance = false;
+			idle = 0;
+			if (sn_pass(d)) {
+				/* Still busy: yield the CPU to uverbs between passes
+				 * (d->lock is not held here) and go again. */
+				cond_resched();
+				continue;
+			}
+			if (pending) {
+				/* Pending but the pass made no progress: stay responsive
+				 * without burning the CPU in a hard loop. */
+				cond_resched();
+				continue;
+			}
+		}
+		/* Cold: hold the CPU briefly so an imminent frame (a ping-pong
+		 * reply lands tens of microseconds away) is caught without a
+		 * sleep/wake round trip, then sleep on the 1 ms maintenance tick. */
+		if (++idle < SN_IDLE_SPIN_US) {
+			cpu_relax();
+			udelay(1);
+			continue;
+		}
+		wait_event_timeout(d->poll_wait,
+			sn_ring_pending(d) || READ_ONCE(d->control_count) ||
+			READ_ONCE(d->dead) || kthread_should_stop(),
+			msecs_to_jiffies(1));
+		idle = 0;
+		maintenance = true;
 	}
-	return false;
+	return 0;
 }
 static struct net_device *sn_find_netdev(struct tb_service *svc)
 {
@@ -270,7 +305,8 @@ static int sn_probe(struct tb_service *svc, const struct tb_service_id *id)
 	d->in_hop2 = d->out_hop2 = -1;
 	d->caps = SN_CAPS_V1;
 	mutex_init(&d->lock); spin_lock_init(&d->ring_lock);
-	INIT_LIST_HEAD(&d->mrs); INIT_DELAYED_WORK(&d->work, sn_work);
+	init_waitqueue_head(&d->poll_wait);
+	INIT_LIST_HEAD(&d->mrs);
 	do { d->ready.local_epoch = get_random_u64(); } while (!d->ready.local_epoch);
 	sn_gid_from_uuid(&d->gid, xd->local_uuid);
 	sn_gid_from_uuid(&d->peer_gid, xd->remote_uuid);
@@ -309,7 +345,16 @@ static int sn_probe(struct tb_service *svc, const struct tb_service_id *id)
 	if (ret) goto notifier;
 	d->registered = true;
 	tb_service_set_drvdata(svc, d);
-	sn_schedule(d);
+	/* Start the poller last: it drives the handshake, so everything it
+	 * touches (service, device, readiness state) must already be live. */
+	d->thread = kthread_run(sn_thread, d, "strix_nhi/%s", dev_name(&svc->dev));
+	if (IS_ERR(d->thread)) {
+		ret = PTR_ERR(d->thread);
+		d->thread = NULL;
+		d->registered = false;
+		ib_unregister_device(&d->ib);
+		goto notifier;
+	}
 	return 0;
 notifier:
 	if (netdev) unregister_netdevice_notifier(&d->net_notifier);
@@ -333,7 +378,14 @@ static void sn_remove(struct tb_service *svc)
 	if (d->qp) sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
 	mutex_unlock(&d->lock);
 	if (d->netdev) unregister_netdevice_notifier(&d->net_notifier);
-	cancel_delayed_work_sync(&d->work);
+	/* Stop the poller before tearing down the rings it drains. kthread_stop
+	 * must NOT run under d->lock: the thread takes it for its final pass,
+	 * observes d->dead (set above, lock released) and exits on its own. */
+	if (d->thread) {
+		wake_up(&d->poll_wait);
+		kthread_stop(d->thread);
+		d->thread = NULL;
+	}
 	/* No object lock or workqueue is held while waiting for local core
 	 * ownership. Core-removal callbacks observe its release-published
 	 * cleanup marker immediately. Ordinary unbind retries in this thread,
@@ -346,8 +398,8 @@ static void sn_remove(struct tb_service *svc)
 	}
 	ib_unregister_device(&d->ib);
 	/* Ring callbacks, the notifier and uverbs commands that raced with the
-	 * first cancel may have requeued the worker; it must not outlive d. */
-	cancel_delayed_work_sync(&d->work);
+	 * stop may still call sn_schedule; that only wakes an empty waitqueue
+	 * now, so the poller cannot outlive d. */
 	mutex_lock(&svc->lock);
 	old = svc->local_properties; svc->local_properties = NULL;
 	mutex_unlock(&svc->lock);

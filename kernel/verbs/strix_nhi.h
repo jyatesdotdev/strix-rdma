@@ -86,7 +86,10 @@ struct sn_device {
 	 * Ring callbacks only set slot flags under ring_lock; never take lock. */
 	struct mutex lock;
 	spinlock_t ring_lock;
-	struct delayed_work work;
+	/* Resident poller: replaces the delayed_work whose dispatch latency
+	 * (ring_work then the work item) dominated receive latency. */
+	struct task_struct *thread;
+	wait_queue_head_t poll_wait;
 	struct tb_ring *tx_ring, *rx_ring;
 	struct sn_slot tx[SN_RING_SIZE], rx[SN_RING_SIZE];
 	unsigned int tx_head, tx_tail, rx_tail;
@@ -120,7 +123,7 @@ struct sn_device {
 	unsigned int control_head, control_count;
 	/* Consecutive invalid remote directory snapshots; see sn_snapshot_check(). */
 	unsigned int invalid_snapshots;
-	/* Next allowed renotification while not ready; see sn_work(). */
+	/* Next allowed renotification while not ready; see sn_pass(). */
 	unsigned long renotify_after;
 	/* Next HELLO retransmission (ktime ns); session handshake is timer-driven. */
 	u64 next_hello;

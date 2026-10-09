@@ -24,7 +24,7 @@ if grep -E 'uverbs_cmd_mask[[:space:]]*=' "$here/../verbs/main.c" "$tmp/native.p
     echo 'uverbs_cmd_mask must be extended with |=, never assigned' >&2; exit 1
 fi
 printf 'ok - uverbs_cmd_mask extends the core default write commands\n'
-# Source-contract checks only (no kernel runtime): netdev and worker lifetime.
+# Source-contract checks only (no kernel runtime): netdev and poller lifetime.
 main=$here/../verbs/main.c
 awk '
  /^static int sn_net_event\(/ { f=1 }
@@ -41,12 +41,13 @@ awk '
 ' "$main"
 awk '
  /^static void sn_remove\(/ { f=1 }
- f && /ib_unregister_device\(/ { unreg=1 }
- f && unreg && /cancel_delayed_work_sync\(&d->work\)/ { joined=1 }
- f && /ib_dealloc_device\(/ { if (!joined) exit 1; passed=1; exit }
+ f && /kthread_stop\(d->thread\)/ { stopped=1 }
+ f && /sn_rings_stop\(d\)/ { if (!stopped) exit 1 }
+ f && /ib_unregister_device\(/ { if (!stopped) exit 1 }
+ f && /ib_dealloc_device\(/ { if (!stopped) exit 1; passed=1; exit }
  END { if (!passed) exit 1 }
 ' "$main"
-printf 'ok - netdev released on NETDEV_UNREGISTER; worker joined after unregister (source contract)\n'
+printf 'ok - netdev released on NETDEV_UNREGISTER; poller stopped before ring teardown (source contract)\n'
 # The dynamic session handshake must be wire-carried: no DATA property blob,
 # handshake frames gated on local paths only, one-shot static rendezvous.
 if grep -F 'tb_property_add_data(dir, "session"' "$main" "$tmp/native.patch" >/dev/null; then

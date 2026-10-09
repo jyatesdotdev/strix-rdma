@@ -41,8 +41,21 @@ bool sn_ring_pending(struct sn_device *d)
 {
 	if (!READ_ONCE(d->rings_started))
 		return false;
-	return sn_slot_peek(d, &d->rx[d->rx_tail % SN_RING_SIZE]) ||
-	       sn_slot_peek(d, &d->tx[d->tx_tail % SN_RING_SIZE]);
+	if (sn_slot_peek(d, &d->rx[d->rx_tail % SN_RING_SIZE]) ||
+	    sn_slot_peek(d, &d->tx[d->tx_tail % SN_RING_SIZE]))
+		return true;
+	/* The zero-copy burst path lands on the second ring pair; the poller
+	 * must see it too or it sleeps mid-burst and pays a wake-up per frame.
+	 * Both are hints: a stale read only costs one callback-driven wake. */
+	if (READ_ONCE(d->zdata)) {
+		if (d->data_rx_tail != d->data_rx_head &&
+		    sn_slot_peek(d, &d->data_rx[d->data_rx_tail % SN_RING_SIZE]))
+			return true;
+		if (d->data_tx_tail != d->data_tx_head &&
+		    sn_slot_peek(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE]))
+			return true;
+	}
+	return false;
 }
 
 /* ---- Zero-copy data plane: header-less payload frames over a second ring
