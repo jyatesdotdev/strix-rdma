@@ -246,9 +246,10 @@ int main(int argc, char **argv)
 			.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED }, *sbad = NULL;
 		int64_t best = INT64_MAX, worst = 0, total = 0;
 		barrier(fd, 1); /* align start */
+		if (listening)
+			verb(ibv_post_recv(qp, &rw, &rbad), "ping prime receive");
 		for (unsigned it = 0; it < ping_iters; it++) {
 			if (listening) {
-				verb(ibv_post_recv(qp, &rw, &rbad), "ping post receive");
 				unsigned done = 0; int64_t deadline = milliseconds() + TIMEOUT_MS;
 				while (!done) {
 					struct ibv_wc wc; int n = ibv_poll_cq(cq, 1, &wc);
@@ -256,6 +257,12 @@ int main(int argc, char **argv)
 					if (n && wc.status == IBV_WC_SUCCESS && wc.opcode == IBV_WC_RECV) done = 1;
 					require(n == 0 || wc.status == IBV_WC_SUCCESS, "ping WC status");
 				}
+				/* Re-arm BEFORE echoing. The peer only sends its next ping
+				 * after receiving this echo, so arming first guarantees a
+				 * receive is posted when it arrives. Arming after the echo's
+				 * send completion instead lost the race on ~1992/2000
+				 * iterations and measured RNR-retry latency, not the path. */
+				verb(ibv_post_recv(qp, &rw, &rbad), "ping re-arm receive");
 				verb(ibv_post_send(qp, &sw, &sbad), "ping post echo");
 				done = 0; deadline = milliseconds() + TIMEOUT_MS;
 				while (!done) {
