@@ -65,20 +65,46 @@ sudo make M=drivers/infiniband/hw/strix_nhi modules_install \
   INSTALL_MOD_DIR=updates LOCALVERSION="$LOCALVER"
 sudo depmod -a
 
-# Load on BOTH nodes (thunderbolt-net must be up; strix_nhi gates on its carrier):
+# Load on BOTH nodes. Two modes, and they differ in what thunderbolt_net must do:
+#
+#   zero-copy (the fast path; both DMA path tuples, data rings live, zdata=1)
+#     thunderbolt_net must be ABSENT. With a netdev present the driver gates ring
+#     bring-up on TB-IP carrier, which no-TB-IP operation never establishes.
+#     Use the script -- it blacklists tbnet, reloads the custom core over the
+#     stock initramfs module, loads strix_nhi once, and waits for the handshake:
+sudo ~/strix-rdma/tools/scripts/strix-verbs-bringup.sh
+#
+#   staged-only (legacy; small messages and CPU-copy fallback)
+#     thunderbolt_net up, and strix_nhi gates on its carrier:
 sudo modprobe strix_nhi enable=1
+
 # Each side goes PORT_ACTIVE once the wire handshake completes:
 cat /sys/class/infiniband/strix_nhi0/ports/1/state   # -> 4: ACTIVE
 
-# Two-host exchange smoke (both sides; listener first):
+# Two-host exchange smoke (both sides; listener first). In zero-copy mode TB-IP
+# is down, so the out-of-band metadata channel runs over the LAN addresses
+# instead of 10.99.0.x:
 cd ~/strix-rdma/tools/verbs && make OUTPUT=strix-verbs-smoke
-# max (10.99.0.1):
+# max (192.168.1.84):
 sudo sh -c 'ulimit -l unlimited; exec sudo -u jryates \
-  ./strix-verbs-smoke --live strix_nhi0 listen 10.99.0.1 4789'
-# max2 (10.99.0.2):
+  ./strix-verbs-smoke --live strix_nhi0 listen 192.168.1.84 4789'
+# max2:
 sudo sh -c 'ulimit -l unlimited; exec sudo -u jryates \
-  ./strix-verbs-smoke --live strix_nhi0 connect 10.99.0.1 4789'
+  ./strix-verbs-smoke --live strix_nhi0 connect 192.168.1.84 4789'
+
+# Ping-pong RTT (256 B staged path; connector prints avg/min/max):
+#   ... listen  192.168.1.84 4789 ping 2000
+#   ... connect 192.168.1.84 4789 ping 2000
+# Throughput at DS4's shape (window 4 x 2 MiB, bidirectional):
+#   ... listen  192.168.1.84 4789 200
+#   ... connect 192.168.1.84 4789 200
+# Live driver state (data-ring occupancy, zc state, poll/credit counters):
+cat /sys/class/infiniband/strix_nhi0/native_stats
 ```
+
+Port 4789 must be open on both nodes for the metadata channel
+(`firewall-cmd --add-port=4789/tcp`; add `--permanent` to keep it across
+reboots).
 
 DS4 over the provider: create a systemd drop-in on each node that overrides
 ExecStart to `--transport rdma --rdma-device strix_nhi0 --rdma-gid-index 0`
@@ -375,11 +401,22 @@ deployment build; **PROVEN live**: full two-host SEND/RECV exchange (0/1/3984B
 and 2 MiB windows, 18.9 MB), repeated unload/reload cycles, and unmodified
 ROCm DS4 tensor parallelism over the provider (`--transport rdma
 --rdma-device strix_nhi0`, 377 MB placed, zero bad frames, working inference).
-Not yet run: sustained DS4 throughput/latency measurement vs the stream path
-(the A/B data for the keep-native-vs-stream decision); RDMA READ/WRITE on
-hardware (DS4's RoCE path is SEND-only); hot-unplug/malformed-peer injection.
-Do not describe this bounded experimental implementation as complete RC or
-production-ready.
+
+**Also PROVEN live since (2026-10-10, zero-copy data plane):** sustained
+throughput and latency at DS4's message shape, which closes the A/B item below.
+Window-4 x 2 MiB bidirectional at **1182-1238 MiB/s (9.9-10.4 Gbps) per
+direction**, 15/15 consecutive runs consistent, including a 6.4 GiB long run;
+256 B ping-pong RTT **35.1 us avg / 31 us min / 345 us max**. Both are at or
+above the USB4STREAM zero-copy figures (1146 MB/s, 3837 us bidirectional p50)
+and at the ~9.5 Gbit/s per-direction link ceiling, so the keep-native-vs-stream
+decision now favours native on both axes. See
+`bench/results/2026-10-10-verbs-zerocopy-latency.md`.
+
+Not yet run: RDMA READ/WRITE on hardware (DS4's RoCE path is SEND-only);
+hot-unplug/malformed-peer injection; sustained multi-hour endurance; DS4
+end-to-end inference re-run over the zero-copy data plane (the earlier DS4 run
+predates it). Do not describe this bounded experimental implementation as
+complete RC or production-ready.
 
 All new code here is GPL-2.0-only, authored for this implementation against the
 pinned Linux API. No Hellas source was copied. The experimental Hellas repository
