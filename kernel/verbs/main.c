@@ -198,9 +198,18 @@ static int sn_thread(void *arg)
 	bool maintenance = true;
 
 	while (!kthread_should_stop()) {
-		bool pending = sn_ring_pending(d) || READ_ONCE(d->control_count);
+		bool kick = READ_ONCE(d->poll_kick);
+		bool pending = kick || sn_ring_pending(d) ||
+			       READ_ONCE(d->control_count);
 
 		if (pending || maintenance) {
+			/* Consume the latch only when this pass acts on it. Clearing it
+			 * just before sleeping instead discards a kick that raced with
+			 * the cold spin -- wake_up was a no-op because we were not yet
+			 * queued -- and the frame then waits for the 1 ms tick. A kick
+			 * arriving during the pass simply re-arms the next one. */
+			if (kick)
+				WRITE_ONCE(d->poll_kick, false);
 			maintenance = false;
 			idle = 0;
 			if (sn_pass(d)) {
@@ -209,9 +218,8 @@ static int sn_thread(void *arg)
 				cond_resched();
 				continue;
 			}
-			/* No progress this pass. Fall through to the bounded cold path
-			 * rather than re-passing immediately: a pending hint that the
-			 * pass cannot act on must not pin the CPU. */
+			/* No progress: fall through to the bounded cold path so a
+			 * pending hint the pass cannot act on does not pin the CPU. */
 		}
 		/* Cold: hold the CPU briefly so an imminent frame (a ping-pong
 		 * reply lands tens of microseconds away) is caught without a
@@ -221,11 +229,6 @@ static int sn_thread(void *arg)
 			udelay(1);
 			continue;
 		}
-		/* Clear the latch immediately before waiting. wait_event queues us
-		 * before testing the condition, so a sn_schedule racing with the
-		 * sleep either makes the test pass or wakes the queued entry --
-		 * the kick cannot be lost either way. */
-		WRITE_ONCE(d->poll_kick, false);
 		wait_event_timeout(d->poll_wait,
 			READ_ONCE(d->poll_kick) || sn_ring_pending(d) ||
 			READ_ONCE(d->control_count) ||
