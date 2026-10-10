@@ -455,10 +455,11 @@ static ssize_t native_stats_show(struct device *dev, struct device_attribute *at
 	ssize_t n;
 
 	mutex_lock(&d->lock);
-	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_timeouts %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\n",
+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_timeouts %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\n",
 		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_timeouts, d->zc_aborts,
-		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick);
+		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
+		d->sched_calls, d->rnr_sent);
 	if (d->qp) {
 		struct sn_qp *q = d->qp;
 

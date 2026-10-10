@@ -38,6 +38,8 @@ static struct tb_property_dir *sn_directory;
 void sn_schedule(struct sn_device *d)
 {
 	if (READ_ONCE(d->registered) && !READ_ONCE(d->dead)) {
+		/* Diagnostic; may race across callers, so the count is a hint only. */
+		d->sched_calls++;
 		WRITE_ONCE(d->poll_kick, true);
 		wake_up(&d->poll_wait);
 	}

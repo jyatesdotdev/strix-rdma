@@ -435,7 +435,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,193 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -557,6 +557,7 @@ new file mode 100644
 +	u64 zc_bursts, zc_aborts, zc_timeouts;
 +	/* Poller diagnostics: written only by the poller thread. */
 +	u64 poll_passes, poll_sleeps, poll_wake_kick, poll_wake_tick;
++	u64 sched_calls, rnr_sent;
 +	struct list_head mrs;
 +	struct sn_qp *qp;
 +	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
@@ -632,7 +633,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,494 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -673,6 +674,8 @@ new file mode 100644
 +void sn_schedule(struct sn_device *d)
 +{
 +	if (READ_ONCE(d->registered) && !READ_ONCE(d->dead)) {
++		/* Diagnostic; may race across callers, so the count is a hint only. */
++		d->sched_calls++;
 +		WRITE_ONCE(d->poll_kick, true);
 +		wake_up(&d->poll_wait);
 +	}
@@ -1605,7 +1608,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/str
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/verbs.c
-@@ -0,0 +1,497 @@
+@@ -0,0 +1,498 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/random.h>
 +#include <linux/vmalloc.h>
@@ -2063,10 +2066,11 @@ new file mode 100644
 +	ssize_t n;
 +
 +	mutex_lock(&d->lock);
-+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_timeouts %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\n",
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_timeouts %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\n",
 +		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 +		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_timeouts, d->zc_aborts,
-+		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick);
++		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
++		d->sched_calls, d->rnr_sent);
 +	if (d->qp) {
 +		struct sn_qp *q = d->qp;
 +
@@ -2541,7 +2545,7 @@ new file mode 100644
 +			sn_ack(q, SN_ZC_READY, h->sequence, 0);
 +		return;
 +	}
-+	if (!q->rq_count) { sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
++	if (!q->rq_count) { d->rnr_sent++; sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
 +	w = &q->rq[q->rq_head];
 +	if (h->total > w->length || (w->address & (SN_FRAME - 1))) {
 +		sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
@@ -2618,7 +2622,7 @@ new file mode 100644
 +		 * READ response, allowing the single retained snapshot to advance. */
 +		q->response_active = false;
 +		if (h->opcode == SN_SEND) {
-+			if (!q->rq_count) { sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
++			if (!q->rq_count) { sn_dev(q->ib.device)->rnr_sent++; sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
 +			w = &q->rq[q->rq_head];
 +			if (h->total > w->length) {
 +				sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);

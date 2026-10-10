@@ -268,7 +268,7 @@ static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 			sn_ack(q, SN_ZC_READY, h->sequence, 0);
 		return;
 	}
-	if (!q->rq_count) { sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
+	if (!q->rq_count) { d->rnr_sent++; sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
 	w = &q->rq[q->rq_head];
 	if (h->total > w->length || (w->address & (SN_FRAME - 1))) {
 		sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
@@ -345,7 +345,7 @@ static void sn_receive_request(struct sn_qp *q, const struct sn_header *h, const
 		 * READ response, allowing the single retained snapshot to advance. */
 		q->response_active = false;
 		if (h->opcode == SN_SEND) {
-			if (!q->rq_count) { sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
+			if (!q->rq_count) { sn_dev(q->ib.device)->rnr_sent++; sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
 			w = &q->rq[q->rq_head];
 			if (h->total > w->length) {
 				sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
