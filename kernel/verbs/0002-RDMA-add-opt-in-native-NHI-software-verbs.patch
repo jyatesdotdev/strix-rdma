@@ -435,7 +435,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,219 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -457,6 +457,15 @@ new file mode 100644
 + * left unthrottled so ack latency stays at the ~36 us ping-pong floor. */
 +#define SN_DATA_THROTTLE_NS 128000
 +#define SN_CONTROL_RESERVE 8
++
++/* Data-ring interrupt moderation, in ns; 0 disables it. Bulk throughput wants
++ * long batching -- 128 us took the link from bimodal 18-1313 MiB/s to a
++ * consistent 1182-1238 MiB/s by removing the per-frame interrupt storm -- but a
++ * latency-sensitive sender moving small batches pays up to one window per batch.
++ * Runtime-tunable (read-only: tb_ring_throttling requires a stopped ring, so a
++ * new value takes effect on the next module load) so the knee can be measured
++ * on hardware without a rebuild. Defined in main.c, consumed in ring.c. */
++extern unsigned int sn_data_throttle_ns;
 +#define SN_SERVICE "strixv1"
 +#define SN_CONTROL_BYTES 112
 +/* Handshake retransmission intervals; loss is expected, peers retransmit. */
@@ -650,7 +659,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,501 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -680,6 +689,13 @@ new file mode 100644
 +module_param(idle_spin_us, uint, 0644);
 +MODULE_PARM_DESC(idle_spin_us,
 +	"Microseconds the poller busy-polls while cold before sleeping (default 128)");
++
++/* Defined here, consumed by sn_data_rings_start(). See strix_nhi.h for the
++ * throughput/latency trade this dial controls. */
++unsigned int sn_data_throttle_ns = SN_DATA_THROTTLE_NS;
++module_param_named(data_throttle_ns, sn_data_throttle_ns, uint, 0444);
++MODULE_PARM_DESC(data_throttle_ns,
++	"Data ring interrupt moderation in ns, 0 to disable (default 128000; applied at ring start)");
 +
 +static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 +				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
@@ -1149,7 +1165,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,487 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1255,9 +1271,12 @@ new file mode 100644
 +		 * because the drain consumes every pending frame per pass (37 frames
 +		 * accumulate per 128 us at wire speed, well inside the 64-slot ring).
 +		 * The control ring stays unthrottled -- it carries the acks and
-+		 * descriptors whose latency the 36 us ping-pong floor depends on. */
-+		if (tb_ring_throttling(d->data_tx_ring, SN_DATA_THROTTLE_NS) ||
-+		    tb_ring_throttling(d->data_rx_ring, SN_DATA_THROTTLE_NS))
++		 * descriptors whose latency the 36 us ping-pong floor depends on.
++		 * The window is the data_throttle_ns module parameter; 0 leaves both
++		 * data rings unmoderated (lowest latency, per-frame interrupts). */
++		if (sn_data_throttle_ns &&
++		    (tb_ring_throttling(d->data_tx_ring, sn_data_throttle_ns) ||
++		     tb_ring_throttling(d->data_rx_ring, sn_data_throttle_ns)))
 +			dev_warn(&d->service->dev,
 +				 "strix_nhi: data ring interrupt throttling unavailable\n");
 +		tb_ring_start(d->data_tx_ring);
