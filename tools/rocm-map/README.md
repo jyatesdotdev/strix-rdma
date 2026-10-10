@@ -9,7 +9,7 @@ make -C tools/rocm-map
 `tbstream-hip-map` checks GPU read/write access to the local mapped TX pool.
 `tbstream-hip-zc` additionally hands GPU-written pages to the NHI and verifies
 the bytes on the peer. It uses a CPU-written 64-byte envelope followed by a
-synchronous VRAM-to-mapped-pool copy, matching DS4's mapped transport path.
+synchronous VRAM-to-mapped-pool copy, the shape a mapped transport path uses.
 
 Start the receiver first and wait for its `READY` line:
 

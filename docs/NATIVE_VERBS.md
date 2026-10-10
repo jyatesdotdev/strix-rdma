@@ -2,13 +2,11 @@
 
 **Hardware-validated on the lab nodes (Strix Halo pair, Fedora 43 / 7.2.8):
 two-host SEND/RECV exchange passes (0/1/3984-byte and 2 MiB windows, 18.9 MB),
-repeated unload/reload cycles pass, and unmodified ROCm DS4 tensor parallelism
-runs over the provider (`--transport rdma --rdma-device strix_nhi0
---rdma-gid-index 0`): 377 MB placed through SEND/RECV, ~140k frames per
-direction, zero bad frames, working inference. Not yet: throughput/latency A/B
-against the stream path (the keep-vs-stream decision data), hardware
-READ/WRITE (DS4's RoCE path is SEND-only), hot-unplug and malformed-peer
-injection.** Still not complete RC conformance, production-ready, or a
+repeated unload/reload cycles pass, and an unmodified ROCm tensor-parallel
+inference workload runs over the provider: 377 MB placed through SEND/RECV,
+~140k frames per direction, zero bad frames, working inference. Not yet:
+hardware READ/WRITE (the validated consumer path is SEND-only), hot-unplug and
+malformed-peer injection.** Still not complete RC conformance, production-ready, or a
 performance claim. Existing series20
 USB4STREAM production behavior/configuration is unchanged. This separate service
 must not be tried alongside production traffic without operator-authorized
@@ -21,7 +19,7 @@ implemented in software over its DMA rings. This implementation is a real Linux
 API or library interposer. The first path is **CPU-copy staging**: pinned CPU MR
 pages -> coherent NHI staging -> cable -> staging -> pinned CPU MR pages. There
 is no IP/TCP payload fallback, GPU-direct, DMA-BUF registration, or zero-copy
-claim. TCP in the smoke/DS4 adapter is metadata/barriers only.
+claim. TCP in the smoke tool is metadata/barriers only.
 
 ## Compatibility and limits
 
@@ -51,23 +49,23 @@ still mandatory. A trusted physical link is not authentication: epochs prevent
 stale sessions, not a malicious authorized peer. Keep IOMMU and existing device
 access policy enabled; no widened permissions are required or authorized here.
 
-### Unchanged DS4 target
+### Consumer profile
 
-The target is **Linux ROCm `ds4_tp_roce.h`**, not every Linux DS4 build. The
-inspected read-only DS4 HEAD is `1bcd62093b5307a3758d90c3875d86ca758b08fb`.
-It dlopens standard `libibverbs.so.1` and uses normal device/port/GID queries,
-CQ8, RC QP4/4, one SGE, two8MiB host MRs, 2MiB chunks, INIT/RTR/RTS and CQ polling.
+The validated consumer is **a Linux ROCm application that dlopens standard
+`libibverbs.so.1`**, not every Linux verbs build. It uses normal device/port/GID
+queries, CQ8, RC QP4/4, one SGE, two8MiB host MRs, 2MiB chunks, INIT/RTR/RTS
+and CQ polling.
 It requests one READ requester/responder resource even though its transfers are
 SEND/RECV; these are real implemented resources, not ignored attributes.
 Its MRs have LOCAL_WRITE only and QP access0: **they remain remotely inaccessible**.
-No DS4 source change, transport hook or fake RoCE capability was introduced.
+No consumer source change, transport hook or fake RoCE capability is required.
 
-DS4's existing adapter calls the transport “RoCE” in logs/option descriptions;
+A consumer may call the transport “RoCE” in its own logs/option descriptions;
 that string is not a protocol claim by this native provider. It accepts active
 Ethernet metadata and nonzero GID0 without requiring RoCEv2 type. Select the
-explicit native device and GID0 only after bilateral readiness. The separate
-generic non-ROCm Linux adapter explicitly requires RoCEv2 GIDs and larger
-queues, so **it is unsupported**. Do not relabel the native GID to bypass it.
+explicit native device and GID0 only after bilateral readiness. A separate
+generic non-ROCm Linux consumer that explicitly requires RoCEv2 GIDs and larger
+queues is **unsupported**. Do not relabel the native GID to bypass that.
 
 ## Build and offline gates
 
@@ -140,7 +138,7 @@ endpoint; the listener binds the explicit address, not all interfaces):
 ./strix-verbs-smoke --live strix_nhi0 connect 10.99.0.1 18515
 ```
 
-The tool performs DS4-shaped queries/registration/transitions and read-depth
+The tool performs consumer-shaped queries/registration/transitions and read-depth
 checks, rejects oversized/multiple-SGE/invalid-key/inline WRs, preposts4 receives,
 checks deregistration returns EBUSY, then exchanges boundary-size and two full
 4x2MiB windows **in both directions**, checking each byte, WR identity, WC opcode,
@@ -150,7 +148,7 @@ has30-second deadlines; TCP has no payload send path. Before/after kernel
 SEND placement bytes and no READ/WRITE fallback/extra placement or bad frames.
 It tests explicit ERR's ordered receive flush, then destroys QP before MR/free.
 A failed teardown exits without manually freeing registered memory. Any error
-is a failed gate, never a benchmark sample. This is **not a DS4 model run**.
+is a failed gate, never a benchmark sample. This is **not a workload run**.
 
 ## Remaining acceptance gates and deployment restrictions
 
@@ -173,7 +171,7 @@ is implied by compilation or the above models. Still unrun:
    inactive-peer NHI wedge**. READY means primed/started/locally activated with
    reciprocal fresh epochs; it does not prove loss/unload races cannot wedge
    hardware. No recovery or non-disruption guarantee exists yet.
-5. Actual **unchanged Linux ROCm DS4** build against normal headers/library,
+5. Actual **unmodified Linux ROCm consumer** build against normal headers/library,
    provider selection/GID0, TP exchange, model correctness and output equivalence.
    Source-call-pattern matching and a smoke binary are not this test. No
    throughput, latency, inference-performance or GPU-direct claims until measured.

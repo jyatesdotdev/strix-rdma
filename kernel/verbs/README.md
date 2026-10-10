@@ -95,7 +95,13 @@ sudo sh -c 'ulimit -l unlimited; exec sudo -u jryates \
 # Ping-pong RTT (256 B staged path; connector prints avg/min/max):
 #   ... listen  192.168.1.84 4789 ping 2000
 #   ... connect 192.168.1.84 4789 ping 2000
-# Throughput at DS4's shape (window 4 x 2 MiB, bidirectional):
+# Verified RDMA WRITE / READ (window 4 x 2 MiB, bidirectional, every byte
+# checked; both sides print the placed byte count and the native counter delta):
+#   ... listen  192.168.1.84 4789 write 4
+#   ... connect 192.168.1.84 4789 write 4
+#   ... listen  192.168.1.84 4789 read 4
+#   ... connect 192.168.1.84 4789 read 4
+# Throughput at the reference workload's shape (window 4 x 2 MiB, bidirectional):
 #   ... listen  192.168.1.84 4789 200
 #   ... connect 192.168.1.84 4789 200
 # Live driver state (data-ring occupancy, zc state, poll/credit counters):
@@ -106,13 +112,13 @@ Port 4789 must be open on both nodes for the metadata channel
 (`firewall-cmd --add-port=4789/tcp`; add `--permanent` to keep it across
 reboots).
 
-DS4 over the provider: create a systemd drop-in on each node that overrides
-ExecStart to `--transport rdma --rdma-device strix_nhi0 --rdma-gid-index 0`
-plus `LimitMEMLOCK=infinity` (the verbs MR path checks memlock). The committed
-examples are `ds4-v41-server.service.d/95-nhi-rdma.conf` (max2, coordinator) and
-`ds4-v41-worker.service.d/95-nhi-rdma.conf` (max, worker) on the nodes. Then
-`systemctl daemon-reload; systemctl start ds4-v41-server` (coordinator, max2)
-then `ds4-v41-worker` (max). The API is on the coordinator at `http://10.99.0.2:8080`.
+Running a consumer over the provider: create a systemd drop-in on each node that
+overrides ExecStart to `--transport rdma --rdma-device strix_nhi0
+--rdma-gid-index 0` plus `LimitMEMLOCK=infinity` (the verbs MR path checks
+memlock). The proven tensor-parallel run used node-local drop-ins for that
+workload's server (max2, coordinator) and worker (max) units; those drop-ins live
+on the nodes, not in this repository. The API was on the coordinator at
+`http://10.99.0.2:8080`.
 
 **Do not load `thunderbolt_stream` while strix_nhi and thunderbolt-net are both
 bound** — the Strix NHI has only 3 usable ring HopIDs per direction and the
@@ -145,7 +151,8 @@ out-of-tree reproduction; the executed build used an owned in-container tree.
 - Standard uverbs commands, including POST_SEND, POST_RECV, POLL_CQ and
   REQ_NOTIFY_CQ. **No private command payloads**, mmap queues or doorbells.
   Provider command structures must not append private input/output bytes.
-- One context, one PD, one RC QP, up to two CQs of 1..64 entries (DS4 uses shared
+- One context, one PD, one RC QP, up to two CQs of 1..64 entries (the reference
+  workload uses a shared
   CQ8). QP SQ/RQ depths 1..4, **exactly one SGE** per WR, including zero-length
   transfers. CQ overflow emits CQ_ERR, fails the QP and never overwrites unread
   CQEs. Unsignaled successful SQ work has no CQE; errors/flushes do.
@@ -181,12 +188,13 @@ out-of-tree reproduction; the executed build used an owned in-container tree.
   decoded frames and SEND/WRITE/READ placement byte counts. These are kernel
   counters, not evidence of measured hardware throughput.
 
-The intended unchanged application is Linux ROCm `ds4_tp_roce.h`: two 8 MiB
-LOCAL_WRITE-only MRs, window4/2 MiB, shared CQ8, access_flags0 and read depth1.
-**Its MRs remain remotely inaccessible.** The separate generic Linux DS4 adapter
-requires RoCEv2 GIDs and much larger queues; it is unsupported. Provider startup
-must not fabricate ACTIVE: operators must observe bilateral port readiness
-before launching DS4, which fails immediately on a DOWN port.
+The reference consumer is a Linux ROCm tensor-parallel RoCE transport header:
+two 8 MiB LOCAL_WRITE-only MRs, window4/2 MiB, shared CQ8, access_flags0 and read
+depth1. **Its MRs remain remotely inaccessible**, so it exercises SEND/RECV only.
+The separate generic Linux adapter for that workload requires RoCEv2 GIDs and much
+larger queues; it is unsupported. Provider startup must not fabricate ACTIVE:
+operators must observe bilateral port readiness before launching a consumer,
+which fails immediately on a DOWN port.
 
 ## Native addressing and platform safety
 
@@ -205,9 +213,9 @@ are zero; speed/width are unknown (zero), and the cached GID type is the core's
 non-RoCE default, **not RoCEv2**. This metadata path still needs real uverbs tests.
 
 Only PCI **1022:158d / 1022:158e** are admitted, before netdev lookup, allocation
-or RDMA registration. These Strix Halo IDs are recorded at c4:00.5/c4:00.6 in the
-existing `2026-08-25-ds4-stage3-93f75b9-compile-oracle-v10-capture/max2-dmesg-prefix.txt`
-(lines536/541); they are not inferred from DMI/netdev names. At the pinned kernel,
+or RDMA registration. These Strix Halo IDs were observed at c4:00.5/c4:00.6 in the
+2026-08-25 compile-oracle dmesg capture on max2 (lines536/541 of its
+`max2-dmesg-prefix.txt`); they are not inferred from DMI/netdev names. At the pinned kernel,
 `nhi.c:nhi_select_cm` selects software CM for native ACPI control, otherwise tries
 `icm_probe` and falls back to `tb_probe`. `icm.c:2463..2589` switches on PCI device
 ID (not vendor!) and neither admitted ID has an ICM case; absent `is_supported`
@@ -221,7 +229,7 @@ Approved core exception: `uverbs_cmd.c:copy_ah_attr_from_uverbs` uses
 `rdma_ah_set_dlid`/`rdma_ah_set_path_bits`; the pinned `ib_verbs.h` discards these
 IB-only fields for UNDEFINED AH type. The driver cannot reject their original
 raw values. They have **no native routing effect**, are not supported routing
-features, and DS4 sets both zero. All visible native route fields are checked.
+features, and the reference workload sets both zero. All visible native route fields are checked.
 
 ## Source-associated startup and teardown proof
 
@@ -360,10 +368,23 @@ reserved bits, length overflow and CRC mismatch are rejected before copying.
 CRC32C Castagnoli uses initial/final complement and treats bytes96..99 as zero,
 covering the complete header and payload. It detects corruption, not an
 unauthorized peer. Opcodes: SEND1, WRITE2, READ3, READ_REPLY4, ACK5, READ_ACK6,
-CREDIT7. Status: OK0, RNR1, ACCESS2, LENGTH3, PROTOCOL4. Unused fields must be zero.
+CREDIT7, HELLO8, HELLO_ACK9, BIND10, BIND_ACK11, ZC_SEND12, ZC_READY13,
+ZC_WRITE14. Status: OK0, RNR1, ACCESS2, LENGTH3, PROTOCOL4. Unused fields must be zero.
 CREDIT total is available application RQ WQEs, serial its revision; it is only a
 hint. Actual SEND admission checks RQ ownership and returns RNR without consuming
 an absent WQE. Preposted transport RX slots are never application credits.
+
+The ZC_* opcodes are the zero-copy data-plane burst protocol and are only ever
+exchanged between peers that both advertised `SN_CAP_ZDATA` in HELLO. A burst
+descriptor carries the whole message in `total` and its payload follows as
+header-less frames on the data ring; `ZC_READY` carries the operation serial in
+the ACK serial field. `ZC_SEND` and `ZC_WRITE` differ exactly as their staged
+counterparts do: `ZC_SEND` forbids remote address/rkey because the payload lands
+in a receive WQE the responder posted, while `ZC_WRITE` requires them because the
+responder places the payload in the requester's named MR. A `ZC_WRITE` therefore
+consumes no receive WQE, produces no receive CQE and can never be RNR; a WRITE
+whose length is at or below the zero-copy threshold, or whose local source or
+remote destination is not frame aligned, stays on the staged path instead.
 
 A single ordered assembly accepts only the expected serial; reordered fragments
 are dropped, already assembled duplicates do not advance it. Complete SEND/WRITE
@@ -399,24 +420,44 @@ page pinning**. Repository
 Still required: reviewer gate; the CI-like source checks; the x86_64
 deployment build; **PROVEN live**: full two-host SEND/RECV exchange (0/1/3984B
 and 2 MiB windows, 18.9 MB), repeated unload/reload cycles, and unmodified
-ROCm DS4 tensor parallelism over the provider (`--transport rdma
+ROCm tensor-parallel inference over the provider (`--transport rdma
 --rdma-device strix_nhi0`, 377 MB placed, zero bad frames, working inference).
 
 **Also PROVEN live since (2026-10-10, zero-copy data plane):** sustained
-throughput and latency at DS4's message shape, which closes the A/B item below.
+throughput and latency at the reference workload's message shape, which closes the A/B item below.
 Window-4 x 2 MiB bidirectional at **1182-1238 MiB/s (9.9-10.4 Gbps) per
 direction**, 15/15 consecutive runs consistent, including a 6.4 GiB long run;
 256 B ping-pong RTT **35.1 us avg / 31 us min / 345 us max**. Both are at or
 above the USB4STREAM zero-copy figures (1146 MB/s, 3837 us bidirectional p50)
 and at the ~9.5 Gbit/s per-direction link ceiling, so the keep-native-vs-stream
-decision now favours native on both axes. See
-`bench/results/2026-10-10-verbs-zerocopy-latency.md`.
+decision now favours native on both axes. These figures are quoted here rather
+than linked: the dated result files that originally recorded the runs were
+removed when this repository stopped being workload-specific, so the numbers
+below are the surviving record of what was measured on the lab host pair.
 
-Not yet run: RDMA READ/WRITE on hardware (DS4's RoCE path is SEND-only);
-hot-unplug/malformed-peer injection; sustained multi-hour endurance; DS4
-end-to-end inference re-run over the zero-copy data plane (the earlier DS4 run
+Not yet run: RDMA READ/WRITE on hardware. The zero-copy WRITE path and the
+`strix-verbs-smoke ... write|read` modes are implemented and covered by the
+offline suites, but no WRITE or READ has ever carried a byte on hardware
+(`placed_write_bytes`/`placed_read_bytes` have only ever read 0), because the
+reference workload's RoCE path is SEND-only. Also not yet run:
+hot-unplug/malformed-peer injection; sustained multi-hour endurance; an
+end-to-end inference re-run over the zero-copy data plane (the earlier proven run
 predates it). Do not describe this bounded experimental implementation as
 complete RC or production-ready.
+
+**Mixed-version pairs fail rather than degrade.** `SN_ZC_WRITE` is opcode 14 and
+reuses the existing `SN_CAP_ZDATA` negotiation instead of adding a capability
+bit. That is deliberate: `SN_CAPS_KNOWN` is enforced during HELLO/HELLO_ACK
+validation, so a new bit would make a pre-change peer reject the handshake
+outright and the session would never form at all — strictly worse than the
+alternative. The consequence is that a peer running the older module still
+advertises ZDATA, accepts the descriptor, and then rejects opcode 14 at
+`sn_decode`: the frame is dropped, `bad_frames` increments, and the requester
+eventually fails with retry-exceeded. There is no misinterpretation and no
+memory-safety hazard, but **both hosts must run the same module build** before
+exercising zero-copy WRITE. Real mixed-version safety would need an `SN_VERSION`
+bump negotiated in HELLO; that is a larger wire-ABI decision and has not been
+taken.
 
 All new code here is GPL-2.0-only, authored for this implementation against the
 pinned Linux API. No Hellas source was copied. The experimental Hellas repository

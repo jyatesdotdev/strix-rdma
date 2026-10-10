@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Ordinary libibverbs client. TCP carries only 48-byte metadata and barriers;
- * every tested payload byte goes through registered native SEND/RECV. */
+/* Ordinary libibverbs client. TCP carries only 64-byte metadata and barriers;
+ * every tested payload byte goes through registered native SEND/RECV, RDMA
+ * WRITE or RDMA READ. */
 #define _POSIX_C_SOURCE 200809L
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
@@ -22,9 +23,15 @@
 #define WINDOW 4u
 #define CHUNK (2u * 1024u * 1024u)
 #define POOL (WINDOW * CHUNK)
-#define META_SIZE 48u
+#define META_SIZE 64u
+/* The native zero-copy burst path posts MR pages directly, and a header-less
+ * data frame never spans a page, so a remote target must be this aligned for a
+ * large WRITE to leave the staged path. */
+#define RDMA_ALIGN 4096u
 #define TIMEOUT_MS 30000
-struct endpoint { uint64_t nonce; uint32_t qpn, psn; union ibv_gid gid; };
+/* raddr/rkey name the remotely accessible target buffer this side exposes;
+ * both are zero in the SEND-only modes. */
+struct endpoint { uint64_t nonce, raddr; uint32_t qpn, psn, rkey; union ibv_gid gid; };
 struct counters { unsigned long long tx, rx, bad, send, write, read; };
 static void fail(const char *what)
 {
@@ -33,6 +40,12 @@ static void fail(const char *what)
 }
 static void require(bool ok, const char *what) { if (!ok) fail(what); }
 static void verb(int ret, const char *what) { if (ret) { errno = ret; fail(what); } }
+static unsigned iterations(const char *text, unsigned long limit, const char *what)
+{
+	char *end = NULL; unsigned long v = strtoul(text, &end, 10);
+	require(end && !*end && v && v <= limit, what);
+	return (unsigned)v;
+}
 static int64_t milliseconds(void)
 {
 	struct timespec ts;
@@ -107,19 +120,27 @@ static uint32_t get32(const unsigned char *p)
 { return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]; }
 static void metadata_encode(unsigned char out[META_SIZE], const struct endpoint *e)
 {
-	memset(out, 0, META_SIZE); put32(out, 0x53564d31); put32(out+4, 1);
+	memset(out, 0, META_SIZE); put32(out, 0x53564d31); put32(out+4, 2);
 	put32(out+8, e->nonce >> 32); put32(out+12, e->nonce);
 	put32(out+16, e->qpn); put32(out+20, e->psn); put32(out+24, IBV_MTU_4096);
+	put32(out+28, e->rkey);
 	memcpy(out+32, e->gid.raw, 16);
+	put32(out+48, e->raddr >> 32); put32(out+52, e->raddr);
 }
 static bool metadata_decode(struct endpoint *e, const unsigned char in[META_SIZE])
 {
 	union ibv_gid zero = {};
-	if (get32(in) != 0x53564d31 || get32(in+4) != 1 || get32(in+28) ||
+	if (get32(in) != 0x53564d31 || get32(in+4) != 2 || get32(in+56) || get32(in+60) ||
 	    get32(in+24) != IBV_MTU_4096 || !get32(in+16) || get32(in+16) > 0xffffff ||
 	    get32(in+20) > 0xffffff || !memcmp(in+32, &zero, 16)) return false;
 	e->nonce = (uint64_t)get32(in+8)<<32 | get32(in+12);
-	e->qpn = get32(in+16); e->psn = get32(in+20); memcpy(e->gid.raw, in+32, 16);
+	e->qpn = get32(in+16); e->psn = get32(in+20); e->rkey = get32(in+28);
+	memcpy(e->gid.raw, in+32, 16);
+	e->raddr = (uint64_t)get32(in+48)<<32 | get32(in+52);
+	/* rkey and remote address describe one buffer: both or neither, and frame
+	 * aligned so a large WRITE can take the zero-copy data ring. */
+	if ((e->rkey && !e->raddr) || (!e->rkey && e->raddr)) return false;
+	if (e->raddr && (e->raddr & (RDMA_ALIGN - 1))) return false;
 	return e->nonce != 0;
 }
 static void barrier(int fd, unsigned window)
@@ -145,16 +166,27 @@ static struct counters stats(const char *device)
 }
 static void selftest(void)
 {
-	struct endpoint e = { .nonce = UINT64_C(0x12345678abcdef01), .qpn = 17, .psn = 0xffffff }, d;
+	struct endpoint e = { .nonce = UINT64_C(0x12345678abcdef01), .qpn = 17, .psn = 0xffffff,
+		.rkey = 0x2a, .raddr = UINT64_C(0x7f8000001000) }, d;
 	unsigned char bytes[META_SIZE];
 	e.gid.raw[0] = 0xfe; e.gid.raw[1] = 0x80; e.gid.raw[15] = 3;
 	metadata_encode(bytes, &e); require(metadata_decode(&d, bytes), "metadata decode");
 	require(d.nonce == e.nonce && d.qpn == e.qpn && d.psn == e.psn && !memcmp(&d.gid, &e.gid, 16), "metadata round trip");
-	bytes[28] = 1; require(!metadata_decode(&d, bytes), "reserved rejection");
+	require(d.rkey == e.rkey && d.raddr == e.raddr, "RDMA target round trip");
+	metadata_encode(bytes, &e); bytes[56] = 1; require(!metadata_decode(&d, bytes), "reserved rejection");
+	metadata_encode(bytes, &e); put32(bytes+4, 1); require(!metadata_decode(&d, bytes), "metadata version rejection");
 	metadata_encode(bytes, &e); bytes[20] = 1; require(!metadata_decode(&d, bytes), "PSN rejection");
 	metadata_encode(bytes, &e); put32(bytes+16, 0); require(!metadata_decode(&d, bytes), "QPN rejection");
 	metadata_encode(bytes, &e); memset(bytes+32, 0, 16); require(!metadata_decode(&d, bytes), "zero GID rejection");
+	metadata_encode(bytes, &e); put32(bytes+28, 0); require(!metadata_decode(&d, bytes), "remote address without rkey rejection");
+	metadata_encode(bytes, &e); put32(bytes+48, 0); put32(bytes+52, 0);
+	require(!metadata_decode(&d, bytes), "rkey without remote address rejection");
+	metadata_encode(bytes, &e); put32(bytes+48, 0); put32(bytes+52, 0x1001);
+	require(!metadata_decode(&d, bytes), "unaligned remote address rejection");
+	metadata_encode(bytes, &e); put32(bytes+28, 0); put32(bytes+48, 0); put32(bytes+52, 0);
+	require(metadata_decode(&d, bytes) && !d.rkey && !d.raddr, "SEND-only metadata carries no RDMA target");
 	require(pattern(e.nonce, 1, 0, 0) != pattern(e.nonce, 1, 1, 0), "distinct slots");
+	require(pattern(e.nonce, 1, 0, 0) != pattern(e.nonce, 2, 0, 0), "distinct iterations");
 	puts("ok - smoke metadata codec/selftest only; no device opened");
 }
 int main(int argc, char **argv)
@@ -162,32 +194,30 @@ int main(int argc, char **argv)
 	struct ibv_device **devices; struct ibv_context *ctx = NULL;
 	struct ibv_device_attr dev; struct ibv_port_attr port;
 	struct ibv_pd *pd; struct ibv_cq *cq; struct ibv_qp *qp;
-	struct ibv_mr *tx_mr, *rx_mr; unsigned char *tx, *rx;
+	struct ibv_mr *tx_mr, *rx_mr, *rd_mr = NULL; unsigned char *tx, *rx, *rd = NULL;
 	struct endpoint local = {}, peer; struct counters before, after;
 	struct ibv_qp_attr attr = {};
 	struct ibv_qp_init_attr init = { .qp_type = IBV_QPT_RC,
 		.cap = { .max_send_wr = WINDOW, .max_recv_wr = WINDOW, .max_send_sge = 1, .max_recv_sge = 1 } };
 	unsigned char mine[META_SIZE], theirs[META_SIZE];
 	unsigned long long expected = 0;
-	unsigned bench_iters = 0, ping_iters = 0;
-	int count, fd; bool listening;
+	unsigned bench_iters = 0, ping_iters = 0, rdma_iters = 0;
+	int count, fd; bool listening, rdma_read = false;
 	if (argc == 2 && !strcmp(argv[1], "--selftest")) { selftest(); return 0; }
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters]]\n", argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | write [iters] | read [iters]]\n", argv[0], argv[0]);
 		return 2;
 	}
 	if (argc >= 7 && !strcmp(argv[6], "ping")) {
-		if (argc == 8) {
-			char *end = NULL; unsigned long v = strtoul(argv[7], &end, 10);
-			require(end && !*end && v && v <= 1000000, "ping iteration count");
-			ping_iters = (unsigned)v;
-		} else
-			ping_iters = 1000;
+		if (argc == 8) ping_iters = iterations(argv[7], 1000000, "ping iteration count");
+		else ping_iters = 1000;
+	} else if (argc >= 7 && (!strcmp(argv[6], "write") || !strcmp(argv[6], "read"))) {
+		rdma_read = !strcmp(argv[6], "read");
+		if (argc == 8) rdma_iters = iterations(argv[7], 100000, "RDMA iteration count");
+		else rdma_iters = 4;
 	} else if (argc == 7) {
-		char *end = NULL; unsigned long v = strtoul(argv[6], &end, 10);
-		require(end && !*end && v && v <= 100000, "iteration count");
-		bench_iters = (unsigned)v;
+		bench_iters = iterations(argv[6], 100000, "iteration count");
 	}
 	require(!strncmp(argv[2], "strix_nhi", 9) && argv[2][9] &&
 		strspn(argv[2]+9, "0123456789") == strlen(argv[2]+9), "explicit native device");
@@ -217,16 +247,32 @@ int main(int argc, char **argv)
 	tx_mr = ibv_reg_mr(pd, tx, POOL, IBV_ACCESS_LOCAL_WRITE);
 	rx_mr = ibv_reg_mr(pd, rx, POOL, IBV_ACCESS_LOCAL_WRITE);
 	require(tx_mr && rx_mr, "two LOCAL_WRITE-only 8MiB MRs / memlock");
+	if (rdma_iters) {
+		/* The RDMA target is the only remotely accessible buffer. It exists
+		 * solely for the WRITE/READ modes so the SEND modes keep proving that
+		 * remote access is not granted by default. */
+		verb(posix_memalign((void **)&rd, RDMA_ALIGN, POOL), "RDMA allocation");
+		rd_mr = ibv_reg_mr(pd, rd, POOL, IBV_ACCESS_LOCAL_WRITE |
+			IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+		require(rd_mr != NULL, "remotely accessible 8MiB RDMA MR / memlock");
+		local.rkey = rd_mr->rkey; local.raddr = (uintptr_t)rd;
+	}
 	require(getrandom(&local.nonce, sizeof(local.nonce), 0) == sizeof(local.nonce) && local.nonce, "nonce");
 	require(getrandom(&local.psn, sizeof(local.psn), 0) == sizeof(local.psn), "PSN");
 	local.psn &= 0xffffff; local.qpn = qp->qp_num;
-	attr.qp_state = IBV_QPS_INIT; attr.port_num = 1; attr.pkey_index = 0; attr.qp_access_flags = 0;
+	attr.qp_state = IBV_QPS_INIT; attr.port_num = 1; attr.pkey_index = 0;
+	/* Remote access is granted only where a mode exercises it. */
+	attr.qp_access_flags = rdma_iters ?
+		(IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ) : 0;
 	verb(ibv_modify_qp(qp, &attr, IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS), "INIT");
 	fd = control_socket(listening, argv[4], argv[5]);
 	metadata_encode(mine, &local);
 	control_io(fd, mine, sizeof(mine), true, milliseconds()+TIMEOUT_MS);
 	control_io(fd, theirs, sizeof(theirs), false, milliseconds()+TIMEOUT_MS);
 	require(metadata_decode(&peer, theirs) && peer.nonce != local.nonce, "peer metadata");
+	if (rdma_iters)
+		require(peer.rkey && peer.raddr && !(peer.raddr & (RDMA_ALIGN - 1)) &&
+			rd_mr != NULL, "peer RDMA target metadata");
 	memset(&attr, 0, sizeof(attr)); attr.qp_state = IBV_QPS_RTR; attr.path_mtu = IBV_MTU_4096;
 	attr.dest_qp_num = peer.qpn; attr.rq_psn = peer.psn; attr.max_dest_rd_atomic = 1; attr.min_rnr_timer = 12;
 	attr.ah_attr.is_global = 1; attr.ah_attr.port_num = 1; attr.ah_attr.grh.dgid = peer.gid;
@@ -295,7 +341,76 @@ int main(int argc, char **argv)
 			       ping_iters, (double)total / ping_iters, (long long)best, (long long)worst);
 		goto done;
 	}
-	if (bench_iters) { /* Timed DS4-shaped window-4 x 2MiB bidirectional loop; no verification. */
+	if (rdma_iters) { /* Verified bidirectional RDMA WRITE or READ, window 4 x 2 MiB. */
+		struct ibv_sge ss[WINDOW];
+		struct ibv_send_wr sw[WINDOW] = {}, *sbad = NULL;
+		/* The local SGE is always the LOCAL_WRITE-only tx pool: a WRITE reads it
+		 * and a READ lands in it. The rd pool is the only remotely accessible
+		 * buffer, so it is the peer's WRITE target and the peer's READ source.
+		 * `filled` is what this side publishes for the peer to transfer;
+		 * `landed` is the buffer this side verifies afterwards. */
+		unsigned char *filled = rdma_read ? rd : tx;
+		unsigned char *landed = rdma_read ? tx : rd;
+		struct counters pre = stats(argv[2]);
+		unsigned long long verified = 0;
+		int64_t t0 = milliseconds();
+		for (unsigned it = 1; it <= rdma_iters; it++) {
+			unsigned done = 0, completed = 0, next = 0;
+			int64_t deadline;
+			for (unsigned i = 0; i < WINDOW; i++) {
+				for (unsigned j = 0; j < CHUNK; j++) filled[i*CHUNK+j] = pattern(local.nonce, it, i, j);
+				memset(landed+i*CHUNK, 0, CHUNK);
+			}
+			atomic_thread_fence(memory_order_release);
+			/* Both sides must have published their source and cleared their
+			 * landing buffer before either operation can reach the peer. */
+			barrier(fd, it);
+			for (unsigned i = 0; i < WINDOW; i++) {
+				ss[i] = (struct ibv_sge){ .addr = (uintptr_t)(tx+i*CHUNK), .length = CHUNK, .lkey = tx_mr->lkey };
+				sw[i] = (struct ibv_send_wr){ .wr_id = it*16u+i, .sg_list = &ss[i], .num_sge = 1,
+					.opcode = rdma_read ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE,
+					.send_flags = IBV_SEND_SIGNALED,
+					.next = i+1 < WINDOW ? &sw[i+1] : NULL,
+					.wr = { .rdma = { .remote_addr = peer.raddr + i*CHUNK, .rkey = peer.rkey } } };
+			}
+			verb(ibv_post_send(qp, sw, &sbad), rdma_read ? "post RDMA READ window" : "post RDMA WRITE window");
+			deadline = milliseconds() + TIMEOUT_MS;
+			while (done != WINDOW) {
+				struct ibv_wc wc[8]; int n = ibv_poll_cq(cq, 8, wc);
+				require(n >= 0 && milliseconds() < deadline, "RDMA poll/deadline");
+				for (int k = 0; k < n; k++) {
+					unsigned slot = wc[k].wr_id % 16;
+					require(wc[k].status == IBV_WC_SUCCESS && wc[k].wr_id/16 == it &&
+						wc[k].qp_num == qp->qp_num, "RDMA WC status/identity");
+					require(wc[k].opcode == (rdma_read ? IBV_WC_RDMA_READ : IBV_WC_RDMA_WRITE), "RDMA WC opcode");
+					require(slot < WINDOW && !(completed & (1u<<slot)) && slot == next++, "ordered unique RDMA completion");
+					completed |= 1u<<slot; done++;
+				}
+			}
+			/* A READ completion orders only this side's landing buffer; a remote
+			 * WRITE into it is ordered by this barrier instead. */
+			barrier(fd, 1000 + it);
+			atomic_thread_fence(memory_order_acquire);
+			for (unsigned i = 0; i < WINDOW; i++) for (unsigned j = 0; j < CHUNK; j++)
+				require(landed[i*CHUNK+j] == pattern(peer.nonce, it, i, j), "RDMA payload verification");
+			verified += (unsigned long long)WINDOW * CHUNK;
+		}
+		int64_t elapsed = milliseconds() - t0;
+		struct counters post = stats(argv[2]);
+		require(post.bad == pre.bad && post.tx > pre.tx && post.rx > pre.rx,
+			"no rejected frames during RDMA verification");
+		if (rdma_read)
+			require(post.read - pre.read == verified && post.write == pre.write &&
+				post.send == pre.send, "native counters prove READ placements only");
+		else
+			require(post.write - pre.write == verified && post.read == pre.read &&
+				post.send == pre.send, "native counters prove WRITE placements only");
+		printf("PASS native RDMA %s: %u iters x %u x %u B, wall %lld ms, %.2f MiB/s, %llu bytes placed and verified byte-for-byte (%s)\n",
+		       rdma_read ? "READ" : "WRITE", rdma_iters, WINDOW, CHUNK, (long long)elapsed,
+		       (double)verified / (1048576.0 * elapsed / 1000.0), verified, argv[3]);
+		goto done;
+	}
+	if (bench_iters) { /* Timed window-4 x 2MiB bidirectional loop; no verification. */
 		struct ibv_sge rs[WINDOW], ss[WINDOW];
 		struct ibv_recv_wr rw[WINDOW] = {}, *rbad = NULL;
 		struct ibv_send_wr sw[WINDOW] = {}, *sbad = NULL;
@@ -410,9 +525,10 @@ int main(int argc, char **argv)
 	done:
 	verb(ibv_destroy_qp(qp), "synchronous QP destroy");
 	verb(ibv_dereg_mr(tx_mr), "TX deregistration"); verb(ibv_dereg_mr(rx_mr), "RX deregistration");
-	free(tx); free(rx); verb(ibv_destroy_cq(cq), "CQ destroy"); verb(ibv_dealloc_pd(pd), "PD free");
+	if (rd_mr) verb(ibv_dereg_mr(rd_mr), "RDMA deregistration");
+	free(tx); free(rx); free(rd); verb(ibv_destroy_cq(cq), "CQ destroy"); verb(ibv_dealloc_pd(pd), "PD free");
 	verb(ibv_close_device(ctx), "context close"); close(fd);
-	if (!bench_iters)
-		printf("PASS native CPU SEND/RECV: %llu bytes received, DS4-shaped setup/window4, ERR flush; not full DS4 or complete RC qualification\n", expected);
+	if (!bench_iters && !ping_iters && !rdma_iters)
+		printf("PASS native CPU SEND/RECV: %llu bytes received, window4 x 2MiB setup, ERR flush; not complete RC qualification\n", expected);
 	return 0;
 }

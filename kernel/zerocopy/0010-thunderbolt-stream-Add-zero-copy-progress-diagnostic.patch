@@ -3,7 +3,7 @@ From: Jonathan Yates <jonjryjo@gmail.com>
 Date: Wed, 5 Aug 2026 19:00:28 -0700
 Subject: [PATCH 10/10] thunderbolt: stream: Add zero-copy progress diagnostics
 
-The DS4-shaped asymmetric workload can stop making progress without
+An asymmetric workload can stop making progress without
 enough state to distinguish a fabric delivery failure from a missed
 interrupt, ring harvest, or stream event publication failure.
 

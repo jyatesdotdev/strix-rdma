@@ -59,6 +59,8 @@ struct sn_qp {
 	u32 zc_offset;
 	bool zc_expect;
 	u32 zc_total, zc_received;
+	struct sn_mr *zc_mr;
+	u64 zc_address;
 };
 struct packet { u8 data[SN_FRAME]; size_t bytes; };
 union ib_gid { u8 raw[16]; };
@@ -79,12 +81,13 @@ struct sn_device {
 	u64 sched_calls, rnr_sent;
 	bool check_ids;
 	u32 caps;
-	/* Zero-copy model state: peer link, expected-burst landing zone, drop knob. */
+	/* Zero-copy model state: peer link, expected-burst landing zone, drop knob.
+	 * The landing zone mirrors what the real data ring posts from q->zc_mr. */
 	bool peer_zc, zdata, zc_drop;
 	struct sn_device *zc_peer;
-	struct sn_mr *zc_mr;
-	u64 zc_addr;
-	u32 zc_len, zc_landed;
+	struct sn_mr *zc_land_mr;
+	u64 zc_land_addr;
+	u32 zc_land_len, zc_land_landed;
 };
 static u64 now;
 static u64 ktime_get_ns(void) { return now; }
@@ -137,7 +140,7 @@ static int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *pa
 }
 /* Zero-copy data-plane models; defined after the engine include. */
 int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
-int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w);
+int sn_data_recv_start(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 void sn_data_abort(struct sn_device *d);
 #include "../verbs/protocol.c"
@@ -151,24 +154,25 @@ int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
 	u32 off = q->zc_offset, n = w->length - off;
 
 	if (d->zc_drop) { q->zc_offset = w->length; return 0; }
-	assert(p && p->zc_mr && n <= p->zc_len - p->zc_landed);
-	memcpy(p->zc_mr->data + (p->zc_addr - p->zc_mr->base) + p->zc_landed,
+	assert(p && p->zc_land_mr && n <= p->zc_land_len - p->zc_land_landed);
+	memcpy(p->zc_land_mr->data + (p->zc_land_addr - p->zc_land_mr->base) + p->zc_land_landed,
 	       w->mr->data + (w->address - w->mr->base) + off, n);
-	p->zc_landed += n;
+	p->zc_land_landed += n;
 	sn_engine_zc_bytes(p->qp, n);
 	q->zc_offset = w->length;
 	return 0;
 }
-int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w)
+int sn_data_recv_start(struct sn_device *d, struct sn_qp *q)
 {
-	d->zc_mr = w->mr; d->zc_addr = w->address;
-	d->zc_len = q->zc_total; d->zc_landed = 0;
+	assert(q->zc_mr);
+	d->zc_land_mr = q->zc_mr; d->zc_land_addr = q->zc_address;
+	d->zc_land_len = q->zc_total; d->zc_land_landed = 0;
 	return 0;
 }
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 {
 	(void)q;
-	d->zc_landed = 0;
+	d->zc_land_landed = 0;
 	return 0;
 }
 void sn_data_abort(struct sn_device *d) { (void)d; }
@@ -370,7 +374,7 @@ static void test_control_overflow(void)
 	struct sn_header h;
 	u8 byte = 0x42;
 	unsigned int i;
-	q->attr.qp_access_flags = 0; /* DS4 INIT access flags */
+	q->attr.qp_access_flags = 0; /* SEND-only INIT access flags */
 	post(a, SN_READ, 1);
 	sn_engine_progress(a);
 	assert(q->active && q->sq_count == 1 && q->next_sequence == 100);
@@ -541,17 +545,143 @@ static void test_zc_fallback(void)
 	receive(b, SN_MESSAGE); post(a, SN_SEND, SN_MESSAGE);
 	for (i = 0; i < 1000 && !a->sends; i++) step(a, b, NULL, NULL);
 	assert(a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
-	assert(!b->zc_mr);
+	assert(!b->zc_land_mr);
 	release(a); release(b);
 	puts("ok 11 - no ZDATA capability: large SEND stays on the staged path");
 }
+static void test_zc_write(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	const struct packet *desc;
+	struct sn_header got;
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x5a, SN_MESSAGE);
+	post(a, SN_WRITE, SN_MESSAGE);
+	sn_engine_progress(a);
+	assert(a->count && !a->sends && !b->recvs && a->mr[0].users == 1 && a->qp->zc_state == SN_ZC_WAIT);
+	/* The descriptor must name the responder MR: unlike a ZC SEND it carries
+	 * address+rkey, and it carries no payload of its own. It is the last frame
+	 * queued by this pass, after the credit hint. */
+	desc = &a->packets[(a->head + a->count - 1) % SN_RING_SIZE];
+	assert(!sn_decode(&got, desc->data, desc->bytes));
+	assert(got.opcode == SN_ZC_WRITE && got.total == SN_MESSAGE && got.sequence == 100 &&
+	       !got.length && !got.offset && !got.status && !got.ack_sequence &&
+	       got.rkey == 2 && got.address == a->mr[1].base);
+	for (i = 0; i < 1000 && !a->sends; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && !b->recvs && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	/* One landed burst, so exactly one ACK; the remote MR reference is retired
+	 * and the receive queue was never touched. */
+	assert(b->zc_bursts == 1 && b->write_bytes == SN_MESSAGE && !b->send_bytes);
+	assert(!a->mr[0].users && !b->mr[1].users && !b->qp->rq_count && !b->qp->remote_mr);
+	assert(b->qp->receive.have_replay && b->qp->receive.replay.opcode == SN_ZC_WRITE &&
+	       b->qp->receive.replay_status == SN_OK);
+	release(a); release(b);
+	puts("ok 12 - zero-copy WRITE burst: descriptor rkey/address, ZC_READY, payload at the remote address, single ACK");
+}
+static void test_zc_write_retry_ready(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	int drop_ready = SN_ZC_READY;
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x7c, SN_MESSAGE);
+	post(a, SN_WRITE, SN_MESSAGE);
+	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, &drop_ready);
+	assert(a->sends == 1 && !b->recvs && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(b->zc_bursts == 1 && b->write_bytes == SN_MESSAGE && !b->mr[1].users);
+	release(a); release(b);
+	puts("ok 13 - lost ZC_WRITE READY: descriptor retransmit, duplicate restart, completes");
+}
+static void test_zc_write_retry_burst(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x8d, SN_MESSAGE);
+	post(a, SN_WRITE, SN_MESSAGE);
+	sn_engine_progress(a);
+	deliver(a, b, NULL); deliver(b, a, NULL);
+	a->zc_drop = true;
+	sn_engine_progress(a);
+	a->zc_drop = false;
+	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && !b->recvs && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(b->zc_bursts == 1 && b->write_bytes == SN_MESSAGE && !b->mr[1].users);
+	release(a); release(b);
+	puts("ok 14 - lost ZC_WRITE burst: whole-message retry reposts the remote MR from offset zero");
+}
+static void test_zc_write_fallback(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	/* At the threshold a WRITE stays on the staged control-ring path. */
+	memset(a->mr[0].data, 0x5a, SN_ZC_THRESHOLD);
+	post(a, SN_WRITE, SN_ZC_THRESHOLD);
+	for (i = 0; i < 1000 && !a->sends; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && !b->recvs && !a->errors && !b->errors);
+	assert(!b->zc_land_mr && !b->zc_bursts && b->write_bytes == SN_ZC_THRESHOLD);
+	for (i = 0; i < SN_ZC_THRESHOLD; i++) assert(b->mr[1].data[i] == 0x5a);
+	release(a); release(b);
+
+	/* Above it, a frame-unaligned remote destination still stays staged. */
+	a = zc_pair(&b);
+	memset(a->mr[0].data, 0x6b, SN_MESSAGE);
+	post(a, SN_WRITE, SN_MESSAGE);
+	a->qp->sq[a->qp->sq_head].remote_address += SN_HEADER;
+	for (i = 0; i < 1000 && !a->sends; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && !b->recvs && !a->errors && !b->errors);
+	assert(!b->zc_land_mr && !b->zc_bursts && b->write_bytes == SN_MESSAGE);
+	for (i = 0; i < SN_MESSAGE; i++) assert(b->mr[1].data[SN_HEADER + i] == 0x6b);
+	release(a); release(b);
+	puts("ok 15 - zero-copy WRITE fallback: threshold and remote alignment keep a WRITE staged");
+}
+static void test_zc_write_refusal(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	struct sn_header h;
+	unsigned int i;
+
+	/* Without REMOTE_WRITE the descriptor is refused before any burst page is
+	 * posted; the responder stays in RTS and the requester fails remotely. */
+	memset(a->mr[0].data, 0x5a, SN_MESSAGE);
+	b->qp->attr.qp_access_flags = IB_ACCESS_LOCAL_WRITE | IB_ACCESS_REMOTE_READ;
+	post(a, SN_WRITE, SN_MESSAGE);
+	for (i = 0; i < 100 && !a->errors; i++) step(a, b, NULL, NULL);
+	assert(a->last_error == IB_WC_REM_ACCESS_ERR && !a->sends && !b->recvs);
+	assert(!b->zc_land_mr && !b->zc_bursts && !b->write_bytes && !b->mr[1].users);
+	assert(b->qp->attr.qp_state == IB_QPS_RTS && !b->errors);
+	release(a); release(b);
+
+	/* Defense in depth: a non-conforming peer's unaligned ZC_WRITE descriptor is
+	 * refused the same way, and the refusal survives a retry. */
+	a = zc_pair(&b);
+	h = (struct sn_header){0};
+	h.opcode = SN_ZC_WRITE; h.sequence = 200; h.total = SN_MESSAGE;
+	h.rkey = 2; h.address = a->mr[1].base + SN_HEADER;
+	inject(a, h, NULL);
+	assert(a->qp->receive.have_replay && a->qp->receive.replay_status == SN_ACCESS);
+	assert(!a->zc_land_mr && !a->zc_land_landed && !a->write_bytes && !a->errors);
+	assert(a->qp->attr.qp_state == IB_QPS_RTS && !a->qp->rq_count && !a->qp->remote_mr);
+	inject(a, h, NULL);
+	assert(a->qp->receive.have_replay && a->qp->receive.replay_status == SN_ACCESS);
+	assert(!a->zc_land_mr && !a->errors && a->qp->attr.qp_state == IB_QPS_RTS);
+	release(a); release(b);
+	puts("ok 16 - zero-copy WRITE refusal: no REMOTE_WRITE and an unaligned destination stay off the data ring");
+}
 int main(void)
 {
-	puts("1..11");
+	puts("1..16");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
 	test_zc_fallback();
+	test_zc_write(); test_zc_write_retry_ready(); test_zc_write_retry_burst();
+	test_zc_write_fallback(); test_zc_write_refusal();
 	assert(!warnings);
 	return 0;
 }

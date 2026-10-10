@@ -14,7 +14,7 @@ Also ratelimit the flush timeout warning. A peer that goes away without
 its CLOSE reaching us (or userspace re-creating connection generations
 against a dead peer) produces one uncompletable CLOSE per generation,
 observed as 78 warnings at two-second cadence over five minutes while a
-DS4 coordinator outlived its worker.
+coordinator outlived its worker.
 ---
  drivers/thunderbolt/stream.c | 44 ++++++++++++++++++++++++------------
  1 file changed, 29 insertions(+), 15 deletions(-)

@@ -1,15 +1,15 @@
 # LOG
 Running log of noteworthy work; newest first.
 
-## 2026-10-06 — native verbs: DS4 TP over the provider (hardware-validated)
+## 2026-10-06 — native verbs: full two-host bring-up over the provider (hardware-validated)
 - **What:** The experimental native NHI verbs backend (`kernel/verbs/`,
   `providers/strix_nhi/`) passed its full bring-up on the lab nodes (max/max2,
   Fedora 43 / 7.2.8). Two-host SEND/RECV exchange PASS (0/1/3984-byte and 2 MiB
-  windows, 18.9 MB, ERR flush), repeated module reload cycles, and unmodified
-  ROCm DS4 tensor parallelism over the provider (`--transport rdma
-  --rdma-device strix_nhi0 --rdma-gid-index 0`): TP bound rank 0/1, 50/50
-  expert split, 377 MB placed through SEND/RECV, ~140k frames per direction,
-  zero bad frames, working 128-token inference, no kernel warnings.
+  windows, 18.9 MB, ERR flush), repeated module reload cycles, and an
+  unmodified ROCm tensor-parallel inference workload over the provider
+  (`--transport rdma --rdma-device strix_nhi0 --rdma-gid-index 0`): both ranks
+  bound, 377 MB placed through SEND/RECV, ~140k frames per direction, zero bad
+  frames, working 128-token inference, no kernel warnings.
 - **The three hardware bugs found in bring-up** (documented in
   `kernel/verbs/README.md`): (1) `sof=0` broke multi-packet frame reassembly —
   >252-byte frames arrived as CRC-flagged pieces with intact content; the fix
@@ -24,487 +24,8 @@ Running log of noteworthy work; newest first.
   BIND/BIND_ACK exchange (the property channel now carries only static prtc* +
   a write-once `rxhop` rendezvous), which eliminated the stale-snapshot class.
 - **Next:** throughput/latency A/B against the stream path (the keep-native-vs
-  -stream decision data); hardware RDMA READ/WRITE (DS4's RoCE path is
-  SEND-only); hot-unplug and malformed-peer injection.
-
-## 2026-08-28 — `ae762ae` endurance v9 PASS (executed)
-- **What:** Operator-authorized one launch of reviewed v9 (SHA256SUMS
-  `dfdd7d04…d65e`). SUCCESS nonce `beb77d1b…a22e`. Evidence `843f15b1…84e1`
-  (212). All 6 identity SHA `cf044162…` len 83409, 16384/length, cached=0,
-  prompt 160021. Prefill TPS 0.9997 wall 1.0004 (gates pass). Decode t/s
-  8.75 vs 7.54 (0.862×, report-only). Median wall 2652 vs 2954 s (1.114×).
-  Coord 13587/3929/2797 all shared samples. Restoration PASS. Mutex gone.
-- **Why:** Endurance screen of exact-shared vs nospec at 16384 tokens /
-  ≥100k prompt on compile-oracle v2 binaries.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
-  `…/stage3-ae762ae-endurance-v9-capture`. Window:
-  `bench/results/2026-08-28-ds4-stage3-ae762ae-endurance-v9-window.md`.
-
-## 2026-08-27 — `ae762ae` route-overlap v5 PASS
-- **What:** Independently reviewed exact-digest route-overlap v5
-  (SHA256SUMS `39ce023b…6978`). Canonical base/span sequences identical
-  ordinary vs shared. Worker 471=456+15; coord 460=456+4; hist
-  `0:416,1:19,2:19,3:7,4:6,5:4`; continuation 22. Derived rows match
-  probe/ACTIVE. Weighted savings overall 0.338. Identity 1374/`5f38d237…`.
-  Restoration PASS. Evidence `fd7e8db2…28a7` (152/152).
-- **Why:** Measure exact-span shared-row routing overlap vs ordinary exact.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
-  `…/stage3-ae762ae-route-overlap-v5-capture`.
-
-## 2026-08-27 — `ae762ae` compile/oracle v2 PASS
-- **What:** Independently reviewed exact-digest compile-oracle v2
-  (SHA256SUMS `b0b9f9cf…cbfa`). Bilateral compile of `ae762ae` tree
-  `1e4aa17ee2…` (1494 files). Static 13/13 both hosts (shared 4, route 6,
-  dist-stats 3). dist-v3 92/92, TP/MXFP4/graph PASS, krow BITEXACT+PASS,
-  production-head k=2..5 BITEXACT ~2.07–5.18×. Candidate `ds4`
-  `edaa1727…` identical max/max2. Restoration PASS. Evidence
-  `6a956d40…bca1` (242/242). Mutex absent. Model HOLD.
-- **Why:** Route-probe (`e3976e3`) and dist proposal telemetry (`2856bf7`)
-  need a sealed bilateral candidate before any runtime probe/inference.
-- **Impact:** **COMPILE_ORACLES_PASS; model HOLD.** Capture:
-  `…/stage3-ae762ae-compile-oracle-v2-capture`.
-
-## 2026-08-27 — `223b182` shared-row inference v3 PASS
-- **What:** Independently reviewed exact-digest shared-inference v3
-  (SHA256SUMS `c528e99a…ee40`). 7 phases AB/BA/AB, krow v2 binaries. All 7
-  outputs 512/1374 SHA `5f38d237…` with identical
-  `(content,reasoning,role,finish,usage)`. Work tuple cycles=460 proposed=59
-  accepted_draft=53 on all 6 spec samples. Shared ACTIVE hist `{3:3,4:6,5:6}`
-  both roles, layers worker 22:42 / coord 0:21; one WARNING; zero REJECTED.
-  Median wall shared/exact 0.996x; decode t/s 1.004x. Restoration PASS.
-  Evidence `e1c472d7…40eb` (240/240).
-- **Why:** Measure exact-span shared-row batching vs exact baseline with
-  matched proposal work. Identity holds; wall is a wash (~1.07x vs nospec).
-- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
-  `…/stage3-223b182-shared-inference-v3-capture`.
-
-## 2026-08-27 — `f7edfcf` exact-spec inference v4 PASS (scheduler=0)
-- **What:** Independently reviewed exact-digest inference v4
-  (SHA256SUMS `ddf05eca…045f`). Exact arm `DS4_DSPARK_SCHEDULER=0` (baseline
-  absent). Sealed identity 1374/`5f38d237…`. Coordinator proposed=162
-  accepted_draft=132 (vs v3 59/53). Worker scheduler_skips=0. Prefill ~82 t/s;
-  decode 14.43 vs 11.19; wall 36.549 vs 46.820 (1.281x). Restoration PASS.
-  Evidence `e155f538…80e1` (130/130).
-- **Why:** v3 default scheduler skipped 351/460 cycles; this probe measures
-  density with scheduler off. More accepts, worse wall — proposer chain
-  ~5.4 s dominates.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
-  `…/stage3-f7edfcf-inference-v4-capture`.
-
-## 2026-08-27 — `f7edfcf` exact-spec inference v3 PASS
-- **What:** Independently reviewed exact-digest inference v3
-  (SHA256SUMS `9bc889d0…a81a`). Nospec vs DSpark with EXACT=1 + SPAN=1 +
-  KROW_REQUIRED=1 (baseline keys absent). Identity 512/512 both len 1374 SHA
-  `5f38d237…` (sealed v30/v32e). Coordinator proposed=59 accepted_draft=53.
-  Prefill 82.19 vs 81.80 t/s; decode 14.45 vs 13.42; wall 36.487 vs 39.205
-  (1.074x). Restoration PASS. Evidence `f9dbf4ba…3ace` (130/130).
-- **Why:** Measure whether production-head Q8 k-row speedup moves real exact
-  speculation. It does fire (59/53) and stays bit-identical; wall is still
-  ~7% slower than nospec in this one-sample screen.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
-  `…/stage3-f7edfcf-inference-v3-capture`.
-
-## 2026-08-27 — `f7edfcf` k-row oracle/bench v2 PASS
-- **What:** Independently reviewed exact-digest krow v2
-  (SHA256SUMS `9931cd08…bca4`). Bilateral compile of `f7edfcf` tree
-  `0e4a0176…`. Krow test BITEXACT+PASS both hosts. Production-head bench
-  `4096x129280` / `7168x129280` k=2..5 all BITEXACT; speedups ~2.1–5.2× vs
-  sequential. Candidate `ds4` `b9511e36…` identical max/max2. Restoration
-  PASS. Evidence `1b624100…097b` (218/218). Mutex absent. Model HOLD.
-- **Why:** Exact 2..5-row Q8 prequant path vs serial one-row, production vocab
-  head, required-mode banner.
-- **Impact:** **COMPILE_ORACLES_PASS; model HOLD.** Capture:
-  `…/stage3-f7edfcf-krow-v2-capture`.
-
-## 2026-08-27 — `11a0c28` inference v32e PASS (no MULTI_MODEL)
-- **What:** Independently reviewed exact-digest v32e
-  (SHA256SUMS `11bcfe5f…e012`). Nospec vs DSpark+SPEC_DISABLE with
-  `DS4_ROCM_Q8_F16_CACHE_MULTI_MODEL` **absent**. Identity 512/512, both
-  len 1374 SHA `5f38d237…` (byte-identical to sealed v30). Prefill 81.87 vs
-  82.02 t/s; wall 36.487 vs 36.561 (1.002x). No dist spec stats; worker
-  DSpark stats absent. Exact policy line both roles on support arm.
-  FD-exec `/proc/self/fd/3`. Restoration PASS. Evidence `c1a8f2d8…b658`
-  (130/130). Mutex/snapshots absent.
-- **Why:** Prove `11a0c28` preserves primary Q8-F16 without the v30 env override.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
-  `…/stage3-11a0c28-inference-v32e-capture`.
-
-## 2026-08-27 — `11a0c28` compile-oracle v31c PASS
-- **What:** Independently reviewed exact-digest v31c
-  (SHA256SUMS `5918272e…3d21`). Bilateral compile of `11a0c28` tree
-  `9fc5803e…`. Krow BITEXACT after support map + overall PASS on both hosts.
-  Production binaries identical max/max2 (`ds4` `5cb6ed4c…`, `ds4-server`
-  `46eebe15…`). Restoration PASS. Evidence `25a8ed7d…2702` (206/206).
-  Mutex absent. Inference HOLD.
-- **Why:** Runtime Q8-F16 primary-cache preservation needs a unique candidate
-  build before MULTI_MODEL-unset inference.
-- **Impact:** **COMPILE_ORACLES_PASS; model HOLD.** Capture:
-  `…/stage3-11a0c28-v31c-capture`. Inference freeze waits on this PASS review.
-
-## 2026-08-27 — `3798544` v30 Q8-F16 multi-model cache localization PASS
-- **What:** Independently reviewed exact-digest v30
-  (SHA256SUMS `2f4f5e17…bfc9`). Nospec vs DSpark+SPEC_DISABLE with
-  `DS4_ROCM_Q8_F16_CACHE_MULTI_MODEL=1` on both roles. Identity 512/512,
-  both len 1374 SHA `5f38d237…`. Prefill 82.24 vs 82.10 t/s; wall 36.554 vs
-  36.519 (1.001x). No dist spec stats. Capture layers 40,41,42. Restoration
-  PASS. Evidence `a7e0a85b…0bc1` (126/126).
-- **Why:** Loading DSpark disabled primary Q8→F16 caches unless MULTI_MODEL=1.
-  Same alternate SHA across v26/v27/v29 DSpark modes was Q8 arithmetic
-  fallback, not speculative seam.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Runtime fix (keep
-  primary Q8-F16 under multi-model) is local atop 29d1cf4; no host compile
-  until a frozen build bundle is reviewed. Capture:
-  `…/stage3-3798544-inference-v30-capture`.
-
-## 2026-08-27 — `3798544` DSpark measurement v24b PASS
-- **What:** Independently reviewed exact-digest v24b
-  (SHA256SUMS `0795ea7a…aeb8`). Identity 128/128. Exact 11.723s / 12.74 t/s
-  (ratio 1.030 vs this-run nospec 11.386s). Trust-all 7.671s / 21.36 t/s.
-  Exact wall/t/s **unchanged vs v23c**; ratio drop is nospec variance.
-  Restoration PASS. Evidence `fee5149e…4cbe`.
-- **Why:** Single-buffer + per-row heads keep correctness; this 128-token
-  sample does not show an exact-arm wall win vs v23c.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Window:
-  `bench/results/2026-08-27-ds4-stage3-3798544-inference-v24b-window.md`.
-
-## 2026-08-27 — `d177574` DSpark measurement v23c PASS
-- **What:** Independently reviewed exact-digest v23c
-  (SHA256SUMS `61a85f0c…73bb`). Identity 128/128 exact=nospec. Trust-all
-  ceiling 7.651s / 21.41 t/s (−26.7% wall, +47.8% decode vs nospec 10.434s
-  / 14.49). Exact 11.728s / 12.74 (+12.4% wall). dmesg 3/3. Restoration PASS.
-  Evidence `ec687180…7b8e`. Frozen checker re-run PASS.
-- **Why:** Verification cost, not draft capacity. Next: cheaper exact row
-  heads and/or accept rate >85%.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model HOLD.** Capture:
-  `…/stage3-d177574-inference-v23c-capture`.
-  Window: `bench/results/2026-08-27-ds4-stage3-d177574-inference-v23c-window.md`.
-
-## 2026-08-27 — v23 `13e9aa7` compile-oracle RETIRED unexecuted
-- **What:** Frozen SHA256SUMS `28cdcdd1…003a` kept in archive, never launched.
-  Trust-all knob will land as a second commit; v23-final + v23b will freeze
-  on that single tip.
-- **Why:** Avoid two compile windows; measurement binaries must include
-  `DS4_DIST_SPEC_TRUST_ALL`.
-- **Impact:** No host action. Bundle remains
-  `…/stage3-13e9aa7-compile-oracle-v23`.
-
-## 2026-08-27 — `b7627f6` DSpark measurement v22b PASS
-- **What:** Independently reviewed exact-digest v22b
-  (SHA256SUMS `1f74d836…cbe7`). Token identity 128/128 temp=0 spec=nospec.
-  Spec fire `cycles=99 proposed=32 accepted_draft=29` (90.62%). No hard-error.
-  Wall 13.15s spec vs 10.74s nospec (~+22%). Decode t/s 11.16 vs 14.50.
-  Restoration PASS. Evidence `81f2d4af…42e5`. Frozen checker re-run PASS.
-- **Why:** Exact replay is correct; at block=5 drafting does not pay for
-  replay cost. Default-off. Optimize-next is batch-exact verify.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model window HOLD.** Capture:
-  `…/stage3-b7627f6-inference-v22b-capture`.
-  Window: `bench/results/2026-08-27-ds4-stage3-b7627f6-inference-v22b-window.md`.
-  Merge-ready: `wip-dspark-dist` → `perf-prefill-decode` / PR #861.
-
-## 2026-08-27 — `b7627f6` compile-oracle v22 PASS; v22b measurement frozen
-- **What:** v22 compile-oracle PASS (SHA256SUMS `a51f4dad…e8b0`, nonce
-  `80a879f9…`, evidence `199f80b2…`). distv3 92/92; binaries
-  `ds4` `cf57608c…30c9` / `ds4-server` `da6ed2c4…1784`.
-  v22b measurement frozen offline (SHA256SUMS `1f74d836…cbe7`):
-  those binaries, `{window="avg"}` t/s scrape, same DSpark gates as v21.
-- **Why:** Exact-replay + recover-after-failure compile; v21 unlabeled
-  metrics regex missed Prometheus labels.
-- **Impact:** Compile PASS; v22b not executed pending independent PASS.
-  Capture: `…/stage3-b7627f6-compile-oracle-v22-capture`.
-
-## 2026-08-26 — `dd18162` DSpark measurement v21 HOLD
-- **What:** Independently reviewed exact-digest v21 launched once.
-  Spec **fired** (`cycles=80 proposed=16 accepted_draft=14`, 87.5%).
-  Wall 9.19s dspark vs 10.27s nospec. Checker HOLDed: (1) dspark
-  `finish=error` at gen=92 (`distributed speculative decode failed`);
-  (2) metrics scrape missed labeled `ds4_*_tps{window=avg}`;
-  (3) identity 128 vs 92 is a consequence of (1). Restoration PASS.
-- **Why:** Dist spec must degrade a failed cycle to per-token, not kill
-  a committed-prefix request. Harness regex must match Prometheus labels.
-- **Impact:** **HOLD.** Capture:
-  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-dd18162-inference-v21-capture`.
-  Window: `bench/results/2026-08-26-ds4-stage3-dd18162-inference-v21-window.md`.
-  Next: worker fix commit → v22 compile-oracle → v22b re-measure.
-
-## 2026-08-26 — `dd18162` compile-oracle v20d PASS
-- **What:** Independently reviewed exact-digest v20d
-  (SHA256SUMS `0afa924c…c308`). First host compile of dist-spec / ROCm
-  `.cuh` tree. `test-dist-v3` 92/92 both hosts; TP/MXFP4/graph-172 PASS;
-  production binaries hash-stable and bilateral-identical (`ds4`
-  `c01d1367…8d1a`). Restoration PASS. Evidence `fc017bcc…d92f`.
-- **Why:** v20c attempts 1–3 false-ABSENT preflight from bash `set -e` +
-  `[ ! -e p ] && [ ! -L p ]`. v20d `require_absent` + snapshots + fresh
-  paths.
-- **Impact:** **COMPILE_ORACLES_PASS; model window HOLD.** Capture:
-  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-dd18162-compile-oracle-v20d-capture`.
-  Window: `bench/results/2026-08-26-ds4-stage3-dd18162-compile-oracle-v20d-window.md`.
-
-## 2026-08-26 — `93f75b9` q2 TP-speedup v19b PASS
-- **What:** Independently reviewed exact-digest v19b
-  (SHA256SUMS `ea723db2…5d58`). q2 SHA `ca22ae2f838e…61c0` both hosts.
-  Prefill 75.63s standalone vs 45.10/45.18s TP TCP/NHI (~1.68×).
-  Decode 21.64s vs 22.81/22.78s (~0.95×). Restoration PASS. Evidence
-  `fb46503c…c259`.
-- **Why:** Two-GPU TP helps compute-bound prefill; decode is serial plus
-  a small hop. TCP≈NHI again.
-- **Impact:** **PASS; model window HOLD.** Capture:
-  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-93f75b9-inference-v19-capture`.
-  Window: `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v19b-window.md`.
-
-## 2026-08-26 — `93f75b9` inference-perf v17 PASS (measurement)
-- **What:** Independently reviewed exact-digest v17
-  (SHA256SUMS `25bd8035…a5bb`). Baseline `84cc882` compile SKIP (TheRock
-  `-fPIC`/`R_X86_64_32` link of `ds4_gpu_args.o`). Three NHI configs ran
-  probes ×3: medians ~65.26/65.27/65.12 s prefill and ~25.84/25.98/25.77 s
-  decode. Mapped registration proven. Restoration PASS. Evidence `a32c3703…`.
-- **Why:** At this probe set the link is not the bottleneck; bits=8 and
-  MAPPED=1 sit in noise vs prod-eq NHI. Pre-MXFP4 A/B still needs a
-  buildable ancestor or a -fPIC rebuild of 84cc882.
-- **Impact:** **PASS; model window HOLD.** Capture:
-  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-93f75b9-inference-v17-capture`.
-  Window: `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v17-window.md`.
-
-## 2026-08-26 — `93f75b9` inference-validation v16 PASS
-- **What:** Independently reviewed exact-digest v16
-  (SHA256SUMS `49088770…4278`) ran P1 TCP, P2 NHI, P-prod, and P3a–P3d.
-  Frozen checker re-run over the sealed capture: `ok=true`, `failures=[]`.
-  Restoration PASS; pre/post identity byte-identical. Evidence manifest
-  `c293ece8…93dd1`.
-- **Why:** v16 was the G4 stats-line allowlist over HOLDed v15. Live window
-  confirmed G1' (reasoning_content TCP=NHI), G2 (~100% of production TCP),
-  G3 refusal-correctness (`tokens=5`, HTTP 500, zero dumps), G4 worker
-  `tcp`/`nhi-cpu-copy`. dmesg allowlist counted 5/5 NHI-teardown flush
-  timeouts on max2.
-- **Impact:** **INFERENCE_VALIDATION_PASS; model window HOLD.** Capture:
-  `/Users/jyates/Repositories/ds4-stage3-artifacts/stage3-93f75b9-inference-v16-capture`.
-  Window: `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v16-window.md`.
-
-## 2026-08-26 — `93f75b9` inference-validation v14 FAIL-CLOSED at P3a; P1/P2/P-prod completed
-- **What:** Independently reviewed exact-digest v14
-  (SHA256SUMS `34f6a68a…6931`) launched once. P1 TCP, P2 NHI, and P-prod all
-  finished 27/27 HTTP 200. `reasoning_content` identical across TCP/NHI/prod.
-  Perf transport-neutral (~100% of production). P3a armed 1-token chat hit
-  `tokens=5` (template), designed dump refusal, 500, zero dumps; collect
-  aborted. max2 dmesg: two `tbstream TX ring 2 flush timed out in-flight=1`
-  lines. Restoration identity/API healthy; dmesg gate FAILED. v14 retired.
-- **Why:** API chat/completions cannot produce n_tokens==1. `/v1/completions`
-  still renders chat. NHI teardown leaves one in-flight TX descriptor.
-- **Impact:** **FAIL-CLOSED after answering G1'/G2 informally.** Evidence:
-  `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v14-window.md`.
-
-## 2026-08-26 — `93f75b9` inference-validation v13 FAIL-CLOSED at run_driver quoting
-- **What:** Independently reviewed exact-digest v13
-  (SHA256SUMS `26630cb8…eaac`) launched once. Quiescence, parity, and P1
-  candidate TP-TCP ready all passed (~25s). `run_driver` then failed closed:
-  multi-line JSON plan was single-quote-wrapped into the remote Python
-  payload (SyntaxError). original_rc=1. v13 retired; do not retry.
-- **Why:** v11/v12 never reached `run_driver` live. Offline plan-validator
-  covered extraction/validation, not the exact printf composition.
-- **Impact:** **FAIL-CLOSED; restoration PASS; model window HOLD.** TP-TCP
-  launch/ready is proven. Evidence:
-  `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v13-window.md`.
-  Follow-on: separately versioned v14 (base64 plan injection + composition
-  compile tests), not a v13 retry.
-
-## 2026-08-26 — `93f75b9` inference-validation v12 FAIL-CLOSED at P1 standalone OOM
-- **What:** Independently reviewed exact-digest v12
-  (SHA256SUMS `0c61bad1…631e7`) launched once. Host-conditional quiescence
-  PASS on both hosts. P1 candidate standalone then OOM'd after caching
-  112.63 GiB (`tensor-span:114` at offset ~120 GiB). Ready-poll 900s
-  original_rc=124. No G1/G2/G3/G4 evidence. v12 retired; do not retry.
-- **Why:** Full-model single-GPU device cache of this GGUF does not fit one
-  128 GB Strix Halo. The quiescence v11 defect was fixed; the remaining
-  failure is a design limit, not a harness bug.
-- **Impact:** **FAIL-CLOSED; restoration PASS; model window HOLD.** Production
-  verified healthy (API `deepseek-v4-flash`). Evidence:
-  `bench/results/2026-08-26-ds4-stage3-93f75b9-inference-v12-window.md`.
-  Follow-on: separately versioned v13 G1' (candidate v3 TCP vs v3 NHI),
-  not a v12 retry.
-
-## 2026-08-25 — `93f75b9` bilateral compile/runtime-oracle v10 PASS
-- **What:** The independently reviewed, exact-digest frozen v10 bundle ran the
-  stage-3 no-model compile/oracle sequence on `max` then `max2` from exact DS4
-  `93f75b98bcfcb6a44ca739754472bf767f5433dc` (1,490-file manifest). Per host:
-  `make clean`, one `make -B strix-halo`, then exactly once each
-  `test-tp-combine-rocm`, `test-mxfp4-rocm`, and
-  `test-graph-deferred-dump-rocm`. All passed; graph chronology exact (3
-  control negatives, subset 8-entry arm, full 172-entry arm, 172 unique
-  deferred dumps). Bilateral checker PASS: byte-identical binaries, toolchain,
-  and runtime-library manifests. No model, GGUF, prefill, decode, TP/NHI
-  diagnostic, umbrella `test-rocm`, or module swap occurred.
-- **Why:** Stage 3 needed proof that the deferred-graph capture work compiles
-  and passes its focused oracles identically on both hosts before any later
-  window. Nine earlier bundle versions were rejected or failed closed in
-  review/attempts (v8: macOS-local `flock` prerequisite; v9: stale worker
-  baseline discovery + Bash nounset derived-local bug, no mutation); v10 bound
-  the current exact production baseline (worker/server/exporter SHAs, API
-  8080, module srcversion dual-absence, exact-empty systemd `Job`).
-- **Impact:** **COMPILE_ORACLES_PASS; model window remains HOLD.** Wrapper
-  and settle rc all 0; restoration PASS with pre/post identity byte-identical,
-  private FLOCKs held, dmesg deltas empty, global lock absent throughout.
-  Evidence manifest `8ce422b7…9e2`.
-  Evidence: `bench/results/2026-08-25-ds4-stage3-93f75b9-compile-oracle-v10-window.md`.
-
-## 2026-08-25 — `6460eb6` Arm A proves broad dumps perturb the standalone oracle
-- **What:** In a wholly separate v5 window, fresh bilateral TheRock
-  `test-rocm` passed rollback TP 9/9, production-prequant 1/1 with all 4,096
-  outputs finite, CLI 49/0, and full MXFP4. Immutable Arm A then ran once
-  under the production module and exited 0 with the exact 173-file,
-  6,155,280-byte all-layer inventory, all 1,538,562 f32 values finite, 43
-  valid top-k vectors, exact dump chronology, and no dump errors. Its output
-  SHA was `3eeab08a…666d`, not frozen `21afe05c…05ae`, so the integrated guard
-  made the runner exit 1 and publish no success/commit marker.
-- **Why:** An exact standalone guard was required before exposing the same
-  all-layer filter to TP; intermediate dump synchronization can alter command
-  boundaries and therefore had to prove invariance rather than be assumed.
-- **Impact:** **Arm A FAIL; Stage 3 remains NO-GO.** p15 was never loaded and
-  Arm B/NHI never ran. The perturbation is material despite retaining argmax
-  5: versus frozen output, all 129,280 values differ, relative RMSE is
-  0.17364 and cosine is 0.98563. This is instrumentation evidence, not TP or
-  production correctness evidence. Production module remained loaded and
-  full restoration passed (timers/services/private FLOCKs/endpoints/TB-IP/
-  API/exporter/marker-only dmesg). Evidence:
-  `bench/results/2026-08-25-ds4-stage3-6460eb6-localization-arm-a-window.md`.
-
-## 2026-08-25 — `6460eb6` localization window fails closed before either arm
-- **What:** Reviewed and staged exact test-only `6460eb6` with bilateral
-  1,488-file provenance and an unchanged `4c20e811…` runtime, then opened the
-  separately authorized localization window. Production preflight and
-  worker-first quiescence passed, but the mandatory fresh bilateral
-  `make test-rocm` invocation omitted TheRock's build-time `ROCM_HOME`/HIPCC
-  override. Make selected absent `/opt/rocm/bin/hipcc` and exited 2 on both
-  hosts before any ROCm executable or test ran. Full MXFP4 was skipped; no
-  retry or follow-on occurred.
-- **Why:** Standalone all-layer dumps were intended to guard a single TP/NHI
-  all-layer localization arm, but both validation and final independent
-  script review were strict prerequisites. A late independent HOLD also
-  identified additional bounded-cleanup defects for a future runbook.
-- **Impact:** **PRE-ARM FAIL-CLOSED; Stage 3 remains NO-GO.** Arm A was never
-  launched, p15 was never loaded, Arm B was never launched, and there were no
-  dumps or NHI frames. The production module remained loaded throughout.
-  Timers/services were restored, with exact module/endpoints/private FLOCKs,
-  no diagnostic lock/process/holder, unchanged staged hashes, TB-IP, exporter,
-  fresh API inference, and marker-only dmesg all passing. Evidence:
-  `bench/results/2026-08-25-ds4-stage3-6460eb6-localization-prearm-window.md`.
-
-## 2026-08-25 — Exact `9b383ac` completes all TP gates but produces wrong logits
-- **What:** Independently matched all 1,488 archived source files and staged
-  artifacts on both hosts, reviewed the typed ROCm shared-down dispatcher,
-  and ran one separately authorized raw-prefill arm under p15. Both ranks
-  exited 0 after all 86 TP gates (688/688 TX frames each); failures, event
-  drops, CRC, overruns, timeouts, and marked dmesg messages were all zero.
-  The coordinator wrote finite 4,096-value norm and 129,280-value output
-  dumps. The worker cleanly exited on `leader finished` without executing or
-  dumping the output head. No retry or follow-on occurred.
-- **Why:** `9b383ac` repaired the unconditional ROCm generic K-slice stub and
-  needed one bounded end-to-end gate before any decode or performance work.
-  Full logits and rank agreement remain the required correctness oracle.
-- **Impact:** **Stage 3 model correctness remains NO-GO.** Execution and NHI
-  transport now complete, but coordinator logits are substantively wrong:
-  argmax 201 versus frozen standalone argmax 5, zero top-five overlap,
-  max absolute error 18.5687, RMSE 2.49725, relative RMSE 0.7203, and cosine
-  0.77824. Worker dump absence separately leaves rank equality unproven.
-  A future separately reviewed diagnostic should expose a tensor both ranks
-  necessarily execute, such as final-layer `hc_ffn_post`; another arm of the
-  current binary is not justified. Production module/endpoints/timers/
-  services/private locks were fully restored, with TB-IP, exporter, fresh API
-  inference, and marked dmesg checks passing. Evidence:
-  `bench/results/2026-08-25-ds4-stage3-9b383ac-one-prefill-window.md`.
-
-## 2026-08-25 — Exact `2f17834` TP arm reaches shared-down ROCm stub
-- **What:** Revalidated all 1,488 tracked files and the bilateral `dafe4d4…`
-  binary, then ran one separately authorized warmed raw-prefill arm under
-  transient p15 with `-n 1`, speculative evaluation disabled, and dual
-  final-state/logit dump filters. Both ranks connected, completed the first
-  8-frame ATTN gate, and exited 1 with the new bilateral label:
-  `TP decode failed layer=0 pos=0 stage=shared_down`. No dump was produced
-  and no retry or follow-on occurred.
-- **Why:** The previous generic failure interval needed first-failure
-  localization, and Stage 3 still requires a clean full-logit one-token
-  oracle before any decode or performance work.
-- **Impact:** **Stage 3/full decode remain NO-GO.** The exact source root is
-  now identified: the live graph calls generic
-  `ds4_gpu_matmul_quant_kslice_tensor`, but ROCm still resolves that symbol
-  to the unconditional unavailable stub; only the Q8-specific K-slice API
-  is implemented. The focused shared-slice test missed the seam by calling
-  the specific API directly. Transport was clean (TX 8/8 each, zero
-  failures/drops/CRC/overrun, coordinator CLOSED), marked dmesg spotless,
-  and production fully restored with API/TB-IP/private-lock checks. The
-  rank-local routed-MoE repair was not reached live. Evidence:
-  `bench/results/2026-08-25-ds4-stage3-2f17834-one-token-window.md`.
-
-## 2026-08-25 — Exact `2f17834` Stage-3 window stops at CLI validation
-- **What:** Corrected a staging-provenance defect before wire time, then
-  independently verified all 1,488 tracked files on both build hosts against
-  DS4 `2f17834` (canonical manifest SHA `3603d185…`) and obtained a
-  bit-identical `dafe4d4…` ROCm binary. Fresh bilateral ROCm TP 9/9, CLI
-  49/0, and full MXFP4 strict cached-half suites passed. After a clean
-  production preflight and transient p15 swap, the single allowed rank-0
-  invocation exited 2 immediately: `ds4: invalid value for -n: 0`.
-  Rank 1 was never launched and no retry was attempted.
-- **Why:** The intended arm was one raw prompt prefill and zero evaluated
-  decode tokens. `2f17834` parses `-n` with a positive-only helper, so the
-  reviewed zero cap was not a valid CLI command.
-- **Impact:** **No engine arm and no NHI traffic occurred; Stage 3/full decode
-  remain NO-GO.** There was no test lock, model load, TCP listen, device
-  holder, or dump. Source review after restoration confirms a future
-  separately authorized arm can use existing CLI `-n 1` plus
-  `DS4_MTP_SPEC_DISABLE=1`: it performs the prefill, samples one token, and
-  exits before evaluating that token. Production module/endpoints/timers/
-  services/private locks were fully restored; TB-IP, models, exporter, fresh
-  API inference, and marked dmesg all passed. Evidence:
-  `bench/results/2026-08-25-ds4-stage3-2f17834-prearm-window.md`.
-
-## 2026-08-25 — Stage-3 one-token engine arm fails after first clean gate
-- **What:** Reviewed DS4 through stable tip `0a2cf21`, including the rank-1
-  compact-head fix, poison regression, cross-UID lock hardening, and restored
-  ROCm target. In a bounded p15 window, first froze a standalone one-token
-  ROCm oracle (129,280 finite logits, SHA `21afe05c…bc05ae`, argmax 5 / `#`).
-  The TP NHI arm then connected and completed exactly one 8-frame ATTN
-  exchange before both ranks exited 1: worker `rocm prefill failed`, leader
-  `worker prefill sync failed`. No TP logit dump was produced and no retry was
-  attempted.
-- **Why:** The contract requires a bit-exact, clean one-token engine reference
-  before any full decode or performance run; a visible token alone is not a
-  sufficient math oracle.
-- **Impact:** **Stage 3 remains NO-GO and full decode remains blocked.** The
-  one completed exchange was transport-clean (TX 8/8 both, zero
-  failures/drops/CRC/overrun, ordered worker CLOSE observed by coordinator,
-  spotless dmesg). Complete logs localize the silent engine return to layer 0
-  after the ATTN gate and before the FFN gate. A post-window exact-size HC
-  expand-add oracle passed bit-for-bit, so the real-graph interaction or a
-  later stage still needs first-failure diagnostics before another window.
-  Production modules/endpoints/timers/services were fully restored, API
-  inference and TB-IP passed, production-private locks were inode/FLOCK
-  verified, and final dmesg was clean. Evidence:
-  `bench/results/2026-08-25-ds4-stage3-one-token-window.md`.
-
-## 2026-08-25 — DS4 Stage-3 preflight: hardened transport passes; engine arm held safely
-- **What:** Reviewed DS4's ROCm/NHI Stage-3 implementation through three
-  fixups (`e4266a5..8fb6977`), catching before wire time: TX_DONE's zero-byte
-  ABI, TX-slot overwrite before wrap credit, healthy-shutdown ownership
-  loss, and gate-construction/CLOSE races. Under transient p15, the hardened
-  S2 arm then passed 4000 bit-exact full-duplex exchanges (~8 wraps) both
-  ranks with exact quiesce, TX 32000/32000, zero failures/drops/CRC/overrun,
-  93.4–94.1 µs/exchange, and spotless dmesg. The bounded one-token engine
-  arm did **not** run: worker failed before connect/NHI on Fedora's protected
-  stale host `/tmp/ds4.lock` left by a non-root manual run, and while
-  coordinator was still only waiting on TCP the DS4 session found a rank-1
-  compact-head offset bug. Urgent hold
-  honored; no retry and no Stage-3 stream traffic.
-- **Why:** Establish the engine gate only after both software ownership and
-  model semantics are correct; prevent a false result or an unopened-peer
-  wedge during first integration.
-- **Impact:** DS4's hardened transport is independently wire-approved; the
-  engine result remains explicitly open pending review/build of semantic
-  fix `0ce04c5` and a fresh one-token window. Root tests must use
-  `DS4_LOCK_FILE=/run/ds4-stage3.lock`, not a stale host `/tmp` lock.
-  Follow-up inode audit proved production's `PrivateTmp=yes` locks intact
-  (namespace path == fd inode plus live kernel FLOCK) but also showed they
-  cannot exclude host-namespace manual runs; prod stop+process audit stays
-  mandatory. Production modules/timers/services restored, API
-  inference-smoked, final dmesg clean. Evidence:
-  `bench/results/2026-08-25-ds4-stage3-preflight-window.md`.
+  -stream decision data); hardware RDMA READ/WRITE (the validated consumer
+  path is SEND-only); hot-unplug and malformed-peer injection.
 
 ## 2026-08-25 — TP exchange probe: 3.2 ms/token — tensor parallelism clears the bar
 - **What:** Built `tbstream-tp-exchange` (full-duplex simultaneous 28 KiB
@@ -514,12 +35,13 @@ Running log of noteworthy work; newest first.
   × {transport-only, +reduce} matrix at sustained cadence on the node
   pair: spin 29.0 µs/exchange (2.61 ms/90-exchange token), spin+reduce
   35.2 µs (3.17 ms), reap 52.3 µs (4.71 ms), reap+reduce 75.6 µs
-  (6.80 ms). Zero drops, dmesg spotless, reduce sums bit-exact, prod
-  served TCP untouched throughout. Follow-up `hip-event-before-spin`
+  (6.80 ms). Zero drops, dmesg spotless, reduce sums bit-exact, and the
+  production TCP-served workload untouched throughout. Follow-up
+  `hip-event-before-spin`
   verified on both gfx1151 hosts that a service-thread event sync returns
   while a later same-default-stream one-CU spin remains active — the
-  exact deadlock-sensitive Stage-3 enqueue shape.
-- **Why:** The ds4 session's go/no-go criterion for building TP mode was
+  exact deadlock-sensitive record-event-then-spin enqueue shape.
+- **Why:** The consumer workload's go/no-go criterion for building TP mode was
   sustained sync ≤ 5 ms/token at the real exchange shape.
 - **Impact:** **TP clears the bar with 1.8 ms of margin** in the realistic
   spin+reduce arm → projected ~27 t/s vs today's 14.3 (≈1.9×). Full
@@ -528,10 +50,10 @@ Running log of noteworthy work; newest first.
   UC-payload reduce is conservative. Fidelity notes recorded: in-band
   stamps force whole-pool UC in spin mode (one MTYPE per imported pool)
   at no cost for streaming payloads; RX repost requires both the driver
-  event and completion of the final GPU slot reader; and Stage 3 must
-  event-sync, never stream-sync, before host submission. Ball now in ds4's
-  court (ROCm gate ops + NHI TP backend). Evidence:
-  `bench/results/2026-08-25-tp-exchange-probe.md`.
+  event and completion of the final GPU slot reader; and a consumer must
+  event-sync, never stream-sync, before host submission. The remaining work is
+  the consumer's (ROCm gate ops + NHI TP backend). Measured 2026-08-25 on the
+  lab host pair.
 
 ## 2026-08-24 — Patch 15 validated; the TB link wedge is reproducible
 - **What:** Wrote and validated patch 15 (`0015-...Skip-CLOSE-toward-an-
@@ -550,62 +72,11 @@ Running log of noteworthy work; newest first.
   were the week's only kernel-side blemishes.
 - **Impact:** All close-ordering scenarios now exit with zero warnings
   (normal, SIGKILL mid-stream with CLOSE still delivered from the killed
-  side, imported-TX dedicated CLOSE frame), dmesg spotless, prod ds4
-  served TCP untouched throughout. The flood/ratelimit arm was skipped
+  side, imported-TX dedicated CLOSE frame), dmesg spotless, and the production
+  TCP-served workload untouched throughout. The flood/ratelimit arm was skipped
   deliberately — generating uncompletable CLOSEs IS the wedge trigger.
   Follow-ups: TX-credit watchdog + firmware-vs-driver wedge
-  investigation. Evidence:
-  `bench/results/2026-08-24-patch15-close-suppression-and-wedge-repro.md`.
-
-## 2026-08-24 — Gate 7: imported native pools run live DS4 inference bit-exact
-- **What:** Window B with the ds4 session: layered an opt-in imported-pool
-  mode (`DS4_DIST_NHI_IMPORTED=1`, worker-only) onto their freshly ported
-  NHI transport (their `winb-imported-pool` @ 46ea98e). The worker exports a
-  dedicated 16 MiB native HIP pool as a DMA-BUF, imports it as the TX pool
-  before ring activation, and the output head writes logits straight into
-  memory the NHI reads — no hipHostRegister, no CPU touch. Three-arm A/B
-  under the acceptance gate: v3-TCP 14.29 t/s, mapped NHI 13.33, imported
-  NHI 13.33, all bit-exact (sha df07199e5a292872), 21k prefill 245.85 /
-  246.84 (imported best-of-day, all within noise). Kernel stats clean
-  (0 failures/drops/CRC). Mid-window the TB-IP link wedged both directions
-  with silent dmesg; module reloads didn't heal it, authorized reboot did.
-  Window protocol hardened (never both devices closed with the reconcile
-  timer stopped); boot-order and tmpfs-/tmp staging footguns found and
-  disarmed; loud-failure design validated by an accidental boot flap.
-- **Why:** Prove the native DMA-BUF path under real inference and close out
-  the 0.065 ms host-registered penalty question.
-- **Impact:** Gate 7 passes: bit-exact + wall parity; the penalty removal is
-  real but below gate granularity, so the mode's value is structural — the
-  zero-CPU-touch substrate for TP exchanges (already measured at 9.8 µs RTT
-  / 4 KiB) and the end of host round trips in the result path. Follow-ups
-  queued: suppress terminal CLOSE toward a dead peer (2 s retry noise under
-  keep-open protocol), earlier+flushed stats logging for SIGTERM teardown.
-  Evidence: `bench/results/2026-08-24-gate7-imported-pool-live-inference.md`.
-  Both hosts restored to production and re-gated.
-
-## 2026-08-24 — Window A: patch 14 is transparent to real DS4 inference
-- **What:** First coordinated test window with the ds4 session (prod stopped,
-  restorable, acceptance-gated). Scripted the transient module swap
-  (`tools/scripts/p14-swap.sh on|off`: holder-refusal, param verification,
-  prod endpoint recreation) and ran the patch-14 module set on both nodes
-  under the campaign-lineage DS4 binaries in both existing NHI modes
-  (CPU-copy and mapped hipHostRegister), full production config including
-  MTP.
-- **Why:** Compat prerequisite for gate 7 / Window B: prove patch-14's lazy
-  activation is invisible to the deployed open→ZC_ENABLE→GET_INFO→mmap
-  transport sequence under real inference load before layering the
-  imported-pool mode on it.
-- **Impact:** Both arms bit-exact against the production reference sha
-  (df07199e5a292872, 200 tok), wall parity (15.38 tok/s gate; 244.96/245.08
-  tok/s 21k prefill vs 245.2–245.7 TCP band), dmesg completely clean on both
-  nodes, clean teardown, production module+timer restored and verified by
-  script. DS4-side code confirmations: single open site, ENABLE immediately
-  after open, dispatcher polls only post-mmap. Window B plan agreed: ds4
-  session ports the NHI transport onto the live perf-prefill-decode lineage
-  (TCP-gated first); I layer the imported-pool worker-logits mode on the
-  ported file with an AmbientCapabilities=CAP_SYS_RAWIO drop-in, kernel gate
-  kept strict, and transport-shutdown ZC_GET_STATS logging added for gate
-  artifacts.
+  investigation. Validated 2026-08-24 on the lab host pair.
 
 ## 2026-08-23 — Pass gate 6; measure sub-5 µs GPU-polled exchange for TP
 - **What:** Completed gate 6 on the transient patch-14 module set: 17-case
@@ -618,14 +89,14 @@ Running log of noteworthy work; newest first.
   production pair. Then built `tbstream-tp-pingpong` (both directions
   imported on both hosts) and measured kernel-notified vs persistent-GPU-
   wave detection.
-- **Why:** Close the remaining pre-DS4 correctness/fault gates and convert
+- **Why:** Close the remaining pre-integration correctness/fault gates and convert
   the hybrid tensor-parallel proposal from projection to a measured
   transport budget.
 - **Impact:** Exchange RTT p50: 4 KiB 20.3 µs reap vs **9.8 µs spin**
   (~4.9 µs one-way); 32 KiB 57.7 vs **45.3 µs** with jitter collapsed (max
   88→47 µs); implied burst bandwidth ~1.6 GB/s/direction. Two findings:
   small `hipMalloc`s share slab BOs (the driver's same-BO rejection caught
-  it; tools now pad to dedicated 16 MiB BOs — DS4 integration must verify
+  it; tools now pad to dedicated 16 MiB BOs — consumers must verify
   dedicated allocations), and gate-5 coherence is dispatch-scoped — a
   spinning wave never sees NHI writes through GPU L2, so persistent-kernel
   signaling needs uncached flag words (payload stays coarse). At these
@@ -633,8 +104,7 @@ Running log of noteworthy work; newest first.
   decode estimate whose kernel half is now the open question. One polish
   candidate: skip the final CLOSE toward an already-closed peer to silence
   benign flush-timeout warnings. Hosts restored to production and
-  smoke-verified. Full evidence:
-  `bench/results/2026-08-23-gate6-tp-exchange-probe.md`.
+  smoke-verified. Measured 2026-08-23 on the lab host pair.
 
 ## 2026-08-23 — Pass gate 5: imported native GPU pools carry real NHI traffic
 - **What:** Implemented zero-copy patch 14 (`TBSTREAM_ZC_IMPORT`): lazy ring/
@@ -652,7 +122,7 @@ Running log of noteworthy work; newest first.
   ring 4096 (production geometry).
 - **Why:** Gate 5 of the native HIP DMA-BUF experiment: prove NHI DMA into
   reused hot native-GPU RX slots is correct under alternating generations
-  before any DS4 integration, and characterize which acquire mechanism is
+  before any workload integration, and characterize which acquire mechanism is
   actually required.
 - **Impact:** First-ever real stream traffic into native `hipMalloc` memory
   with zero CPU copies: 6,656 messages / 448 MiB / 448 pool wraps across
@@ -664,8 +134,8 @@ Running log of noteworthy work; newest first.
   `hipEventReleaseToSystem` acquire remains the production contract. Both
   hosts were restored to the production module set and smoke-verified.
   Gate 6 (imported TX→RX plus fault/rollback coverage) is unblocked;
-  gate 7 touches DS4/live inference and awaits explicit operator go-ahead.
-  Full evidence: `bench/results/2026-08-23-dmabuf-imported-pool-stale-cache.md`.
+  gate 7 touches a live inference workload and awaits explicit operator
+  go-ahead. Measured 2026-08-23 on the lab host pair.
 
 ## 2026-08-23 — Pass gate 4: live DMA-BUF import probe on the real NHI
 - **What:** Wrote the `tbstream-hip-export` companion (dedicated coarse/
@@ -689,8 +159,7 @@ Running log of noteworthy work; newest first.
   gate 5 must use coarse+explicit-acquire vs. uncached as its arms. Gate 5
   (stale-cache ownership with real traffic and a GPU payload digest) is now
   unblocked; it needs a MOK-signed two-host deployment, which also covers the
-  deferred `max2` replication. Full evidence:
-  `bench/results/2026-08-23-dmabuf-import-probe.md`.
+  deferred `max2` replication. Measured 2026-08-23 on the lab host pair.
 
 ## 2026-08-17 — Implement the gate-3 no-traffic DMA-BUF import probe
 - **What:** Added zero-copy patch 13 (`TBSTREAM_ZC_DMABUF_PROBE`) with the
@@ -720,54 +189,24 @@ Running log of noteworthy work; newest first.
   the UAPI header.
 
 ## 2026-08-14 — Identify and bound a native HIP DMA-BUF path to the USB4 NHI
-- **What:** Re-audited the NHI, AMDGPU, ROCm, and current DS4 data paths and ran initial read-only topology/memory checks on both Strix hosts. The GPUs have only 512 MiB of BIOS VRAM and about 124 GiB of GTT, so DS4's large native HIP allocations are system/GTT pages. The installed HIP 7.13 runtime exposes DMA-BUF export; a temporary 4 MiB `hipMalloc` gate on `max` exported successfully, and a diagnostic CPU mmap saw the exact GPU-written pattern. A subsequent importer/synchronization audit used only local Linux, ROCm, and DS4 source and did not access either host. The public gfx1151 wheel manifest resolves the exact HIP build to TheRock `6d2136cd12be` and `rocm-systems` `79e85e1468f9`; the apparent `3309c6114a` suffix is a generated package hash, not the public source commit.
+- **What:** Re-audited the NHI, AMDGPU, ROCm, and consumer data paths and ran initial read-only topology/memory checks on both Strix hosts. The GPUs have only 512 MiB of BIOS VRAM and about 124 GiB of GTT, so a workload's large native HIP allocations are system/GTT pages. The installed HIP 7.13 runtime exposes DMA-BUF export; a temporary 4 MiB `hipMalloc` gate on `max` exported successfully, and a diagnostic CPU mmap saw the exact GPU-written pattern. A subsequent importer/synchronization audit used only local Linux, ROCm, and consumer source and did not access either host. The public gfx1151 wheel manifest resolves the exact HIP build to TheRock `6d2136cd12be` and `rocm-systems` `79e85e1468f9`; the apparent `3309c6114a` suffix is a generated package hash, not the public source commit.
 - **Why:** Distinguish physically impossible one-sided RDMA from achievable GPU-addressable DMA message passing, find a way around the measured penalty of NHI-owned `hipHostRegister()` pages, and identify the exact ownership contract before writing a live driver.
-- **Impact:** True rkey/remote-VA/atomic/GPU-initiated RDMA remains impossible, but fixed native HIP pools should be addressable by the NHI through a bounded DMA-BUF importer. The source follow-up found two critical constraints: current stream `open()` activates paths before an import ioctl can run, and an idle HIP synchronize is not an RX cache acquire. The design now requires lazy path activation, exact SG/offset validation, reverse rollback, direction-correct DMA-BUF mapping, explicit TX system release, and a source-pinned or newly supported RX system acquire. No-traffic mapping and stale-cache gates must pass before DS4 integration. Full evidence: `docs/GPU_TO_GPU_FEASIBILITY.md`.
-
-## 2026-08-06 — Remove one QKV launch per layer with a bit-exact ROCm fusion
-- **What:** Swept MXFP4 routed-MoE rows per wave, retained the existing one-row specialization, then fused DeepSeek V4 Q/KV weighted RMS normalization with KV RoPE for resident ROCm decode. Added a same-binary rollback and a strict differential suite spanning dense, YaRN, inverse, multi-row/head, zero-rotation, exact-256, 257-pair fallback, and invalid shapes. A first YaRN failure exposed fast-math reciprocal hoisting in the fused loop; one-pair-per-thread indexing fixed it without relaxed tolerances.
-- **Why:** The event ledger ranked routed MoE, attention output, and QKV preparation as the largest repeated layer groups. The MoE sweep showed that wider row grouping reduces effective bandwidth, while the QKV path had a concrete removable launch boundary.
-- **Impact:** The balanced full-model cohort measured 14.57487 tok/s unfused and 14.60320 tok/s fused (+0.1944%); combined two-host GPU stream time fell from 67.30038 to 67.15398 ms/token (-0.2175%, equivalent to +0.2180% throughput). All 40 responses were identical, all 6,656 profiler samples had zero drops, and both order pairs were positive. Final byte-identical binaries are installed side-by-side as `/opt/ds4-qkv-fuse-20260806-r2`; the standard TCP-v3 services were restored and smoked. Full evidence: `bench/results/2026-08-06-ds4-rocm-qkv-fusion.md`.
-
-## 2026-08-06 — Resolve the full-model GPU hot path with in-process ROCm events
-- **What:** Added a fail-open, nonblocking ROCm timing backend and a rotating full-model decode profiler that records 14 stream-0 events around one layer per token, then aggregates only after DS4's existing synchronization. Added 198 deterministic backend/stub checks plus a journal analyzer with weighted means and consistency ledgers. Ran balanced full-model profiler OFF/ON arms and same-prompt staged/direct NHI event comparisons on `max`/`max2`.
-- **Why:** Boundary profiling had already limited transport/control work to about 0.9 ms of a 68.1 ms token, but synchronized evaluation spans could not distinguish kernels from host launch overhead or show why mapped direct output failed to help.
-- **Impact:** ROCm events account for 99.66% of the two host evaluation spans; pooled profiler overhead is approximately -0.046% throughput. Within sampled layer bodies, routed MoE (24.55%), attention output (24.24%), and QKV preparation (20.71%) dominate. The worker output head is 2.51466 ms/token. Direct NHI raises that head to 2.58050 ms (+2.594%) because it writes mapped system/GTT pages, while combined GPU time remains flat; this small penalty exceeds the lease-fence work that direct mode removes and provides a mechanism consistent with the absent RDMA gain. All live correctness and accounting gates passed, and the production TCP-v3 services were restored and smoked. Full evidence: `bench/results/2026-08-06-ds4-rocm-event-profile.md`.
+- **Impact:** True rkey/remote-VA/atomic/GPU-initiated RDMA remains impossible, but fixed native HIP pools should be addressable by the NHI through a bounded DMA-BUF importer. The source follow-up found two critical constraints: current stream `open()` activates paths before an import ioctl can run, and an idle HIP synchronize is not an RX cache acquire. The design now requires lazy path activation, exact SG/offset validation, reverse rollback, direction-correct DMA-BUF mapping, explicit TX system release, and a source-pinned or newly supported RX system acquire. No-traffic mapping and stale-cache gates must pass before workload integration. Full evidence: `docs/GPU_TO_GPU_FEASIBILITY.md`.
 
 ## 2026-08-05 — Repair NHI lost interrupts and fresh-open path activation
 - **What:** Added zero-copy patch 10 progress diagnostics, then used live descriptor/IRQ snapshots to separate two failures. Patch 11 flushes posted non-auto-clear MSI-X acknowledgments through a safe NHI readback; patch 12 starts and fully primes RX before enabling XDomain DMA paths and completes partial ring-buffer cleanup. The full twelve-patch series passes 38/38, strict checkpatch, independent review, byte-identical two-host builds, installed/initramfs hash verification, and a clean reboot.
 - **Why:** At the original asymmetric stall, hardware and the tail descriptor had completed while software and the interrupt count were one event behind; a diagnostic-only worker kick harvested it. The separate immediate-reopen stall showed posted TX but zero hardware completion on both peers and did not respond to a kick, matching the stream driver's path-before-ring/E2E-credit ordering rather than the interrupt race.
-- **Impact:** With kicks disabled, the pair passed 2,880 exact DS4-shaped exchanges across 27 sessions, 26 close/reopen transitions, and 921,600 descriptor completions without kernel transport errors. Required-NHI CPU-copy completed 22 full-model requests and confirmed-mapped NHI completed 12 with zero mismatches or restarts. Five controlled 800-token cohorts measured 10.9421 tok/s CPU-copy NHI, 10.9438 mapped NHI, and 10.9540 TCP v3: no speedup (-0.1081%/-0.0930%). Temporary NHI service overrides were removed and the production TCP-v3 units restored; NHI is now a qualified experimental candidate pending longer soak and active peer-reboot tests. Full evidence: `bench/results/2026-08-05-nhi-msix-rx-prime-fix.md`.
-
-## 2026-08-05 — Keep NHI experimental; select descriptor-framed TCP for production
-- **What:** Built, independently reviewed, deployed, and loaded zero-copy patches 6 and 7 on both Strix hosts, then rebuilt both initramfs images with the matching module set. Enabled translated/default IOMMU operation, installed `0660 root:tbstream` access, and installed the allocator/follower lifecycle units with stable `/run/ds4-tbstream/device` publication. Symmetric raw and DS4 backend gates continued to pass, but full-model NHI intermittently lost receive/completion progress in both mapped and CPU-copy modes. A model-independent raw gate using the actual asymmetric request/response geometry reproduced the class of failure after 25 exchanges, and an immediate fresh-open retry failed.
-- **Why:** The earlier equal-size bidirectional harness did not cover the model's repeating 17/17/33/65-frame requests followed by 127-frame responses. Reproducing the stall without ROCm or the DS4 TCP control channel isolates it below mapped model I/O and prevents a component-gate pass from being mistaken for production readiness.
-- **Impact:** Any configuration that supplies an NHI device is lab-only and reliability-blocked. Production uses `--dist-transport auto` with no `--dist-nhi-device`, which keeps protocol-v3 descriptor framing while selecting TCP; explicit `--dist-transport tcp` is the legacy-v2 compatibility path. No trustworthy NHI tokens/second gain exists because failed or replayed runs are not benchmark samples. The full-model TCP A/B is 11.38 tok/s on legacy v2 versus 11.28 tok/s on descriptor-framed v3, about -0.9%; token-weighted five-run aggregates differ by only +0.005%, so there is no measured increase. Both hosts booted the rebuilt initramfs successfully. A boot-order HopID collision found during that gate was recovered by a clean two-host reset and fixed operationally with a carrier-first, exact-9/9 lifecycle policy; an enabled peer reboot, v3 reconnect, and final full-model smoke now pass.
-
-## 2026-08-04 — Pass the live DS4 backend gate; record production blockers
-- **What:** Added an opt-in, model-independent DS4 two-host harness with strict HELLO/control records, v3 bulk descriptors, generation/sequence identity, generation-seeded full-payload verification, required path assertions, and literal physical-ring-wrap accounting. Built identical CPU and ROCm binaries on both Strix hosts with an embedded ROCm RUNPATH, then ran the audit-final sources over `/dev/tbstream0`: both endpoints verified 32 messages each way and 4.01 wraps; CPU used 32 copy messages, while ROCm used 28 mapped plus 4 wrap-fallback copy messages per direction. Also fixed mapped-RX semantic rejection to consume/repost its lease before sending an ordinary WORK error, added a regression, documented least-privilege udev access, and completed the local/remote test matrix.
-- **Why:** Raw ping-pong proves the driver, but not DS4's descriptor, generation, sequence, lease, and fallback contract. The new gate exercises that boundary without loading a second 156 GB model beside the production pair or conflating a CPU fallback with a mapped pass.
-- **Impact:** The live backend correctness gate and all host-independent tests pass; postflight left the production PIDs, sockets, API, device, modules, boot state, and `/opt` deployment unchanged. Production readiness is still blocked by `amd_iommu=off`, root-only device permissions, the old deployed DS4 binary, and the maintenance-only model equivalence, reconnect/fault, and 8–24 hour soak rows.
-
-## 2026-08-04 — Complete DS4 single-link protocol, NHI, mapped-slot, and generation stages
-- **What:** Added DS4 protocol v3 HELLO/ACK/READY negotiation and exact 64-byte bulk descriptors; implemented the persistent `/dev/tbstream` CPU-copy backend and mixed completion dispatcher; integrated contiguous 32-bit ROCm mapped TX/RX leases with explicit ownership synchronization; and added per-connection generations, directional sequences, repeated NHI identity envelopes, single-link enforcement, and fail-closed malformed/stale handling. Automatic negotiation retains descriptor-framed TCP and legacy v2 reconnect fallbacks before NHI activation.
-- **Why:** These are integration stages 4–6: they make TCP control and NHI bulk unambiguous, remove heap staging for the mapped 32-bit path, close the HELLO-to-first-WORK activation race, and prevent stale descriptors/events or partial control writes from being accepted in a new or reused generation.
-- **Impact:** Host-independent transport/protocol tests pass under strict warnings, ASan/UBSan, TSan, Linux analyzer/ROCm-host compilation, and 100-run repetition. The software path is limited to one remote worker link; reduced-width or wrapping payloads use CPU-copy NHI. Graph tensors are copied directly to/from registered driver slots, but kernels do not yet execute against `lease_device_ptr`. The next gate is the two-Strix `/dev/tbstream` + ROCm end-to-end matrix, including output equivalence, batches 1/2/4/8, prefill/decode/logits, fallback, disconnect/reconnect, and soak.
-
-## 2026-08-04 — Establish persistent DS4 peer transport and TCP-only bulk split
-- **What:** Preserved and re-ran the dirty `rocm-mxfp4-experts` baseline, then replaced stack-temporary DS4 transport bindings with opaque, reference-counted peer transports. Registry entries own duplicated sockets; route plans retain transports; inbound worker and forwarder connections own one transport for their lifetime. WORK is now received as typed fixed metadata, tokens, hidden bulk, and route data, while RESULT metadata/telemetry and bulk use the same persistent object. Errors remain on the TCP control path. Added focused ownership, nonempty 16-bit bulk, alignment, disconnect/SIGPIPE, and ordered-prefetch-rejection tests.
-- **Why:** These are the first three DS4 integration steps required before a long-lived NHI mapping and completion dispatcher can safely exist. They remove payload-scoped ownership and the whole-WORK temporary buffer without prematurely changing the deployed protocol.
-- **Impact:** Valid v2 TCP framing and fallback behavior are unchanged; strict warning builds and focused tests pass. The NHI stub remains intentionally unavailable. Next is a negotiated v3 descriptor with separate control/bulk lengths, followed by a persistent CPU-copy NHI backend for the initial single device-to-device link.
+- **Impact:** With kicks disabled, the pair passed 2,880 exact workload-shaped exchanges across 27 sessions, 26 close/reopen transitions, and 921,600 descriptor completions without kernel transport errors. Required-NHI CPU-copy completed 22 full-model requests and confirmed-mapped NHI completed 12 with zero mismatches or restarts. Five controlled 800-token cohorts measured 10.9421 tok/s CPU-copy NHI, 10.9438 mapped NHI, and 10.9540 TCP v3: no speedup (-0.1081%/-0.0930%). Temporary NHI service overrides were removed and the production TCP-v3 units restored; NHI is now a qualified experimental candidate pending longer soak and active peer-reboot tests. Measured 2026-08-05 on the lab host pair.
 
 ## 2026-08-04 — Deploy five-patch stream stack; pass one-way and ROCm gates
 - **What:** Built and deployed the eight-patch USB4STREAM backport plus all five zero-copy patches on `max` and `max2`, installed the exact-vermagic module set, reloaded it live, restored the stream and Thunderbolt IP link, and rebuilt both initramfs images. Added patch 5 after a verified 64 KiB run exposed that last-frame-only RX interrupts could suppress a following CLOSE; patch 5 interrupts both message-boundary descriptors. Ran one-way verified/throughput tests, exclusivity regression, a targeted interrupt check, and full-pool ROCm mapping on both GPUs.
-- **Why:** This closes the hardware decision gates before DS4 adopts persistent NHI mappings and records the boundary condition found only under a receive-ring wrap.
-- **Impact:** Verified one-way sender rates were 100.5 MB/s at 4 KiB, 512.3 MB/s at 64 KiB, and 1052.1 MB/s at 1 MiB. A final 512 x 1 MiB run reached 955.9 MB/s with only 24 aggregate Thunderbolt interrupts per host. Both Radeon 8060S GPUs read and wrote all 16 MiB of the mapped TX pool correctly. Module paths, vermagic, initramfs contents, stream devices, and IP connectivity all pass; the DS4 CPU-copy backend is cleared to proceed. Full evidence: `bench/results/2026-08-04-usb4stream-zc-oneway-rocm.md`.
+- **Why:** This closes the hardware decision gates before consumers adopt persistent NHI mappings and records the boundary condition found only under a receive-ring wrap.
+- **Impact:** Verified one-way sender rates were 100.5 MB/s at 4 KiB, 512.3 MB/s at 64 KiB, and 1052.1 MB/s at 1 MiB. A final 512 x 1 MiB run reached 955.9 MB/s with only 24 aggregate Thunderbolt interrupts per host. Both Radeon 8060S GPUs read and wrote all 16 MiB of the mapped TX pool correctly. Module paths, vermagic, initramfs contents, stream devices, and IP connectivity all pass; the CPU-copy backend is cleared to proceed. Measured 2026-08-04 on the lab host pair.
 
-## 2026-08-04 — Prepare reproducible RX/ROCm gates; pin DS4 integration boundary
-- **What:** Reconciled the missing RX interrupt-suppression work as backward-compatible zero-copy patch 4 (`POST_RX_FLAGS` with final-frame interrupt mode), with automatic userspace fallback to legacy `POST_RX`. Added `tools/rocm-map/tbstream-hip-map`, which safely tests GPU read/write access to TX pool pages without touching NHI-owned RX pages. Fixed `host-build.sh` to incrementally apply all eight backport and four zero-copy patches, and recorded the required persistent-connection/wire-protocol DS4 refactor in `docs/DS4_INTEGRATION.md`.
-- **Why:** The logged deployed behavior was not reproducible from the repository, the build script stopped after the base backport, and DS4's current stack-temporary bindings cannot own persistent NHI mappings or safely demultiplex mixed completions.
-- **Impact:** All offline-applicable userspace, patch, script, and documentation gates pass. The ROCm binary cannot be compiled on the macOS development host because `hipcc` is unavailable; patches 3/4, `ztx`/`zrx`, and the ROCm mapping gate require an explicitly authorized rollout to the two Linux hosts before DS4 backend implementation should cross the hardware decision gate.
+## 2026-08-04 — Prepare reproducible RX/ROCm gates
+- **What:** Reconciled the missing RX interrupt-suppression work as backward-compatible zero-copy patch 4 (`POST_RX_FLAGS` with final-frame interrupt mode), with automatic userspace fallback to legacy `POST_RX`. Added `tools/rocm-map/tbstream-hip-map`, which safely tests GPU read/write access to TX pool pages without touching NHI-owned RX pages. Fixed `host-build.sh` to incrementally apply all eight backport and four zero-copy patches.
+- **Why:** The logged deployed behavior was not reproducible from the repository, the build script stopped after the base backport, and the consumer's stack-temporary bindings cannot own persistent NHI mappings or safely demultiplex mixed completions.
+- **Impact:** All offline-applicable userspace, patch, script, and documentation gates pass. The ROCm binary cannot be compiled on the macOS development host because `hipcc` is unavailable; patches 3/4, `ztx`/`zrx`, and the ROCm mapping gate require an explicitly authorized rollout to the two Linux hosts before backend implementation should cross the hardware decision gate.
 
 ## 2026-08-04 — Add one-way zero-copy benchmark modes and harden slot ownership
 - **What:** Added `ztx`/`zrx` to `tools/pingpong` for one-way zero-copy throughput, with full TX-completion draining, message-geometry checks, and optional bit-pattern verification. Fixed batched `REAP` handling that could discard trailing RX events, hardened numeric parsing and sub-8-byte verification, added strict macOS/Linux builds, and documented the implemented zero-copy series. Added patch 3 requiring exclusive zero-copy device ownership so separate opens cannot share and corrupt device-wide slot cursors.
@@ -775,13 +214,13 @@ Running log of noteworthy work; newest first.
 - **Impact:** Offline build and read/write socketpair tests pass. The new zero-copy modes and exclusivity patch still need deployment on the two Linux hosts for hardware measurement. The historical RX-interrupt-suppression note is now represented by backward-compatible patch 4; its exact compatibility with any host-only prototype must be checked during rollout.
 
 ## 2026-08-02 19:18 — Ship zero-copy slot mode; CPU and interrupts halve, RTT is an echo artifact
-- **What:** Implemented, deployed, and measured the zero-copy UAPI (`kernel/zerocopy/` 2-patch series): `RING_FRAME_NO_INTERRUPT` in nhi.c, mmap'd frame pools + `SUBMIT_TX`/`POST_RX`/`REAP` ioctls + `TBSTREAM_DATA_MORE` message delimiting in stream.c, `zping`/`zpong` in pingpong. Verified bit-exact end-to-end. In parallel, an agent landed the DS4 transport vtable (`ds4_transport.[ch]`, TCP backend byte-identical, NHI stub) on `rocm-mxfp4-experts`; clean build, 98/98 placement tests.
-- **Why:** Plan step 3. At 1 MiB the echo side spends **-48% CPU** (0.473→0.245 s/1000 msgs) and **-48% interrupts** (~269→~139/msg) at wire-parity throughput. RTT is parity-to-13%-worse — NOT a transport regression: rw `pong` pipelines within a message via per-frame wakeups while zc REAP is per-message store-and-forward, which matches DS4's real consume-whole-tensor pattern (full analysis in `bench/results/2026-08-02-usb4stream-zc.md`).
-- **Impact:** Gotchas: configfs stream groups pin `thunderbolt_stream` — rmdir before module reload (host-install.sh handles it now); stream configfs settings reset on reconfigure (a "tuned" comparison silently ran at default throttling once). v2: `POST_RX` flag to suppress all-but-every-k-th RX interrupt (~139→~2/msg). Next: `ztx`/`zrx` one-way modes, DS4 NHI backend on the new UAPI, `hipHostRegister()` gate (plan step 4). DS4 note: worker WORK-frame receive is a fused control+bulk read; needs restructuring when NHI framing lands.
+- **What:** Implemented, deployed, and measured the zero-copy UAPI (`kernel/zerocopy/` 2-patch series): `RING_FRAME_NO_INTERRUPT` in nhi.c, mmap'd frame pools + `SUBMIT_TX`/`POST_RX`/`REAP` ioctls + `TBSTREAM_DATA_MORE` message delimiting in stream.c, `zping`/`zpong` in pingpong. Verified bit-exact end-to-end.
+- **Why:** Plan step 3. At 1 MiB the echo side spends **-48% CPU** (0.473→0.245 s/1000 msgs) and **-48% interrupts** (~269→~139/msg) at wire-parity throughput. RTT is parity-to-13%-worse — NOT a transport regression: rw `pong` pipelines within a message via per-frame wakeups while zc REAP is per-message store-and-forward, which matches a real consume-whole-buffer pattern.
+- **Impact:** Gotchas: configfs stream groups pin `thunderbolt_stream` — rmdir before module reload (host-install.sh handles it now); stream configfs settings reset on reconfigure (a "tuned" comparison silently ran at default throttling once). v2: `POST_RX` flag to suppress all-but-every-k-th RX interrupt (~139→~2/msg). Next: `ztx`/`zrx` one-way modes, an NHI backend on the new UAPI, and the `hipHostRegister()` gate (plan step 4).
 ## 2026-08-02 18:54 — First USB4STREAM data between hosts; decision gate 1 passed
-- **What:** Backported stack live on both maxes; stream `ds4` on service 1-2.1 → `/dev/tbstream0`. Verified pingpong: 4 KiB QD1 RTT **22.9 µs p50** (TCP ICMP floor: 64 µs, ~2.8×), bulk ~1.15 GB/s = TCP parity. Ring 4096 / throttling 0 tuning was near-noise → cost is per-4KiB-frame copy/processing (~4.4 µs/frame at 64 KiB), exactly what the zero-copy UAPI targets. Full tables in `bench/results/2026-08-02-usb4stream-stock.md`.
+- **What:** Backported stack live on both maxes; a stream on service 1-2.1 → `/dev/tbstream0`. Verified pingpong: 4 KiB QD1 RTT **22.9 µs p50** (TCP ICMP floor: 64 µs, ~2.8×), bulk ~1.15 GB/s = TCP parity. Ring 4096 / throttling 0 tuning was near-noise → cost is per-4KiB-frame copy/processing (~4.4 µs/frame at 64 KiB), exactly what the zero-copy UAPI targets. Measured 2026-08-02 on the lab host pair.
 - **Why:** Plan step 2 (stock baseline) and decision gate 1: stock materially beats TCP on latency → zero-copy kernel work is justified.
-- **Impact:** Gotchas: max2's post-install boot loaded stock `thunderbolt.ko` (initramfs-era load; broke dependent modules, TB net down) — fixed by live reload + `dracut -f`, but watch both hosts' next reboots. Concurrent readers on one tbstream fd steal frames (incl. CLOSE) — `pkill -f pingpong` before reconfiguring; `ring_size`/`throttling` EBUSY while any fd is open. Next: `RING_FRAME_NO_INTERRUPT` nhi.c change + mmap slot-pool UAPI + `pingpong zc`; DS4 transport abstraction can proceed on the Mac.
+- **Impact:** Gotchas: max2's post-install boot loaded stock `thunderbolt.ko` (initramfs-era load; broke dependent modules, TB net down) — fixed by live reload + `dracut -f`, but watch both hosts' next reboots. Concurrent readers on one tbstream fd steal frames (incl. CLOSE) — `pkill -f pingpong` before reconfiguring; `ring_size`/`throttling` EBUSY while any fd is open. Next: `RING_FRAME_NO_INTERRUPT` nhi.c change + mmap slot-pool UAPI + `pingpong zc`.
 ## 2026-08-02 18:21 — Backport compiles on hosts; fix cross-module MODPOST
 - **What:** First host build of the resolved series: `thunderbolt.ko` + `thunderbolt_stream.ko` compiled and linked clean on both maxes — the hand-resolved conflicts are compile-proven. `thunderbolt-net.ko` failed MODPOST (`tb_ring_throttling` undefined): it's built as a separate `M=` invocation and can't see symbols the freshly built thunderbolt.ko exports. Fixed in `host-build.sh` with `KBUILD_EXTRA_SYMBOLS=$SRC/drivers/thunderbolt/Module.symvers`.
 - **Why:** Stock Module.symvers (kernel-devel) predates the backport's new exports; any two-stage external build with cross-module deps needs the first stage's symvers passed explicitly.
@@ -791,9 +230,9 @@ Running log of noteworthy work; newest first.
 - **Why:** MODVERSIONS is off on Fedora → only exact vermagic match needed (LOCALVERSION=-101.fc43.x86_64 against vanilla v7.1.5). Gotcha: **max2 has Secure Boot + lockdown=integrity** (max does not) — unsigned modules won't load; needs MOK enrollment (host-sign.sh prepares it) or SB disabled in BIOS, either way a physical-console step.
 - **Impact:** max can go end-to-end today; max2 blocks the two-sided stream smoke test until the user does the console step. The 64 µs avg RTT is the small-packet floor the NHI stream must beat at QD1.
 ## 2026-08-02 16:54 — Confirm NHI core change is required; map Mac-buildable work
-- **What:** Verified in source that `ring_write_descriptors()` (`drivers/thunderbolt/nhi.c:245`) hardcodes `RING_DESC_POSTED | RING_DESC_INTERRUPT` on every descriptor — no client control. Also confirmed ds4 builds natively on this Mac (arm64/Metal) and Docker/Colima/Lima are available for Linux kernel compile-checks.
+- **What:** Verified in source that `ring_write_descriptors()` (`drivers/thunderbolt/nhi.c:245`) hardcodes `RING_DESC_POSTED | RING_DESC_INTERRUPT` on every descriptor — no client control. Also confirmed Docker/Colima/Lima are available for Linux kernel compile-checks.
 - **Why:** Settles the plan's open question: per-message TX completion interrupts for the zero-copy transport need a small nhi.c core change (a `no_interrupt` flag on `struct ring_frame`); RX side must instead use the existing `throttling` knob/busy-poll since RX descriptors are pre-posted before message boundaries are known.
-- **Impact:** Work order while hosts are busy: container compile-verify of the hand-resolved backport series, then DS4 transport abstraction (Mac-native, TCP loopback testable). Gotcha: the kernel tree is subtly broken on macOS's case-insensitive FS (`xt_CONNMARK.h`/`xt_connmark.h` collide → phantom diffs in `linux/`); kernel container builds must clone inside the container FS, never bind-mount the Mac checkout.
+- **Impact:** Work order while hosts are busy: container compile-verify of the hand-resolved backport series, then the consumer transport abstraction (Mac-native, TCP loopback testable). Gotcha: the kernel tree is subtly broken on macOS's case-insensitive FS (`xt_CONNMARK.h`/`xt_connmark.h` collide → phantom diffs in `linux/`); kernel container builds must clone inside the container FS, never bind-mount the Mac checkout.
 
 ## 2026-08-02 16:23 — Scaffold repo and produce verified USB4STREAM backport series
 - **What:** Scaffolded the repo (plan doc, kernel/, tools/, bench/), sparse-cloned mainline, and extracted the USB4STREAM work as a 9-commit series ending at `6db21d81`. Test-applied it on v7.1 with `git am -3`, resolved 3 conflicts (property.c `depth` param; xdomain.c hunks from unrelated refactors `4d5fc3f4`/`8b406099` not in the series), dropped the KUnit-only patch, and saved a clean-applying 8-patch series to `kernel/backport/v7.1/`. Wrote and loopback-tested `tools/pingpong` plus ConfigFS setup/bench scripts.

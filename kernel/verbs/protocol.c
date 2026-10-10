@@ -119,12 +119,20 @@ static struct sn_header sn_out_header(struct sn_qp *q, u32 opcode)
 	h.src_epoch = q->binding.local_epoch; h.dst_epoch = q->binding.peer_epoch;
 	return h;
 }
-/* Large SENDs go header-less on the data ring when the peer advertised
- * SN_CAP_ZDATA; everything else uses the staged control-ring path. */
+/* Large SENDs and WRITEs go header-less on the data ring when the peer
+ * advertised SN_CAP_ZDATA; everything else uses the staged control-ring path.
+ * A header-less frame never spans a page, so the local source must be frame
+ * aligned; a WRITE must also name a frame-aligned remote destination, because
+ * the responder posts that MR's pages directly. An unaligned WRITE stays on
+ * the staged path rather than being rejected. */
 static bool sn_zc_eligible(struct sn_device *d, struct sn_wqe *w)
 {
-	return d->zdata && d->peer_zc && w->opcode == SN_SEND &&
-	       w->length > SN_ZC_THRESHOLD && !(w->address & (SN_FRAME - 1));
+	if (!d->zdata || !d->peer_zc || w->length <= SN_ZC_THRESHOLD ||
+	    (w->address & (SN_FRAME - 1)))
+		return false;
+	if (w->opcode == SN_SEND)
+		return true;
+	return w->opcode == SN_WRITE && !(w->remote_address & (SN_FRAME - 1));
 }
 /* Returns nonzero after a full control queue failed the QP; the flush has
  * already retired every SQ/RQ WQE, so callers must not touch them again. */
@@ -156,6 +164,7 @@ void sn_engine_reset(struct sn_qp *q)
 	q->have_last_read = q->rnr_wait = q->credit_sent = false;
 	q->zc_state = SN_ZC_NONE; q->zc_offset = 0;
 	q->zc_expect = false; q->zc_total = q->zc_received = 0;
+	q->zc_mr = NULL; q->zc_address = 0;
 	memset(&q->receive, 0, sizeof(q->receive));
 	memset(&q->read_receive, 0, sizeof(q->read_receive));
 	/* Reclaim the data rings so this aborted burst cannot leave posted RX
@@ -240,11 +249,14 @@ static void sn_request_error(struct sn_qp *q, const struct sn_header *h, u32 sta
 	sn_mr_put(q->remote_mr); q->remote_mr = NULL;
 }
 /* Receiver: a zero-copy burst descriptor arrived on the control ring. The
- * payload will land header-less on the data ring directly in the matched
- * receive WQE's MR; only accounting happens here. */
+ * payload will land header-less on the data ring -- in the matched receive
+ * WQE's MR for SN_ZC_SEND, in the requester-addressed remote MR for
+ * SN_ZC_WRITE; only accounting happens here. */
 static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 {
 	struct sn_device *d = sn_dev(q->ib.device);
+	u64 target_address = 0;
+	struct sn_mr *target = NULL;
 	struct sn_wqe *w;
 
 	if (q->receive.have_replay && h->sequence == q->receive.replay.sequence) {
@@ -268,20 +280,42 @@ static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 			sn_ack(q, SN_ZC_READY, h->sequence, 0);
 		return;
 	}
-	if (!q->rq_count) { d->rnr_sent++; sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
-	w = &q->rq[q->rq_head];
-	if (h->total > w->length || (w->address & (SN_FRAME - 1))) {
-		sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
-		sn_mr_put(w->mr); w->mr = NULL;
-		q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
-		sn_request_error(q, h, SN_LENGTH);
-		sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
+	if (h->opcode == SN_ZC_WRITE) {
+		/* A WRITE names its own landing zone, so it consumes no receive WQE
+		 * and can never be RNR. Frame alignment is the requester's job
+		 * (sn_zc_eligible); refuse it here so a non-conforming peer cannot
+		 * make us post unaligned burst pages. Rejection keeps the retained
+		 * status, exactly like the staged WRITE path. */
+		if (!(q->attr.qp_access_flags & IB_ACCESS_REMOTE_WRITE) ||
+		    (h->address & (SN_FRAME - 1))) {
+			sn_request_error(q, h, SN_ACCESS); return;
+		}
+		target = sn_mr_get(q, h->rkey, h->address, h->total,
+				   IB_ACCESS_REMOTE_WRITE);
+		if (!target) { sn_request_error(q, h, SN_ACCESS); return; }
+		/* Owned until the burst lands or the QP is reset; the data ring may
+		 * still be writing into it, so it must outlive this call. */
+		q->remote_mr = target;
+		target_address = h->address;
+	} else {
+		if (!q->rq_count) { d->rnr_sent++; sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
+		w = &q->rq[q->rq_head];
+		if (h->total > w->length || (w->address & (SN_FRAME - 1))) {
+			sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
+			sn_mr_put(w->mr); w->mr = NULL;
+			q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
+			sn_request_error(q, h, SN_LENGTH);
+			sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
+		}
+		target = w->mr;
+		target_address = w->address;
 	}
 	q->assembly_deadline = ktime_get_ns() + 30000000000ULL;
 	q->response_active = false;
 	q->receive.operation = *h; q->receive.received = 0; q->receive.active = 1;
 	q->zc_expect = true; q->zc_total = h->total; q->zc_received = 0;
-	if (sn_data_recv_start(d, q, w)) {
+	q->zc_mr = target; q->zc_address = target_address;
+	if (sn_data_recv_start(d, q)) {
 		q->receive.active = 0; q->zc_expect = false;
 		sn_qp_error(q, IB_WC_GENERAL_ERR); return;
 	}
@@ -297,6 +331,8 @@ static void sn_receive_zc_ready(struct sn_qp *q, const struct sn_header *h)
  * burst. Called by the platform receive path under d->lock. */
 void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 {
+	struct sn_device *d = sn_dev(q->ib.device);
+	bool write = q->receive.operation.opcode == SN_ZC_WRITE;
 	struct sn_wqe *w;
 	int ret;
 
@@ -304,16 +340,26 @@ void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 	q->zc_received += bytes;
 	if (q->zc_received > q->zc_total) { sn_qp_error(q, IB_WC_GENERAL_ERR); return; }
 	if (q->zc_received < q->zc_total) return;
-	w = &q->rq[q->rq_head];
-	ret = sn_complete(q, w, true, IB_WC_SUCCESS, q->zc_total);
-	sn_mr_put(w->mr); w->mr = NULL;
-	q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
-	if (ret) {
-		sn_request_error(q, &q->receive.operation, SN_ACCESS);
-		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
+	/* The burst landed. Drop the landing zone first: either completion path can
+	 * re-enter the data ring, and a retired WQE or MR must never be posted
+	 * again. A WRITE placement retires the requester's remote MR and consumes
+	 * no receive WQE, so it produces no receive CQE. */
+	q->zc_mr = NULL; q->zc_address = 0;
+	if (write) {
+		sn_mr_put(q->remote_mr); q->remote_mr = NULL;
+		d->write_bytes += q->zc_total;
+	} else {
+		w = &q->rq[q->rq_head];
+		ret = sn_complete(q, w, true, IB_WC_SUCCESS, q->zc_total);
+		sn_mr_put(w->mr); w->mr = NULL;
+		q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
+		if (ret) {
+			sn_request_error(q, &q->receive.operation, SN_ACCESS);
+			sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
+		}
+		d->send_bytes += q->zc_total;
 	}
-	sn_dev(q->ib.device)->send_bytes += q->zc_total;
-	sn_dev(q->ib.device)->zc_bursts++;
+	d->zc_bursts++;
 	sn_operation_commit(&q->receive, SN_OK);
 	q->zc_expect = false;
 	sn_ack(q, SN_ACK, q->receive.replay.sequence, SN_OK);
@@ -421,7 +467,7 @@ void sn_engine_receive(struct sn_device *d, const void *frame, size_t bytes)
 	switch (h.opcode) {
 	case SN_ACK: case SN_READ_ACK: sn_receive_ack(q, &h); break;
 	case SN_ZC_READY: sn_receive_zc_ready(q, &h); break;
-	case SN_ZC_SEND: sn_receive_zc(q, &h); break;
+	case SN_ZC_SEND: case SN_ZC_WRITE: sn_receive_zc(q, &h); break;
 	case SN_READ_REPLY: sn_receive_read_reply(q, &h, frame + SN_HEADER); break;
 	case SN_SEND: case SN_WRITE: case SN_READ:
 		sn_receive_request(q, &h, frame + SN_HEADER); break;
@@ -558,7 +604,11 @@ void sn_engine_progress(struct sn_device *d)
 	if (sn_zc_eligible(d, w)) {
 		switch (q->zc_state) {
 		case SN_ZC_NONE:
-			h.opcode = SN_ZC_SEND; h.address = 0; h.rkey = 0;
+			/* A ZC SEND lands in a buffer the peer posted, so it names no
+			 * remote MR; a ZC WRITE must keep address/rkey so the responder
+			 * places the header-less payload in the requester's MR. */
+			h.opcode = w->opcode == SN_WRITE ? SN_ZC_WRITE : SN_ZC_SEND;
+			if (h.opcode == SN_ZC_SEND) { h.address = 0; h.rkey = 0; }
 			ret = sn_ring_send(d, &h, NULL, false);
 			if (!ret) {
 				q->zc_state = SN_ZC_WAIT; q->zc_offset = 0;

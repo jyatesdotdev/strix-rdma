@@ -86,7 +86,7 @@ int main(void)
 	assert(sn_rnr_timeout_ns(12) == 640000);
 	assert(sn_rnr_timeout_ns(0) == 655360000);
 	assert(!sn_rnr_timeout_ns(32));
-	puts("ok 3 - exact verbs ACK/RNR timer conversions, including DS4 values");
+	puts("ok 3 - exact verbs ACK/RNR timer conversions, including timeout 14 and min_rnr_timer 12");
 	for (i = 0; i <= 6; i++) {
 		retries = 0;
 		while (sn_retry_take(&retries, i)) assert(retries <= i);

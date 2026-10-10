@@ -129,17 +129,69 @@ static void test_opcodes(void)
 	h = header(); h.total = 1; assert(!sn_header_valid(&h));
 	puts("ok 6 - all opcodes roundtrip with canonical operation-specific fields");
 }
+/* The two zero-copy burst descriptors differ only in whether they name a remote
+ * MR: a SEND lands in a buffer the responder posted, a WRITE lands in the
+ * requester's MR, so address/rkey are forbidden for one and required for the
+ * other. Both are header-less -- no length, no offset, no inline payload. */
+static void test_zc_descriptors(void)
+{
+	struct sn_header h = header(), got;
+	sn_u8 p[SN_FRAME];
+
+	h.opcode = SN_ZC_SEND; h.total = SN_MESSAGE;
+	assert(sn_header_valid(&h));
+	assert(!sn_encode(p, sizeof(p), &h) && !sn_decode(&got, p, SN_HEADER));
+	assert(!memcmp(&got, &h, sizeof(h)));
+	h.rkey = 7; assert(!sn_header_valid(&h)); h.rkey = 0;
+	h.address = SN_FRAME; assert(!sn_header_valid(&h)); h.address = 0;
+	h.length = 1; assert(!sn_header_valid(&h)); h.length = 0;
+	h.offset = 1; assert(!sn_header_valid(&h)); h.offset = 0;
+	h.status = SN_ACCESS; assert(!sn_header_valid(&h)); h.status = SN_OK;
+	h.ack_sequence = 1; assert(!sn_header_valid(&h)); h.ack_sequence = 0;
+	h.sequence = 0; assert(!sn_header_valid(&h)); h.sequence = 0xffffff;
+	h.total = 0; assert(!sn_header_valid(&h)); h.total = SN_MESSAGE;
+
+	h.opcode = SN_ZC_WRITE;
+	assert(!sn_header_valid(&h));
+	h.address = SN_FRAME; assert(!sn_header_valid(&h));
+	h.rkey = 7; assert(sn_header_valid(&h));
+	h.address = 0; assert(sn_header_valid(&h));
+	h.address = ~(sn_u64)0; assert(!sn_header_valid(&h));
+	h.address = SN_FRAME;
+	assert(!sn_encode(p, sizeof(p), &h) && !sn_decode(&got, p, SN_HEADER));
+	assert(!memcmp(&got, &h, sizeof(h)));
+	assert(got.opcode == SN_ZC_WRITE && got.rkey == 7 && got.address == SN_FRAME &&
+	       got.total == SN_MESSAGE && !got.length && !got.offset);
+	h.length = 1; assert(!sn_header_valid(&h)); h.length = 0;
+	h.offset = 1; assert(!sn_header_valid(&h)); h.offset = 0;
+	h.status = SN_ACCESS; assert(!sn_header_valid(&h)); h.status = SN_OK;
+	h.ack_sequence = 1; assert(!sn_header_valid(&h)); h.ack_sequence = 0;
+	h.sequence = 0; assert(!sn_header_valid(&h)); h.sequence = 0xffffff;
+	h.rkey = 0; assert(!sn_header_valid(&h)); h.rkey = 7;
+	h.total = 0; assert(!sn_header_valid(&h));
+	h.total = SN_MESSAGE + 1; assert(!sn_header_valid(&h)); h.total = SN_MESSAGE;
+
+	h = header(); h.opcode = SN_ZC_READY; h.sequence = 0; h.ack_sequence = 0xffffff;
+	assert(sn_header_valid(&h));
+	assert(!sn_encode(p, sizeof(p), &h) && !sn_decode(&got, p, SN_HEADER));
+	assert(!memcmp(&got, &h, sizeof(h)));
+	h.total = 1; assert(!sn_header_valid(&h)); h.total = 0;
+	h.sequence = 1; assert(!sn_header_valid(&h)); h.sequence = 0;
+	h.rkey = 1; assert(!sn_header_valid(&h)); h.rkey = 0;
+	h.address = SN_FRAME; assert(!sn_header_valid(&h));
+	puts("ok 7 - zero-copy descriptors: ZC_WRITE requires rkey/address, ZC_SEND forbids them");
+}
 int main(void)
 {
 	unsigned int id;
 
-	puts("1..7");
-	test_codec(); test_admission(); test_opcodes();
+	puts("1..8");
+	test_codec(); test_admission(); test_opcodes(); test_zc_descriptors();
 	assert(sn_crc((const sn_u8 *)"123456789", 9) == 0xe3069283U);
 	for (id = 0; id <= 0xffff; id++) {
 		assert(sn_supported_nhi(0x1022, id) == (id == 0x158d || id == 0x158e));
 		assert(sn_supported_nhi(id, 0x158e) == (id == 0x1022));
 	}
-	puts("ok 7 - CRC32C reference vector and exhaustive admitted PCI identity predicate");
+	puts("ok 8 - CRC32C reference vector and exhaustive admitted PCI identity predicate");
 	return 0;
 }

@@ -9,7 +9,7 @@ Subject: [PATCH 2/2] RDMA: add opt-in experimental native NHI software verbs
 
 Apply after the v7.1 backport, zero-copy series20, and the opt-in native
 path-lifetime core patch. This patch only adds the new native driver. Default off; no module-device alias; enable=1 is required.
-This implementation is experimental and has not passed hardware/DS4 gates.
+This implementation is experimental and has not passed hardware qualification gates.
 Canonical source and validation boundaries are in kernel/verbs/README.md.
 
 ---

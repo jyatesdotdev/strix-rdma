@@ -8,7 +8,7 @@
 
 ## Bottom line
 
-It is **not physically impossible** to move DS4 payloads between the two Strix
+It is **not physically impossible** to move payloads between the two Strix
 Halo GPUs through the USB4 NHI without a CPU payload copy. The repository has
 already demonstrated the following two-sided path with NHI-owned system pages:
 
@@ -40,7 +40,7 @@ are absent from the NHI descriptor and transport hardware.
 ## What is already proven in this repository
 
 The current zero-copy stream driver allocates ordinary pages, DMA-maps them for
-the NHI, mmaps them into DS4, and registers the complete mapping with ROCm using
+the NHI, mmaps them into the consumer, and registers the complete mapping with ROCm using
 `hipHostRegister(..., hipHostRegisterMapped)`. Relevant implementation and
 evidence:
 
@@ -50,13 +50,13 @@ evidence:
   16 MiB TX pool.
 - `tools/rocm-map/tbstream-hip-zc.cu`: GPU-produced bytes are handed to NHI and
   verified on the peer.
-- `bench/results/2026-08-04-usb4stream-zc-oneway-rocm.md`: mapped-pool gate.
-- `bench/results/2026-08-05-nhi-msix-rx-prime-fix.md`: 2,880 exact asymmetric
-  exchanges over 27 sessions and passing mapped full-model runs after the MSI-X
-  and ring-start fixes.
-- `bench/results/2026-08-05-ds4-nhi-direct-slot-profile.md` and
-  `bench/results/2026-08-06-ds4-rocm-event-profile.md`: graph kernels execute
-  against mapped NHI slot aliases in the direct mode.
+- Mapped-pool gate: the full 16 MiB TX pool read and written correctly by both
+  GPUs (measured 2026-08-04 on the lab host pair).
+- 2,880 exact asymmetric exchanges over 27 sessions, and passing full-model
+  runs over the mapped path, after the MSI-X and ring-start fixes (measured
+  2026-08-05 on the same pair).
+- Graph kernels executing against mapped NHI slot aliases in the direct mode
+  (measured 2026-08-05 and 2026-08-06).
 
 The direct path is therefore real GPU/NHI access to the same backing pages. It
 is not merely a CPU memcpy hidden behind the API.
@@ -92,7 +92,7 @@ On `max`:
 
 ### The important UMA detail
 
-These machines do not use a large discrete-VRAM allocation for DS4:
+These machines do not use a large discrete-VRAM allocation for a workload:
 
 ```text
 AMDGPU VRAM total:       536,870,912 bytes (512 MiB)
@@ -105,7 +105,7 @@ had about 86.1 GB in use. The boot configuration explicitly supplies a
 126,976 MiB GTT limit. In the AMDGPU source, an APU with VRAM smaller than GTT
 sets `adev->apu_prefer_gtt`; KFD then implements allocations requested as VRAM
 using `AMDGPU_GEM_DOMAIN_GTT`. Consequently, the large native HIP allocations
-used by DS4 are system-memory/GTT pages on this platform, not inaccessible
+used by a GPU workload are system-memory/GTT pages on this platform, not inaccessible
 memory chips behind a discrete GPU BAR.
 
 That removes the main physical objection to direct NHI access: NHI already DMA
@@ -175,7 +175,7 @@ keeps a later VRAM-capable experiment possible.
 ## Source-only follow-up: constraints on the implementation
 
 This follow-up used the local Linux `zerocopy` tree, the applied stream series
-under `/tmp/strix-rdma-final-linux`, and DS4 commit `b6c6edb`. The exact public
+under `/tmp/strix-rdma-final-linux`. The exact public
 source provenance for the installed HIP version is now resolved. AMD's public
 [gfx1151 `rocm_sdk_core-7.13.0` wheel](https://repo.amd.com/rocm/whl/gfx1151/rocm_sdk_core-7.13.0-py3-none-linux_x86_64.whl)
 carries the same
@@ -264,11 +264,11 @@ I/O-coherent path needs any additional NHI-side maintenance is a hardware gate.
 3. Pass fd, fixed direction, offset, and length to a new stream ioctl before
    traffic or path activation.
 4. Keep the HIP allocations logically alive until the stream driver has
-   detached; do not call `hipFree()` while DS4 can use the pointer. The kernel's
+   detached; do not call `hipFree()` while the consumer can use the pointer. The kernel's
    successful `dma_buf_get()` owns its own file reference, so the UAPI must not
    depend on the userspace fd remaining open, although the first gate should
    keep it open for simple lifetime auditing.
-5. Bind DS4's existing external tensor wrappers directly to slot offsets in the
+5. Bind the consumer's existing external tensor wrappers directly to slot offsets in the
    native pools. No `hipHostRegister()` and no intermediate graph tensor should
    be required.
 
@@ -416,8 +416,8 @@ only after the corresponding ring is synchronously quiescent; use success for a
 normal close and a specific terminal error such as `-ECANCELED`, `-ENODEV`, or
 `-EIO` for cancellation, disconnect, or DMA failure. Fence signaling must not
 need the stream mutex or reservation lock. These fences exclude other
-implicit-sync importers; they still do not represent or replace DS4's per-slot
-HIP ownership transitions.
+implicit-sync importers; they still do not represent or replace the consumer's
+per-slot HIP ownership transitions.
 
 Teardown first atomically enters `CLOSING` and rejects all ioctls. A graceful
 close submits the dedicated CLOSE frame and boundedly flushes TX, then disables
@@ -551,8 +551,8 @@ FPGA, or other external endpoint that implements them.
 ## Performance reality
 
 The DMA-BUF path is technically worthwhile as the only remaining route to a
-native-allocation data plane, but it is unlikely to improve the current serial
-DS4 decode materially:
+native-allocation data plane, but it is unlikely to improve a serial
+consumer decode path materially:
 
 - NHI one-way throughput is already about 1.0-1.1 GB/s, near the measured TCP
   bulk rate.
@@ -591,8 +591,8 @@ multiple tokens/batches are in flight, or the boundary becomes larger.
 7. Benchmark an output-head-like native allocation against the existing
    host-registered pool. Continue only if it removes the measured 0.065 ms
    penalty or produces another clear transport win.
-8. Integrate fixed native slots into DS4 only after mapping and synchronization
-   gates pass on both hosts.
+8. Integrate fixed native slots into a consumer only after mapping and
+   synchronization gates pass on both hosts.
 
 All host gates remain paused until the user explicitly says `max` and `max2` are
 safe to use. Do not weaken disconnect handling, IOMMU isolation, bounded
@@ -601,8 +601,8 @@ ceiling.
 
 ## Documentation status
 
-`docs/DS4_INTEGRATION.md`, `docs/PLAN.md`, `docs/INSTALL.md`, `kernel/README.md`,
-and the root `README.md` are updated alongside this record: current DS4 can
+`docs/PLAN.md`, `docs/INSTALL.md`, `kernel/README.md`,
+and the root `README.md` are updated alongside this record: a consumer can
 execute eligible graph boundaries against host-registered lease aliases, while
 native HIP DMA-BUF pools remain a separate, unimplemented experiment with an
 unresolved portable RX-acquire contract.

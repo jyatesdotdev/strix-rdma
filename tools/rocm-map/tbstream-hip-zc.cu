@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /*
- * Exercise the DS4 GPU-to-NHI handoff without loading a model.
+ * Exercise the GPU-to-NHI handoff without loading a model.
  *
  * Start "rx" on the peer first.  The "tx" side writes a 64-byte envelope
  * with the CPU, copies the remaining payload from VRAM into the registered

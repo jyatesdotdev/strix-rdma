@@ -5,8 +5,8 @@ between two hosts. Deep detail lives in [kernel/README.md](../kernel/README.md)
 (backport + zero-copy series), [bench/README.md](../bench/README.md)
 (benchmark matrix), and
 [tools/systemd/tbstream-lifecycle.md](../tools/systemd/tbstream-lifecycle.md)
-(managed lifecycle). This file is the ordered checklist that ties them
-together.
+(endpoint bring-up and teardown rules). This file is the ordered checklist that
+ties them together.
 
 ## Tested configuration
 
@@ -23,9 +23,9 @@ must run on the hosts themselves.
 ## 1. Build the userspace tools
 
 ```sh
-make            # tools/pingpong/pingpong, tools/ds4-shape/tbstream-ds4-gate
+make            # tools/pingpong/pingpong, tools/dmabuf-probe/tbstream-dmabuf-probe
 make rocm       # tools/rocm-map/* (needs hipcc; auto-detects /opt/rocm*)
-make check      # no-hardware test suite: selftest, lifecycle mocks, python
+make check      # no-hardware test suite: device access policy, UAPI contracts
 ```
 
 ## 2. Get USB4STREAM into the kernel (both hosts)
@@ -60,60 +60,45 @@ and a sparse v7.1.5 + backport `check-kernel` job.
 ## 3. Device access policy (both hosts)
 
 `/dev/tbstreamN` defaults to `0600 root:root`. Do not run workloads as root;
-use the scoped udev rule and a dedicated group:
+use the scoped udev rule and a dedicated group. The stream UAPI mmaps
+DMA-mapped pages, so the rule grants `0660 root:tbstream` and must never be
+widened to world-writable:
 
 ```sh
+sudo make install-lifecycle                 # rule + lifecycle doc
 sudo groupadd --force --system tbstream
 sudo usermod -aG tbstream "$(id -un)"       # new login session required
-sudo install -m 0644 tools/udev/99-tbstream.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --action=change --subsystem-match=misc --sysname-match='tbstream*'
 ```
 
-(Installed automatically by `make install-lifecycle` in step 4b.)
-
-## 4a. Bring up a stream — lab/manual (do not mix with 4b)
-
-Lab-only and mutually exclusive with the managed lifecycle in 4b.
-`tbstream-setup.sh` allocates HopIDs automatically and refuses to run when
-`/etc/sysconfig/ds4-tbstream` or `/run/ds4-tbstream/device` exists
-(`TBSTREAM_SETUP_FORCE=1` overrides). Do not use it on a live managed pair:
-that can steal `thunderbolt-net` HopIDs.
-
-With the cable connected and `thunderbolt_stream` loaded on both ends:
+The rule alone, without the doc install:
 
 ```sh
-hostA$ sudo tools/scripts/tbstream-setup.sh ds4    # prints /dev/tbstreamX
-hostB$ sudo tools/scripts/tbstream-setup.sh ds4    # same name on both sides
+sudo install -m 0644 tools/udev/99-tbstream.rules /etc/udev/rules.d/
 ```
 
-`RING_SIZE=4096` and `THROTTLING=0` env vars matter at QD1; see
-[bench/README.md](../bench/README.md). The kernel defaults are already
-4096/0 after patches 17/19.
+## 4. Bring up a stream
 
-## 4b. Bring up a stream — managed lifecycle (recommended for repeated use)
-
-The fail-closed systemd/udev lifecycle converges the endpoint at boot and on
-peer hotplug, and publishes a stable path at `/run/ds4-tbstream/device`.
-Exactly one endpoint is the allocator:
+`tbstream-setup.sh` creates the ConfigFS endpoint, writes ring size and
+interrupt throttling before the HopIDs activate the stream, and prints the
+device path. The stream name must match on both sides:
 
 ```sh
-hostA$ sudo make install-lifecycle ROLE=allocator
-hostB$ sudo make install-lifecycle ROLE=follower
+hostA$ sudo tools/scripts/tbstream-setup.sh link    # prints /dev/tbstreamX
+hostB$ sudo tools/scripts/tbstream-setup.sh link    # same name on both sides
 ```
 
-Review `/etc/sysconfig/ds4-tbstream` on each host (HopIDs, `TBSTREAM_NETDEV`),
-then on both:
+It refuses to create a second endpoint when one already exists, because
+automatic HopID allocation can take a path `thunderbolt-net` needs;
+`TBSTREAM_SETUP_FORCE=1` overrides. `RING_SIZE=4096` and `THROTTLING=0` env
+vars matter at QD1 (see [bench/README.md](../bench/README.md)); the kernel
+defaults are already 4096/0 after the zero-copy series.
 
-```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now ds4-tbstream-reconcile.timer
-sudo systemctl start ds4-tbstream-reconcile.service
-cat /run/ds4-tbstream/device        # e.g. /dev/tbstream0
-```
-
-Semantics, holder locking, and cleanup rules:
+Read the teardown and wedge rules before running anything long-lived:
 [tools/systemd/tbstream-lifecycle.md](../tools/systemd/tbstream-lifecycle.md).
+Transmitting toward a peer whose device is not open and enabled can wedge the
+whole XDomain connection, Thunderbolt-IP included.
 
 ## 5. Smoke test the link
 
@@ -145,36 +130,29 @@ tools/rocm-map/tbstream-hip-map /dev/tbstream0
 
 This does not exercise the separate native `hipMalloc` DMA-BUF importer
 experiment described in
-[GPU_TO_GPU_FEASIBILITY.md](GPU_TO_GPU_FEASIBILITY.md).
+[GPU_TO_GPU_FEASIBILITY.md](GPU_TO_GPU_FEASIBILITY.md). That path is
+diagnostic-gated: it needs `thunderbolt_stream.zc_diagnostic_dmabuf=1` set
+explicitly, `CAP_SYS_RAWIO`, and the series-20 module installed under
+`/lib/modules/$(uname -r)/updates/` and in the initramfs
+(`dracut --force --kver "$(uname -r)"` on the tested Fedora hosts). Keep the
+parameter off for ordinary deployments.
 
-## 7. DS4 integration
+## 7. Native verbs path (optional, default-off)
 
-The transport contract for the DS4 inference stack is
-[docs/DS4_INTEGRATION.md](DS4_INTEGRATION.md). Descriptor-framed
-protocol-v3 TCP (`--dist-transport auto`, no `--dist-nhi-device`) remains
-the interoperability baseline. The two-node tensor-parallel NHI path now
-has a production-shaped systemd example set:
+The verbs stack is a separate service with its own bring-up and its own
+conflict with the stream setup above — zero-copy mode blacklists
+`thunderbolt-net` and claims both ring HopIDs, so the two cannot be enabled on
+the same link at the same time:
 
-- `tools/modprobe.d/ds4-tbstream-zc.conf`
-- `tools/systemd/ds4-mxfp4-worker.tp-nhi.conf.example`
-- `tools/systemd/ds4-mxfp4-server.tp-nhi.conf.example`
+```sh
+sudo tools/scripts/strix-verbs-bringup.sh   # once per boot; read its header first
+make -C tools/verbs                         # smoke tool against installed libibverbs
+```
 
-Layer-slice stays mapped/TCP. Imported DMA-BUF is TP-only and still
-diagnostic-gated; `make install-lifecycle` does not install the zc
-modprobe snippet. Those files are intentionally not installed by
-`make install-lifecycle`: they enable the diagnostic-gated
-`TBSTREAM_ZC_IMPORT` module parameter and grant `CAP_SYS_RAWIO` to the
-DS4 units. Install them only on the pair that runs DS4 with
-`--tensor-parallel --transport nhi`, after patches 14–20 are installed
-under `/lib/modules/.../updates/` and included in the initramfs
-(`dracut --force --kver "$(uname -r)"` on the tested Fedora hosts). Start the
-worker before the coordinator. For teardown, stop the worker first while the
-coordinator keeps its device open; stop the coordinator only after it observes
-the worker close. Leaving TP NHI (complete rollback) must remove
-`/etc/modprobe.d/ds4-tbstream-zc.conf`, run `depmod -a`, rebuild initramfs,
-reload `thunderbolt_stream`, and verify `zc_diagnostic_dmabuf=N`; follow
-[tbstream-lifecycle.md](../tools/systemd/tbstream-lifecycle.md) rather than
-inventing a shorter procedure.
+Prerequisites, the bounded interface contract and the acceptance gates:
+[docs/NATIVE_VERBS.md](NATIVE_VERBS.md). The data plane, its measurements and
+the defects they exposed: [docs/ZEROCOPY_VERBS.md](ZEROCOPY_VERBS.md). Kernel
+patch order and reproduction: [kernel/verbs/README.md](../kernel/verbs/README.md).
 
 ## Troubleshooting
 
@@ -187,9 +165,12 @@ inventing a shorter procedure.
   enrolled MOK.
 - **`EBUSY` on `TBSTREAM_ZC_ENABLE`**: zero-copy must be enabled on a fresh
   open before any legacy I/O; close, reopen, retry.
-- **Stale ConfigFS state**: `sudo /usr/local/libexec/ds4-tbstream-cleanup.sh`
-  (managed installs; sources `/etc/sysconfig/ds4-tbstream`) — it refuses
-  while any holder has the device open, by design.
-- **Stalls/diagnostics**: `TBSTREAM_ZC_GET_STATS` counters and the
-  `tools/ds4-shape/README.md` timeout-capture workflow localize lost
-  interrupts vs. ring stalls.
+- **Stale ConfigFS state**: stop every consumer, then
+  `rmdir /sys/kernel/config/thunderbolt/stream/<service>/<name>`. It refuses
+  while any fd is open, by design. ConfigFS stream groups also pin
+  `thunderbolt_stream`, so remove them before reloading the module.
+- **Stalls/diagnostics**: the `TBSTREAM_ZC_GET_STATS` counters separate lost
+  interrupts from ring stalls. [docs/TP_TRANSPORT_CONTRACT.md](TP_TRANSPORT_CONTRACT.md)
+  lists the ring invariants, and
+  [tools/systemd/tbstream-lifecycle.md](../tools/systemd/tbstream-lifecycle.md)
+  the recovery sequence for a wedged link.

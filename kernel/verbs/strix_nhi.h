@@ -96,6 +96,13 @@ struct sn_qp {
 	u32 zc_offset;
 	bool zc_expect;
 	u32 zc_total, zc_received;
+	/* Landing zone of the burst this side is receiving: the matched receive
+	 * WQE's MR for SN_ZC_SEND, the requester-addressed remote MR for
+	 * SN_ZC_WRITE. Set by sn_receive_zc before sn_data_recv_start and cleared
+	 * the moment the expected byte count lands. Holds no reference of its own:
+	 * the owner is the receive WQE or q->remote_mr, which both outlive it. */
+	struct sn_mr *zc_mr;
+	u64 zc_address;
 };
 struct sn_slot {
 	struct ring_frame frame;
@@ -201,11 +208,11 @@ dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len);
 /* Zero-copy data-plane platform hooks (kernel: ring.c; tests: modeled).
  * sn_data_send_burst queues header-less payload frames for the active SQ op
  * from its MR, returning 0 when the whole message is queued, -EAGAIN when
- * the data ring is full. sn_data_recv_start posts the matched receive WQE's
- * MR pages for the expected burst; sn_data_recv_restart re-posts them from
- * offset zero for a retried burst. */
+ * the data ring is full. sn_data_recv_start posts the q->zc_mr pages at
+ * q->zc_address for the expected burst; sn_data_recv_restart re-posts them
+ * from offset zero for a retried burst. */
 int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
-int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w);
+int sn_data_recv_start(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 /* Abort an in-progress burst and reclaim both data rings (called from
  * sn_engine_reset so an aborted burst cannot poison the rings). */

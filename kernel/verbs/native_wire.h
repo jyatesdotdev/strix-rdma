@@ -30,12 +30,13 @@ typedef uint64_t sn_u64;
 #define SN_PIN_BYTES (32U * 1024U * 1024U)
 #define SN_PSN_MAX 0xffffffU
 
-/* Values and byte offsets are a wire contract, never a C structure layout. */
+/* Values and byte offsets are a wire contract, never a C structure layout.
+ * Existing values are frozen; a new operation takes the next free value. */
 enum sn_opcode {
 	SN_SEND = 1, SN_WRITE = 2, SN_READ = 3, SN_READ_REPLY = 4,
 	SN_ACK = 5, SN_READ_ACK = 6, SN_CREDIT = 7,
 	SN_HELLO = 8, SN_HELLO_ACK = 9, SN_BIND = 10, SN_BIND_ACK = 11,
-	SN_ZC_SEND = 12, SN_ZC_READY = 13
+	SN_ZC_SEND = 12, SN_ZC_READY = 13, SN_ZC_WRITE = 14
 };
 /* HELLO/HELLO_ACK capability bits in total: v1 is SEND/WRITE/READ. */
 #define SN_CAPS_V1 0x7U
@@ -133,10 +134,19 @@ static inline int sn_header_valid(const struct sn_header *h)
 		       !h->ack_sequence && h->rkey &&
 		       h->address <= ~(sn_u64)0 - h->total;
 	case SN_ZC_SEND:
-		/* Zero-copy burst descriptor: total carries the whole message; payload
-		 * follows as header-less frames on the data ring. */
+		/* Zero-copy SEND burst descriptor: total carries the whole message and
+		 * payload follows as header-less frames on the data ring. The landing
+		 * zone is a receive WQE the responder posted, so address/rkey are
+		 * forbidden here exactly as they are for a staged SN_SEND. */
 		return sn_qp_fields_valid(h) && h->total && h->sequence && !h->length &&
 		       !h->offset && !h->address && !h->rkey && !h->status && !h->ack_sequence;
+	case SN_ZC_WRITE:
+		/* Zero-copy WRITE burst descriptor: same header-less data-ring payload,
+		 * but the responder places it in the requester's named remote MR, so
+		 * address/rkey are required exactly as they are for a staged SN_WRITE. */
+		return sn_qp_fields_valid(h) && h->total && h->sequence && !h->length &&
+		       !h->offset && h->rkey && !h->status && !h->ack_sequence &&
+		       h->address <= ~(sn_u64)0 - h->total;
 	case SN_ZC_READY:
 		/* ack_sequence carries the burst operation serial. */
 		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&

@@ -6,23 +6,24 @@
 #   RING_SIZE=4096       TX/RX ring size (32-4096, kernel default 4096)
 #   THROTTLING=          interrupt throttling in ns (kernel default 0);
 #                        empty = leave default
-#   TBSTREAM_SETUP_FORCE=1  override the managed-lifecycle refusal below
+#   TBSTREAM_SETUP_FORCE=1  create the endpoint even if one already exists
 #
-# Lab-only. Do not run this on a host that already has the managed
-# lifecycle (install-lifecycle / /run/ds4-tbstream/device); it allocates
-# HopIDs automatically and can steal thunderbolt-net's path. The stream
-# name must match on both sides.
+# Lab-only. It allocates HopIDs automatically and can steal thunderbolt-net's
+# path, so create the endpoint before Thunderbolt-IP logs in, or accept that
+# the netdev carrier is re-negotiated. The stream name must match on both
+# sides.
 set -euo pipefail
 
-NAME=${1:-ds4}
+NAME=${1:-link}
 BASE=/sys/kernel/config/thunderbolt/stream
 
-if [ "${TBSTREAM_SETUP_FORCE:-}" != 1 ]; then
-    if [ -e /etc/sysconfig/ds4-tbstream ] || [ -e /run/ds4-tbstream/device ]; then
-        echo "error: managed lifecycle is present; use ds4-tbstream-reconcile.sh" >&2
-        echo "       (TBSTREAM_SETUP_FORCE=1 overrides this lab-only guard)" >&2
+if [ "${TBSTREAM_SETUP_FORCE:-}" != 1 ] && [ -d "$BASE" ]; then
+    for existing in "$BASE"/*/*; do
+        [ -e "$existing" ] || continue
+        echo "error: a stream endpoint already exists: $existing" >&2
+        echo "       remove it first, or set TBSTREAM_SETUP_FORCE=1" >&2
         exit 1
-    fi
+    done
 fi
 
 modprobe thunderbolt_stream
@@ -67,6 +68,6 @@ echo "  in_hopid=$(cat "$DIR/in_hopid") out_hopid=$(cat "$DIR/out_hopid")" >&2
 echo "  ring_size=$(cat "$DIR/ring_size") throttling=$(cat "$DIR/throttling")" >&2
 if [ -e "$DEVICE" ] && [ "$(stat -c '%a:%U:%G' "$DEVICE")" = "600:root:root" ]; then
     echo "  note: $DEVICE is root-only; install tools/udev/99-tbstream.rules" >&2
-    echo "        and use the dedicated tbstream group instead of running DS4 as root" >&2
+    echo "        and use the dedicated tbstream group instead of running workloads as root" >&2
 fi
 echo "$DEVICE"

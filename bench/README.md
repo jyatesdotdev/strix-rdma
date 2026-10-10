@@ -1,54 +1,68 @@
 # Benchmarks
 
-The plan's benchmark matrix (docs/PLAN.md) compares three transports with
-identical tensors and model settings:
+How to measure this transport, and what the paths measured on the lab host pair
+(two Strix Halo systems, direct USB4/Thunderbolt cable). There is no committed
+results tree: every figure below states when it was measured, and all of them
+need re-measuring on your own hosts before you rely on them.
+
+The matrix in [docs/PLAN.md](../docs/PLAN.md) compares the paths with identical
+message shapes:
 
 | Transport | Network stack | User/kernel payload copies | Role |
 |---|---:|---:|---|
-| TCP over `thunderbolt-net` | Yes | Yes | Production baseline |
+| TCP over `thunderbolt-net` | Yes | Yes | Ubiquitous baseline |
 | Stock USB4STREAM (`/dev/tbstreamX`) | No | Yes | Low-risk intermediate baseline |
-| NHI stream | No | CPU-copy or mapped, by mode | Qualified experimental candidate |
+| USB4STREAM zero-copy pools | No | No | Mature high-throughput path |
+| Native verbs, CPU-copy staging | No | Yes | Compatibility path for unmodified RDMA apps |
+| Native verbs, zero-copy data plane | No | No | Current fastest measured path |
 
-Measure for each: one-way and round-trip latency at real hidden-state and
-logit sizes; p50/p95/p99/max (not just bandwidth); QD1 and pipelined; batch
-1/2/4/8; prefill and decode separately; CPU util, context switches,
-interrupts, bytes copied; end-to-end tokens/s.
-
-The current release outcome is descriptor-framed protocol-v3 TCP. Select it
-with `--dist-transport auto` and do not supply `--dist-nhi-device`; explicit
-`--dist-transport tcp` selects legacy v2. Supplying an NHI device is reserved
-for explicit single-link qualification while longer soak and active peer-reboot
-testing continue. Zero-copy patches 11 and 12 repair the reproduced asymmetric
-delivery and reopen failures; the initial post-fix gate passes, but the
-controlled full-model cohort shows no NHI tokens/second gain.
+Measure for each: one-way and round-trip latency at the message sizes that
+matter; p50/p95/p99/max, not just bandwidth; QD1 and pipelined; CPU
+utilization, context switches, interrupts, and bytes copied; and a run long
+enough to expose drift and interrupt storms. Every defect recorded in
+[docs/ZEROCOPY_VERBS.md](../docs/ZEROCOPY_VERBS.md) was invisible in short
+runs, and the verbs data plane was bimodal (18–1313 MiB/s) until interrupt
+moderation landed. Do not accept a single run on this link.
 
 ## Step 1 — TCP baseline
 
-On the current 7.1.5 kernels, over the `thunderbolt-net` interface:
+Over the `thunderbolt-net` interface:
 
 - Raw link: `iperf3 -c <peer>` and `iperf3 -c <peer> -l <msgsize>`; latency
-  with `./pingpong` over a TCP socat relay or plain `ping -f` for the floor.
-- DS4 level: run the existing distributed setup (`ds4-bench` in
-  `~/Repositories/ds4`) at batch 1/2/4/8, record tokens/s and time/token.
+  with `ping` for the floor.
+- Application level: run the real workload's transport at its own message
+  sizes and record its throughput and per-message cost.
 - CPU/copies: `pidstat -w -u`, `/proc/interrupts` deltas, `perf stat`.
 
-Record results in `results/` as CSV plus a notes file per run
-(kernel version, cable, ring settings, governor, batch size).
+Measured 2026-09-18 on the lab pair: iperf3 (MTU 65520) reaches
+**9.49–9.51 Gbit/s one-way** and 9.41 + 9.40 Gbit/s full duplex at the default
+`thunderbolt.dma_credits=14`. The credit sweep is the interesting part: 1 gives
+3333 Mbit/s, 4 already gives 9489, and 8/14/64 are indistinguishable — so the
+XDomain DMA-tunnel credit window is *not* the limiter above 4, and the nominal
+20 Gb/s per-direction link rate is not reachable by any path measured so far.
 
 ## Step 2 — Stock USB4STREAM
 
-After the backport (see ../kernel/README.md) on both hosts:
+After the backport (see [../kernel/README.md](../kernel/README.md)) on both
+hosts:
 
-```
-hostA$ sudo ../tools/scripts/tbstream-setup.sh ds4     # prints /dev/tbstreamX
-hostB$ sudo ../tools/scripts/tbstream-setup.sh ds4
+```sh
+hostA$ sudo ../tools/scripts/tbstream-setup.sh link   # prints /dev/tbstreamX
+hostB$ sudo ../tools/scripts/tbstream-setup.sh link
 
 hostB$ ../tools/pingpong/pingpong pong -d /dev/tbstream0 -s 64k
 hostA$ ./scripts/run-pingpong.sh /dev/tbstream0 stock  # or PEER=user@hostB ...
 ```
 
-Sweep `ring_size` (256 vs 4096) and `throttling` (8192 default, then lower)
-via env vars to `tbstream-setup.sh` — both matter at QD1.
+`run-pingpong.sh` sweeps message sizes and writes a CSV; `OUT_DIR` selects the
+destination directory (default: the current directory). Sweep `RING_SIZE`
+(256 vs 4096) and `THROTTLING` via environment — both matter at QD1.
+
+Measured 2026-08-02 on the lab pair: 4 KiB QD1 round trip **22.9 µs p50**
+against a 64 µs average ICMP floor over the same link (~2.8×), and bulk
+~1.15 GB/s, i.e. TCP parity. Ring 4096 / throttling 0 tuning was near-noise,
+which localized the cost to per-4 KiB-frame copy and processing
+(~4.4 µs/frame at 64 KiB) — exactly what the zero-copy UAPI removes.
 
 ## Step 3 — Zero-copy USB4STREAM
 
@@ -64,37 +78,58 @@ hostA$ ../tools/pingpong/pingpong ztx -d /dev/tbstream0 -s 1m -n 1000 -V
 the complete DMA transfer rather than only ioctl submission time. `zrx` checks
 each message's byte/frame geometry and optionally verifies the payload pattern.
 
+Measured 2026-08-04 on the lab pair, one-way verified sender rates:
+**100.5 MB/s at 4 KiB, 512.3 MB/s at 64 KiB, 1052.1 MB/s at 1 MiB**. A
+512 × 1 MiB run reached 955.9 MB/s with 24 aggregate Thunderbolt interrupts
+per host. Measured 2026-09-18: 1078–1117 MB/s one-way at 1 MiB, and
+1146 MB/s at 2 MiB (2026-10-06).
+
 ## Step 4 — ROCm mapping gate
 
 Build and run `../tools/rocm-map/tbstream-hip-map` on each Strix Halo host. It
 registers only the TX pool, then verifies GPU-to-pool and pool-to-GPU access.
-This gate passed for all 16 MiB on both hosts on 2026-08-04; the result is in
-`results/2026-08-04-usb4stream-zc-oneway-rocm.md`. It cleared implementation
-work and showed that a DMA-BUF fallback is not currently required; it is not a
-production-readiness result for the NHI transport.
+This gate passed for all 16 MiB on both hosts on 2026-08-04. It clears
+implementation work and shows that a DMA-BUF fallback is not required for
+CPU-visible GPU access; it is not a production-readiness result for any
+transport path.
 
-The post-fix hardware and full-model evidence is in
-`results/2026-08-05-nhi-msix-rx-prime-fix.md`; per-run data is in
-`results/2026-08-05-ds4-full-model-tps.csv`. The earlier failure baseline and
-TCP release decision remain in
-`results/2026-08-05-ds4-nhi-reliability-and-tcp-release.md`.
-The mapped direct-slot implementation, matched fast-path A/B, and distributed
-decode hot-path ledger are in
-`results/2026-08-05-ds4-nhi-direct-slot-profile.md`.
-The low-overhead in-process ROCm event ledger, full-model GPU operation split,
-profiler overhead A/B, and mapped-output penalty are in
-`results/2026-08-06-ds4-rocm-event-profile.md`; its raw A/B rows are in the
-same-named CSV. Parse saved profiler journals with
-`scripts/analyze-ds4-rocm-events.py`; it emits weighted human-readable or JSON
-summaries and validates segment, ratio-group, direct-mask, and drop accounting.
-The first compute optimization pass, including the negative routed-MoE
-rows-per-wave sweep and the bit-exact Q/KV RMSNorm plus KV-RoPE fusion, is in
-`results/2026-08-06-ds4-rocm-qkv-fusion.md`; its balanced full-model arm and
-host-role aggregates are in the same-named CSV. The fusion improves measured
-internal decode throughput by 0.194% and combined GPU stream time by 0.218%.
+`../tools/rocm-map/tbstream-hip-zc` goes further and hands GPU-written pages
+to the NHI, verifying the bytes on the peer. The two-host imported-pool
+harnesses used for the ring contract live in `../tools/stale-cache/`.
+
+## Step 5 — Native verbs
+
+The verbs path has its own bring-up (`../tools/scripts/strix-verbs-bringup.sh`)
+and its own smoke tool, which is also the latency/throughput probe:
+
+```sh
+make -C ../tools/verbs
+# usage: strix-verbs-smoke --live strix_nhiN listen|connect <explicit-IPv4> <TCP-port>
+#        [bench-iterations | ping [iters] | write [iters] | read [iters]]
+./strix-verbs-smoke --live strix_nhi0 listen  10.99.0.1 18515   # endpoint A
+./strix-verbs-smoke --live strix_nhi0 connect 10.99.0.1 18515   # endpoint B
+# ... appending "ping 2000" for the 256 B RTT probe, or a bare iteration
+# count (e.g. "200") for the window-4 x 2 MiB bidirectional throughput run.
+```
+
+It cannot be compared against the stream path on the same link at the same
+time: zero-copy verbs mode blacklists `thunderbolt-net` and claims both ring
+HopIDs. Run one, tear it down, run the other.
+
+Measured on the lab pair:
+
+| Date | Path | Result |
+|---|---|---|
+| 2026-10-06 | verbs, CPU-copy staging | 62.9 MiB/s per direction (window 4 × 2 MiB bidirectional) — ~16× below the stream path |
+| 2026-10-06 | stream, one-way copy / zero-copy | 1016 MB/s / 1146 MB/s; bidirectional RTT 1086 MB/s effective |
+| 2026-10-10 | verbs, zero-copy data plane | **1182–1238 MiB/s per direction**, 8/8 consecutive runs consistent; 1211 MiB/s sustained over 156 GiB per direction |
+| 2026-10-10 | verbs, 256 B ping-pong RTT (2000 iters) | **31 µs min / 35.1 µs avg / 345 µs max tail** (was ~52 µs avg with a 6.4 ms tail before the resident poller) |
 
 ## Decision gate
 
-If stock USB4STREAM does not materially beat TCP at DS4 message sizes,
-profile GPU staging copies and scheduling before writing the zero-copy
-kernel patch (see docs/PLAN.md "Decision gates").
+If stock USB4STREAM does not materially beat TCP at your message sizes, profile
+the staging copies and scheduling before writing a large kernel patch (see
+[docs/PLAN.md](../docs/PLAN.md) "Decision gates"). And remember the bound:
+application-level gain is limited by the share of the critical path that is
+transport, so a large latency win in this matrix can still be a rounding error
+end to end.

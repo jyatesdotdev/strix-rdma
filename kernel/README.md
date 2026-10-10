@@ -6,8 +6,8 @@
 opt-in core lifetime extension **after** the existing eight backport and twenty
 zero-copy patches. It does not replace or change USB4STREAM behavior. Its normal
 rdma-core provider is in `../providers/strix_nhi/`; limits, CPU-copy semantics,
-Linux build evidence and unrun device/DS4/hardware gates are documented in
-[`docs/NATIVE_VERBS.md`](../docs/NATIVE_VERBS.md). Existing install/lifecycle
+Linux build evidence and unrun device/workload/hardware gates are documented in
+[`docs/NATIVE_VERBS.md`](../docs/NATIVE_VERBS.md). Existing install
 scripts do not activate it. Enabling its conditional core extension requires
 rebuilding the whole Thunderbolt module set together; the USB4STREAM-only
 module procedure below is not a native-verbs deployment procedure.
@@ -100,7 +100,7 @@ Caveats:
 
 ### Least-privilege device access
 
-The misc device defaults to `0600 root:root`. Do not run DS4 as root merely to
+The misc device defaults to `0600 root:root`. Do not run workloads as root merely to
 open a DMA-mapped stream. Install the repository's scoped udev rule and use a
 dedicated group instead:
 
@@ -119,9 +119,8 @@ that the intended account can read and write `/dev/tbstream0`. The rule matches
 only `SUBSYSTEM=="misc"` devices named `tbstreamN`; it intentionally does not
 grant world access.
 
-On the current `max`/`max2` pair this policy is installed and the lifecycle
-publishes `0660 root:tbstream` devices through
-`/run/ds4-tbstream/device`.
+On the current `max`/`max2` pair this policy is installed, so the stream
+endpoints are `0660 root:tbstream`.
 
 ## Zero-copy UAPI (step 3 of the plan)
 
@@ -130,11 +129,10 @@ v7.1 backport. Patches 1–12 are the mapped-pool production module set.
 Only patches 13–14 (DMA-BUF probe and `TBSTREAM_ZC_IMPORT`) are gated by
 `zc_diagnostic_dmabuf`. Patches 15–20 (CLOSE skip, doorbell batching,
 series advertising, 4096-frame / no-ITR defaults, and imported TX sync)
-apply to mapped and imported pools. This pair's TP production enables
-import with an explicit `tools/modprobe.d/ds4-tbstream-zc.conf` plus
-initramfs rebuild — not because 17/19 need that gate, and not via
-`make install-lifecycle`, which never installs that snippet. `p14-swap.sh`
-is a lab helper, not the production path:
+apply to mapped and imported pools. Enabling import is an explicit deploy
+step — `options thunderbolt_stream zc_diagnostic_dmabuf=1` under
+`/etc/modprobe.d/`, `depmod -a`, then an initramfs rebuild — not because
+17/19 need that gate, and never something `make install-lifecycle` does:
 
 1. Add `RING_FRAME_NO_INTERRUPT` so a ring client can suppress completion
    interrupts for non-final frames.
@@ -205,9 +203,8 @@ is a lab helper, not the production path:
     `sdev->closed` under `zc_lock` before send_close.
 
 The original five-patch zero-copy implementation was built, deployed, and
-benchmarked on both test hosts; see
-`../bench/results/2026-08-02-usb4stream-zc.md` and
-`../bench/results/2026-08-04-usb4stream-zc-oneway-rocm.md`. The userspace
+benchmarked on both test hosts (2026-08-02 and 2026-08-04; the measured rates
+are summarized in `../bench/README.md`). The userspace
 `pingpong` tool provides `zping`/`zpong` for RTT and `ztx`/`zrx` for one-way
 throughput. The complete twelve-patch series was independently reviewed, built
 byte-identically, deployed, embedded in both initramfs images, and booted on the
@@ -217,11 +214,11 @@ two test hosts. The current twenty-patch source-contract suite is
 The progress counters localized the asymmetric stall to a lost MSI-X
 notification, while the separate fresh-open failure showed zero hardware
 progress and exposed the path-before-ring ordering. With patches 11 and 12,
-the exact DS4-shaped gate passes 2,880 exchanges across 27 sessions and 26
+the exact workload-shaped gate passes 2,880 exchanges across 27 sessions and 26
 close/reopen transitions: 921,600 descriptor completions across the pair with
 diagnostic kicks disabled and no kernel transport errors. Required-NHI
-full-model CPU-copy and mapped correctness runs also pass. See
-`../bench/results/2026-08-05-nhi-msix-rx-prime-fix.md`.
+full-model CPU-copy and mapped correctness runs also pass (measured 2026-08-05
+on the lab host pair).
 
 `TBSTREAM_ZC_GET_STATS` is safe to call after a terminal zero-copy failure and
 reports already-queued ownership events before `REAP` starts returning `EIO`.
@@ -229,8 +226,7 @@ NHI register positions are meaningful only when the corresponding ring includes
 `TBSTREAM_ZC_RING_F_HW_VALID`. `TBSTREAM_ZC_KICK` is a lab diagnostic, not a
 recovery API: it requires `CAP_SYS_RAWIO` and remains disabled unless
 `thunderbolt_stream.zc_diagnostic_kick=1` (or the equivalent sysfs module
-parameter) is explicitly set. The DS4-shaped gate documents the timeout capture
-and directional-kick workflow in `../tools/ds4-shape/README.md`.
+parameter) is explicitly set.
 
 Validate the complete series without changing the local kernel checkout:
 
@@ -258,11 +254,11 @@ closing and reopening the stream before zero-copy I/O can resume.
 This is still a proof-of-concept UAPI. It has ordered fixed slots and bounded
 in-flight frames, but not generation numbers, eventfd/io_uring notification,
 or a production protocol for peer credit negotiation and reconnect recovery.
-Those belong with the DS4 transport integration after the ROCm mapping gate.
+Those belong with the consumer transport integration after the ROCm mapping gate.
 
 The ROCm gate in `../tools/rocm-map/` registers the driver-owned mapped TX pool
 and verifies GPU writes and reads without handing any frame to the NHI. It
-passed for the full 16 MiB pool on both test hosts, so DS4 can use this mapping
+passed for the full 16 MiB pool on both test hosts, so a consumer can use this mapping
 without DMA-BUF for that mode. Native `hipMalloc` DMA-BUF ownership is a
 separate, unimplemented importer/coherency experiment; see
 `../docs/GPU_TO_GPU_FEASIBILITY.md`.
@@ -316,8 +312,8 @@ geometry (single fully-covering segment for dedicated 16/256 MiB
 allocations), 448 MiB of word-exact traffic through imported RX pools
 with adversarial stale-cache pressure, full GPU→GPU imported TX→RX with
 rollback/lifecycle/SIGKILL coverage and zero IOMMU faults, and
-bit-exact live DS4 inference through an imported worker TX pool
-(`../bench/results/2026-08-24-gate7-imported-pool-live-inference.md`).
+bit-exact live inference through an imported worker TX pool (measured
+2026-08-24 on the lab host pair).
 Ownership contract: coarse pools + a device synchronize before submit
 (dispatch-boundary coherence), or MTYPE_UC pools with in-band
 system-scope stamps for persistent-wave designs — see
@@ -330,8 +326,8 @@ receive path no longer returns E2E credits, so the frame could never
 complete and only stalled the teardown flush), and the TX flush-timeout
 warning is ratelimited against userspace connection churn toward a dead
 peer. Validated across normal, SIGKILL, and imported-TX close orderings
-with zero warnings and spotless dmesg
-(`../bench/results/2026-08-24-patch15-close-suppression-and-wedge-repro.md`).
+with zero warnings and spotless dmesg (validated 2026-08-24 on the lab host
+pair).
 
 **Known platform hazard (unfixed, rules-based mitigation):** stream TX
 toward a peer whose device is not open+enabled stalls on zero E2E

@@ -1,16 +1,18 @@
 # TP transport integration contract
 
 What the gate-4..7 campaign and the exchange probe validated, stated as
-the rules an NHI TP backend must follow. Reference implementation:
-`tools/stale-cache/tbstream-tp-exchange.cu` (measured: 29.0 µs/exchange
-transport, 35.2 µs with single-workgroup reduce, sustained full-duplex).
-Kernel side: thunderbolt_stream patches 1–15 (`kernel/zerocopy/`). The
-current DS4 tensor-parallel production pair runs the patch-15 module with
-`zc_diagnostic_dmabuf=1`; the former descriptor-v3 TCP production stack ran
-patches 1–12. Keep the diagnostic module parameter disabled unless the
-imported-pool TP path is intentionally deployed; see
-`tools/modprobe.d/ds4-tbstream-zc.conf` and the systemd TP examples in
-`tools/systemd/`.
+the rules a GPU-resident consumer of this transport must follow. Reference
+implementation: `tools/stale-cache/tbstream-tp-exchange.cu` (measured
+2026-08-25 on the lab host pair: 29.0 µs/exchange transport, 35.2 µs with a
+single-workgroup reduce, sustained full-duplex). Kernel side:
+thunderbolt_stream patches 1–15 (`kernel/zerocopy/`).
+
+The imported-pool path is diagnostic-gated: it needs
+`thunderbolt_stream.zc_diagnostic_dmabuf=1` (an
+`options thunderbolt_stream zc_diagnostic_dmabuf=1` line under
+`/etc/modprobe.d/`, then `depmod -a` and a rebuilt initramfs) and
+`CAP_SYS_RAWIO` in the process that calls `TBSTREAM_ZC_IMPORT`. Keep the
+parameter disabled unless that path is intentionally deployed.
 
 ## Pool allocation and import
 
@@ -86,7 +88,8 @@ imported-pool TP path is intentionally deployed; see
     record an event after the last downstream slot reader. Repost strictly
     in sequence order once both conditions hold; small batches are fine.
     Slot reuse distance is `ring/frames` messages (512 at production
-    geometry, only 5.95 DS4 tokens), so this is slack, not permission to
+    geometry — about six tokens at an 86-exchange-per-token schedule), so
+    this is slack, not permission to
     leave credits outstanding indefinitely.
 12. TX submission is host-only (ioctl): exactly one submit per gate/message.
     Budget one service thread that event-synchronizes the GPU release then
@@ -101,14 +104,12 @@ imported-pool TP path is intentionally deployed; see
     TX toward an inactive peer stalls on zero E2E credits and can wedge
     the entire XDomain connection (TB-IP included). A full coordinated
     `thunderbolt_stream` reload healed the 2026-08-30 incident without
-    reboot (see `bench/results/2026-08-30-ds4-tp-nhi-production.md`);
-    keep coordinated reboot as the fallback if reload does not restore the
-    link. Sequence startup as: both sides open→import→ENABLE, then an
+    reboot; keep coordinated reboot as the fallback if reload does not restore
+    the link. Sequence startup as: both sides open→import→ENABLE, then an
     out-of-band barrier (TCP), then first submit. The probe's
     `barrier_sync` is the reference.
-14. Keep one side's device open across restarts of the other, or keep
-    the reconcile timer running; never leave both closed with the timer
-    stopped during a session gap.
+14. Keep one side's device open across restarts of the other; never leave both
+    ends closed for the duration of a session gap.
 15. Stop order for paired teardown: first quiesce GPU slot users and
     submission, then drain ownership events. Close rank 1/worker while
     rank 0/coordinator keeps its device open; after rank 0 observes the
@@ -119,18 +120,7 @@ imported-pool TP path is intentionally deployed; see
 16. Log `TBSTREAM_ZC_GET_STATS` at close on both sides (flags should
     show TX_IMPORTED|RX_IMPORTED and zero
     failures/event_drops/crc/overrun); flush stderr before teardown so
-    systemd stops don't eat the line.
-17. Root-run test binaries must not reuse a non-root manual run's
-    `/tmp/ds4.lock`: Fedora `fs.protected_regular` rejects opening the
-    other user's mode-0600 file in sticky `/tmp`. Set
-    `DS4_LOCK_FILE=/run/ds4-stage3.lock` per host, or remove a
-    confirmed-stale host-namespace lock only after proving no DS4 process
-    remains. Production units currently use `PrivateTmp=yes`: their
-    `/tmp/ds4.lock` files and flocks are healthy but live in private mount
-    namespaces, so they **cannot** exclude a manual host-namespace process.
-    Stopping production and auditing processes remains mandatory. The
-    durable singleton fix is one shared lock under a writable `/run`
-    RuntimeDirectory for both systemd and manual runs.
+    service stops don't eat the line.
 
 ## Performance envelope (measured, ring 4096, 28 KiB payload)
 
@@ -138,7 +128,7 @@ imported-pool TP path is intentionally deployed; see
 - Sustained exchange: 29.0 µs transport-only; 35.2 µs with a
   single-workgroup UC reduce (conservative — parallelize/overlap in
   production).
-- Per-token sync at DS4's 86-gate schedule: **~2.5 ms transport-only,
+- Per-token sync at an 86-exchange schedule: **~2.5 ms transport-only,
   ~3.0 ms with reduce.**
 - 4 KiB floor (control-sized messages): 9.8 µs RTT.
 - Burst bandwidth ≈ 1.6 GB/s per direction; both directions

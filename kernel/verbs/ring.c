@@ -358,12 +358,15 @@ int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
 	}
 	return 0;
 }
-/* Post more of the expected burst's MR pages to the data RX ring. */
+/* Post more of the expected burst's landing-zone pages to the data RX ring.
+ * The zone is the matched receive WQE's MR for a SEND burst and the
+ * requester-addressed remote MR for a WRITE burst; q->zc_mr names it and is
+ * cleared the moment the expected byte count lands. */
 static int sn_zdata_repost(struct sn_device *d, struct sn_qp *q)
 {
-	struct sn_wqe *w = &q->rq[q->rq_head];
-
 	lockdep_assert_held(&d->lock);
+	if (!q->zc_mr)
+		return 0;
 	while (d->zdata_posted < q->zc_total &&
 	       d->data_rx_head - d->data_rx_tail < SN_RING_SIZE - 1) {
 		struct sn_slot *s;
@@ -371,7 +374,7 @@ static int sn_zdata_repost(struct sn_device *d, struct sn_qp *q)
 		u32 max, size;
 		int ret;
 
-		dma = sn_mr_dma(w->mr, w->address + d->zdata_posted, &max);
+		dma = sn_mr_dma(q->zc_mr, q->zc_address + d->zdata_posted, &max);
 		if (!dma || !max)
 			return -EFAULT;
 		size = min(max, min((u32)SN_FRAME, q->zc_total - d->zdata_posted));
@@ -388,16 +391,18 @@ static int sn_zdata_repost(struct sn_device *d, struct sn_qp *q)
 	}
 	return 0;
 }
-int sn_data_recv_start(struct sn_device *d, struct sn_qp *q, struct sn_wqe *w)
+int sn_data_recv_start(struct sn_device *d, struct sn_qp *q)
 {
 	int ret;
 
 	lockdep_assert_held(&d->lock);
-	ret = sn_mr_ensure_mapped(d, w->mr);
+	if (!q->zc_mr)
+		return -EINVAL;
+	ret = sn_mr_ensure_mapped(d, q->zc_mr);
 	if (ret)
 		return ret;
-	dma_sync_sg_for_device(w->mr->map_dev, w->mr->umem->sgt_append.sgt.sgl,
-		w->mr->umem->sgt_append.sgt.orig_nents, DMA_FROM_DEVICE);
+	dma_sync_sg_for_device(q->zc_mr->map_dev, q->zc_mr->umem->sgt_append.sgt.sgl,
+		q->zc_mr->umem->sgt_append.sgt.orig_nents, DMA_FROM_DEVICE);
 	d->zdata_posted = 0;
 	return sn_zdata_repost(d, q);
 }
@@ -469,14 +474,14 @@ void sn_data_receive(struct sn_device *d)
 		d->rx_frames++;
 		if (d->qp && d->qp->zc_expect) {
 			/* Sync the burst pages for the CPU just before the completing
-			 * byte count makes the receive WQE visible. */
+			 * byte count makes the placement visible. */
 			if (d->qp->zc_received + size == d->qp->zc_total) {
-				struct sn_wqe *w = &d->qp->rq[d->qp->rq_head];
+				struct sn_mr *m = d->qp->zc_mr;
 
-				if (w->mr && w->mr->map_nents)
-					dma_sync_sg_for_cpu(w->mr->map_dev,
-						w->mr->umem->sgt_append.sgt.sgl,
-						w->mr->umem->sgt_append.sgt.orig_nents,
+				if (m && m->map_nents)
+					dma_sync_sg_for_cpu(m->map_dev,
+						m->umem->sgt_append.sgt.sgl,
+						m->umem->sgt_append.sgt.orig_nents,
 						DMA_FROM_DEVICE);
 			}
 			sn_engine_zc_bytes(d->qp, size);

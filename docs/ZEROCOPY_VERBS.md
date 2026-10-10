@@ -1,8 +1,9 @@
 # Verbs fast path: scheduling fix + zero-copy design
 
-Goal: make the native verbs path the default DS4 transport. That requires
-closing the ~16x throughput gap vs USB4STREAM (measured 62.9 MiB/s vs
-1016-1146 MB/s per direction, `bench/results/2026-10-06-nhi-verbs-vs-stream.md`).
+Goal: make the native verbs path a viable general transport. That required
+closing the ~16x throughput gap vs USB4STREAM: 62.9 MiB/s for the staged verbs
+path against 1016-1146 MB/s per direction for the stream path, measured
+2026-10-06 on the lab host pair at window 4 x 2 MiB in both directions.
 
 ## Phase 1 — kill the 1 ms cadence (implemented, offline-verified)
 
@@ -14,11 +15,14 @@ backstop for missed callbacks only.
 ## Phase 2/3 — zero-copy data plane (engine offline-verified; kernel glue
 ## compiles on 7.2.8; hardware test pending lab window)
 
-Implemented and offline-validated (11/11 engine tests incl. 5 ZC tests, 31/31
+Implemented and offline-validated (16/16 engine tests incl. 8 ZC tests, 37/37
 suite, ASan/UBSan clean):
 
-- Wire: `SN_ZC_SEND` descriptor, `SN_ZC_READY`, `SN_CAP_ZDATA` cap bit
-  (all in `native_wire.h`).
+- Wire: `SN_ZC_SEND` and `SN_ZC_WRITE` descriptors, `SN_ZC_READY`,
+  `SN_CAP_ZDATA` cap bit (all in `native_wire.h`). `ZC_SEND` forbids
+  rkey/address because its payload lands in a receive WQE the peer already
+  posted; `ZC_WRITE` requires both, because its payload lands in the
+  requester's remote MR.
 - Engine (`protocol.c`): sender state NONE -> WAIT -> SENDING -> SENT with the
   existing ACK/retry/RNR machinery reused; receiver descriptor matching,
   duplicate-descriptor restart, byte-count completion, staged fallback when
@@ -29,12 +33,13 @@ suite, ASan/UBSan clean):
 ## Hardware bring-up status
 
 Bring-up is solved and the data plane is validated end to end on
-max <-> max2 (Strix Halo, 7.2.8-100.fc43, no-TB-IP mode).
+max <-> max2 (Strix Halo, 7.2.8-100.fc43, no-TB-IP mode). All figures below
+were measured there on 2026-10-10.
 
 ### Measured results
 
 Correctness: `strix-verbs-smoke --live` PASS on both nodes (18,878,353 bytes
-verified, DS4-shaped setup/window4/ERR-flush); 31/31 offline tests green.
+verified, standard-verbs setup/window4/ERR-flush); 31/31 offline tests green.
 
 Latency, 256 B ping-pong RTT over 2000 iterations (`... ping 2000`):
 
@@ -50,9 +55,11 @@ Throughput, window-4 x 2 MiB bidirectional (`... 200`):
 
 - **1182-1238 MiB/s (9.9-10.4 Gbps) per direction**, consistent across 8/8
   consecutive runs, and sustained over a 6.4 GiB long run (800 iters,
-  5168 ms, 1238.39 MiB/s). This is at the link ceiling documented in
-  `bench/results/2026-09-18-link-rate-credits.md` (~9.5 Gbit/s per direction)
-  and above the USB4STREAM zero-copy path's 1146 MB/s.
+  5168 ms, 1238.39 MiB/s). That is the practical link ceiling: iperf3 over
+  `thunderbolt-net` on the same pair tops out at 9.49-9.51 Gbit/s one-way
+  (measured 2026-09-18) against a 20 Gb/s per-direction nominal rate, and
+  raising `thunderbolt.dma_credits` above its default 14 did not lift it. It is
+  also above the USB4STREAM zero-copy path's 1146 MB/s.
 - Earlier builds were **bimodal** (18-1313 MiB/s run to run); root cause and
   fix below.
 
@@ -184,9 +191,9 @@ has not gone ACTIVE yet, which is the normal case when both nodes boot together
 - thunderbolt_net **auto-loads** via its module alias when the XDomain appears.
   For no-TB-IP mode it must be blacklisted; `blacklist` alone is insufficient
   because it only suppresses alias-based autoload, so an explicit
-  modules-load.d entry (the stream path installs `ds4-tbnet.conf`) would still
-  pull it in. The script writes `blacklist` plus `install thunderbolt_net
-  /bin/false` to `/etc/modprobe.d/strix-nhi-verbs-zc.conf`.
+  modules-load.d entry would still pull it in. The script writes `blacklist`
+  plus `install thunderbolt_net /bin/false` to
+  `/etc/modprobe.d/strix-nhi-verbs-zc.conf`.
 - `strix_nhi` is not auto-loaded at boot; load it **once** per boot.
 - Re-probe (`rmmod`/`modprobe`) has been reliable across many cycles when only
   the staged path or short benches ran. The router-level wedge seen earlier
@@ -256,8 +263,10 @@ ring requires giving up TB-IP coexistence on that host.
 
 - **Control ring pair** (existing staged ring): coherent buffers, full SNH1
   protocol — HELLO/BIND handshake, ACK/RNR, small sends (below a threshold),
-  and per-message **ZC descriptors** (`SN_ZC_SEND`: sequence, total length;
-  SEND needs no rkey since the receiver picks the WQE).
+  and per-message **ZC descriptors** (`SN_ZC_SEND`: sequence, total length —
+  SEND needs no rkey since the receiver picks the WQE; `SN_ZC_WRITE`: the same
+  plus rkey and remote address, since the receiver must place into the
+  requester's MR instead of a posted receive).
 - **Data ring pair**: posted with the current receive-WQE MR pages. Payload
   frames are header-less; message framing comes from the NHI sof/eof PDFs;
   ordering and reliability come from E2E (the link does not lose or reorder
@@ -265,7 +274,7 @@ ring requires giving up TB-IP coexistence on that host.
   zero-copy); the NHI writes them directly into the receiver's MR pages (RX
   zero-copy).
 
-**Large-send flow** (DS4's 2 MiB chunks):
+**Large-send flow** (2 MiB chunks):
 
 1. Sender sends a staged `SN_ZC_SEND` descriptor on the control ring.
 2. Receiver matches it to a posted receive WQE (or RNRs), posts the WQE's MR
@@ -273,8 +282,21 @@ ring requires giving up TB-IP coexistence on that host.
 3. Sender blasts the payload as header-less frames on the data ring.
 4. Receiver counts bytes; at `total` it completes the WQE and sends the
    completion ACK on the control ring, then posts the next receive WQE's
-   pages (DS4's window buffers are persistent, so reposts are cheap and
-   steady-state-stable).
+   pages (a consumer's window buffers are normally persistent, so reposts are
+   cheap and steady-state-stable).
+
+**Large-write flow** differs only in where the payload lands. The descriptor is
+`SN_ZC_WRITE` and carries the requester's rkey and remote address; the receiver
+resolves and holds that remote MR instead of matching a posted receive WQE, so
+there is no RNR path and no receive completion. It then ACKs `ZC_READY`, the
+sender blasts the same header-less frames, and at `total` the receiver retires
+the remote MR, counts the bytes into `placed_write_bytes`, and sends the
+completion ACK. Eligibility adds one rule over `SN_ZC_SEND`: the *remote*
+address must also be frame-aligned, because both sides cap each frame at
+`SN_FRAME` from a frame-aligned offset and the sender's `d->zdata_posted`
+bookkeeping has to track the wire exactly. A WRITE that is below the threshold,
+unaligned locally or remotely, or whose MR lacks `IB_ACCESS_REMOTE_WRITE`, stays
+on the staged path.
 
 Ordering: the engine already serializes one SQ operation at a time, so at most
 one ZC burst is in flight per direction; the data ring carries exactly one
@@ -286,9 +308,9 @@ arrive in order and intact.
 
 **TB-IP coexistence**: zero-copy mode needs ring HopID 1 (TB-IP's). The driver
 detects at probe: if thunderbolt-net is absent it claims both hops and runs
-zero-copy-capable; if present it runs staged-only (today's behavior). DS4's
-TP control channel (TCP metadata) can use LAN addresses when TB-IP is down.
-Management SSH to the nodes is over the LAN, not TB-IP, so dropping TB-IP
+zero-copy-capable; if present it runs staged-only (today's behavior). A
+consumer's TCP control/metadata channel can use LAN addresses when TB-IP is
+down. Management SSH to the nodes is over the LAN, not TB-IP, so dropping TB-IP
 during zero-copy runs is survivable — to be confirmed on hardware.
 
 ## Failure/RNR semantics under zero-copy

@@ -1,242 +1,98 @@
-# DS4 USB4STREAM lifecycle units
+# USB4STREAM endpoint lifecycle
 
-These files make the ephemeral USB4STREAM ConfigFS endpoint converge after a
-local boot, peer reboot, or service-ordinal swap. They are templates: installing
-them is an explicit production change and is not performed by the test suite.
-As of 2026-08-05 they are installed and live on the current pair, with `max2`
-as allocator and `max` as follower; the repository copies remain the source for
-future installation or rollback. After deployment, an enabled `max2` reboot
-preserved Thunderbolt-net carrier and converged both endpoints to the configured
-9/9 pair before the production v3 TCP model reconnected.
+What a host needs to create, access, and tear down a `/dev/tbstreamN` endpoint,
+and the ordering rules that keep the link alive. Everything here is host-local
+configuration plus `tools/scripts/tbstream-setup.sh`; no systemd units are
+involved. The native verbs path does not use this interface at all — it drives
+its own NHI rings (see `../../docs/NATIVE_VERBS.md` and
+`../../docs/ZEROCOPY_VERBS.md`).
 
-The helper owns only ConfigFS children named `ds4`. It resolves the current
-Thunderbolt service by `key=stream`, derives the misc-device index from that
-ConfigFS child, verifies the device number and `0660 root:tbstream` policy, and
-then atomically publishes `/run/ds4-tbstream/device`. DS4 should use this stable
-path rather than `/dev/tbstream0`. The stable path is withdrawn before every
-reset; direct raw-device consumers must be stopped because they can bypass that
-publication boundary and the helper's advisory lock.
+## Prerequisites
 
-Exactly one endpoint allocates HopIDs. For the current pair, install
-`tools/sysconfig/ds4-tbstream.allocator` as `/etc/sysconfig/ds4-tbstream` on
-`max2`, and install the follower sample on `max`. A follower removes its own
-unpublished attempt and retries until the allocator's reversed HopIDs are
-visible; both endpoints must never be configured as followers. Two allocators
-are as bad as two followers: both sides would publish overlapping exact HopIDs.
+- `thunderbolt_stream` loaded: Linux 7.2+ with `CONFIG_USB4_STREAM=m`, or the
+  backport plus zero-copy series in `kernel/` (see `../../kernel/README.md`).
+- ConfigFS mounted at `/sys/kernel/config`.
+- The cable linked and the peer's `thunderbolt_stream` loaded. A peer running
+  the driver advertises an XDomain service with `key=stream`; inspect the link
+  with `tblist -A` from [intel/tbtools](https://github.com/intel/tbtools).
+- When the same link also carries Thunderbolt-IP, `thunderbolt-net` must be
+  present and its carrier up before the stream endpoint is created: both draw
+  HopIDs from the same adapter pool, and `thunderbolt-net` reserves HopID 8
+  during its login. The zero-copy verbs mode is the deliberate exception — it
+  blacklists `thunderbolt-net` and claims both HopIDs.
 
-The current single-link samples pin each local direction to HopID 9 with the
-paired `TBSTREAM_IN_HOPID` and `TBSTREAM_OUT_HOPID` settings. The allocator
-requests those exact positive values instead of automatic `-1` allocation; if
-either value is unavailable, it deactivates and removes the partial child and
-retries the same pair without falling back. The follower still does not
-allocate independently: it learns the allocator's advertised pair, reverses it
-through the kernel protocol, and requires the resulting local values to match
-its configured pair before publication. Consequently, asymmetric settings on
-the follower must be the allocator's `OUT/IN` values in reverse local order.
-Both variables must be empty (automatic lab behavior) or both must be integers
-from 8 through the architectural 11-bit maximum of 2047. Hardware may expose a
-smaller maximum; an unsupported exact value fails closed at the kernel write.
+## Device access policy
 
-Both role samples set `TBSTREAM_NETDEV=thunderbolt0`. Before creating a new
-ConfigFS child, the reconciler waits for that interface's
-`/sys/class/net/thunderbolt0/carrier` value to become `1`. This lets
-`thunderbolt-net` allocate its HopIDs first and keeps the TCP control/fallback
-link available when USB4STREAM draws from the same adapter pool. Set the value
-to the actual Thunderbolt netdev name on each host, or leave it empty only when
-that physical link intentionally has no Thunderbolt network interface. The
-wait shares `TBSTREAM_WAIT_SECONDS`; a single-pass watchdog checks once and
-returns immediately. Carrier is a creation-order gate, not an endpoint health
-condition: after a valid managed endpoint exists, carrier loss does not reset
-it or add work to the healthy fast path.
-
-## Install layout
-
-Install the files as root-owned, non-writable production artifacts:
+`/dev/tbstreamN` defaults to `0600 root:root`. The stream UAPI mmaps
+DMA-mapped pages, so never widen it to world-writable; use the scoped rule and
+a dedicated group instead of running workloads as root:
 
 ```sh
-groupadd --force --system tbstream
-usermod -aG tbstream jryates
-install -d -o root -g root -m 0755 /usr/local/libexec \
-    /usr/local/share/doc/strix-rdma
-install -o root -g root -m 0755 tools/scripts/ds4-tbstream-reconcile.sh \
-    tools/scripts/ds4-tbstream-cleanup.sh /usr/local/libexec/
-install -o root -g root -m 0644 tools/systemd/ds4-tbstream-reconcile.service \
-    tools/systemd/ds4-tbstream-reconcile-watchdog.service \
-    tools/systemd/ds4-tbstream-reconcile.timer /etc/systemd/system/
-install -o root -g root -m 0644 tools/modules-load/ds4-tbstream.conf \
-    /etc/modules-load.d/ds4-tbstream.conf
-install -o root -g root -m 0644 tools/udev/98-ds4-tbstream-reconcile.rules \
-    /etc/udev/rules.d/98-ds4-tbstream-reconcile.rules
-install -o root -g root -m 0644 tools/udev/99-tbstream.rules \
-    /etc/udev/rules.d/99-tbstream.rules
-install -o root -g root -m 0644 tools/systemd/tbstream-lifecycle.md \
-    /usr/local/share/doc/strix-rdma/tbstream-lifecycle.md
-```
-
-Install exactly one role sample as `/etc/sysconfig/ds4-tbstream`, reload udev
-and systemd, then enable the timer. `make install-lifecycle` enables the timer
-and starts the service once; do not `systemctl enable` the service itself —
-that can delay boot by about `TBSTREAM_WAIT_SECONDS` if the peer is down.
-Start a new login before DS4 so its process has the `tbstream` supplementary
-group. The one-shot start waits for a peer; the timer and udev add event
-converge later generations.
-The timer remains necessary for property changes and because a remove event
-cannot reliably read the already-removed service's `key` attribute. Udev starts
-reconcile immediately on stream-service add; the staggered timer is a 10–11
-second fallback for removal and missed events. It targets a single-pass service
-that disables bootstrap, holder, and device waits and skips if a stronger pass
-already owns the lifecycle lock. A healthy pass verifies the generation,
-ConfigFS attributes, device identity, metadata, stable link, and ready manifest
-without replacing files or logging another ready transition. Exit 75 is a
-normal transient result for this single-pass watchdog (for example while a peer
-is rebooting), so its unit accepts that status without recording a systemd
-failure; configuration errors remain failures.
-
-```sh
-systemctl daemon-reload
-udevadm control --reload-rules
-udevadm trigger --action=change --subsystem-match=misc \
+sudo groupadd --force --system tbstream
+sudo usermod -aG tbstream "$(id -un)"   # then start a new login session
+sudo make install-lifecycle             # installs 99-tbstream.rules + this doc
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=change --subsystem-match=misc \
     --sysname-match='tbstream*'
-udevadm settle --timeout=10
-systemctl enable --now ds4-tbstream-reconcile.timer
-systemctl start ds4-tbstream-reconcile.service
 ```
 
-Do not add ConfigFS deletion to `ExecStop=`. A normal service stop or shutdown
-must not race an active DS4 mapping. The explicit cleanup helper first withdraws
-the stable link, waits for every `/dev/tbstream*` holder to drain, and then uses
-ConfigFS `rmdir`; it never deletes a `/dev` node.
+`make install-lifecycle` installs `tools/udev/99-tbstream.rules` as
+`/etc/udev/rules.d/99-tbstream.rules` (`0660 root:tbstream`) and this document
+under the package docdir.
 
-## DS4 ordering and rollout
+## Creating the endpoint
 
-Keep this least-privilege service setting in both versioned DS4 units:
-
-```ini
-[Service]
-SupplementaryGroups=tbstream
-```
-
-The layer-slice v3 transport baseline is:
-
-```text
---dist-transport auto
-```
-
-With no `--dist-nhi-device`, two current peers negotiate descriptor-framed v3
-TCP. Explicit `--dist-transport tcp` selects the legacy-v2 compatibility path;
-it is not the v3 production spelling.
-
-For layer-slice deployments, any configuration that supplies
-`/run/ds4-tbstream/device` remains an explicit qualification mode while
-extended soak and active peer-reboot testing continue; the repaired candidate
-also has no measured full-model speed advantage. That includes either:
-
-```text
---dist-transport auto --dist-nhi-device /run/ds4-tbstream/device
---dist-transport nhi --dist-nhi-device /run/ds4-tbstream/device
-```
-
-The independently enabled lifecycle unit remains useful for hardware diagnosis
-and normally finishes long before DS4 loads its model. Production DS4 must not
-be ordered after the blocking reconciler and does not depend on the stable
-device. `auto` can fall back before NHI activation, but it cannot safely replay
-an ambiguous in-flight NHI generation; therefore pre-activation fallback is not
-a substitute for explicit NHI qualification. Do not add
-`Requires`, `After`, `ExecStartPre`, or `BindsTo` dependencies from the
-production DS4 service to the stream device.
-
-## DS4 tensor-parallel NHI drop-ins
-
-The imported DMA-BUF pool path used by DS4 tensor parallelism needs two
-additional, deliberately explicit pieces on both hosts:
-
-1. The series-20 `thunderbolt_stream` module (patches 14–20) must be installed under
-   `/lib/modules/$(uname -r)/updates/` and selected by `modinfo
-   thunderbolt_stream`. Install `tools/modprobe.d/ds4-tbstream-zc.conf` as
-   `/etc/modprobe.d/ds4-tbstream-zc.conf`, run `depmod -a`, and rebuild the
-   initramfs before rebooting (`dracut --force --kver "$(uname -r)"` on the
-   tested Fedora hosts). Verify the rebuilt image contains the larger patched
-   module (`lsinitrd /boot/initramfs-$(uname -r).img | grep
-   thunderbolt_stream.ko`) and that the live boot reports
-   `/sys/module/thunderbolt_stream/parameters/zc_diagnostic_dmabuf=Y`.
-   `zc_diagnostic_dmabuf=1` exposes a diagnostic capability and must not be
-   enabled for ordinary TCP or page-pool NHI deployments.
-2. Install the versioned DS4 drop-in examples after adjusting their paths,
-   addresses, ports, and ROCm library path:
-
-   ```sh
-   install -D -m 0644 tools/systemd/ds4-mxfp4-worker.tp-nhi.conf.example \
-       /etc/systemd/system/ds4-mxfp4-worker.service.d/99-tp-nhi.conf
-   install -D -m 0644 tools/systemd/ds4-mxfp4-server.tp-nhi.conf.example \
-       /etc/systemd/system/ds4-mxfp4-server.service.d/99-tp-nhi.conf
-   systemctl daemon-reload
-   ```
-
-The examples use `/run/ds4-tbstream/device`, require the service user to be
-in the `tbstream` group, and require the base units to select a non-root
-`User=`. The drop-ins reset any inherited capability lists and then grant only
-`CAP_SYS_RAWIO` through `CapabilityBoundingSet` plus `AmbientCapabilities`.
-That capability is the kernel's current gate for `TBSTREAM_ZC_IMPORT`.
-`NoNewPrivileges=true` remains enabled; ambient capabilities are assigned by
-systemd before `execve` and do not require later privilege elevation.
-
-Startup order is worker first, coordinator second. Stop order is also worker
-first: keep the coordinator's NHI device open until it observes the worker
-close, then stop the coordinator. Keep the reconcile timer enabled on both
-hosts; do not leave both NHI devices closed with the timer stopped during a
-test gap.
-
-The production pair validated this configuration with DS4 commit `c18296e`
-on ROCm/gfx1151: 50/50 expert ownership bound on both ranks, a 23-token
-prompt with 4096 generated tokens completed at 15.64 tok/s, and a 3373-token
-cold prefill completed at 15.97 tok/s. Both nodes closed with zero NHI
-failures, event drops, CRC errors, or overruns.
-
-If the Thunderbolt-IP path has already wedged, first stop every DS4 holder,
-stop the reconcile timers, run the managed cleanup, then reload
-`thunderbolt_stream` on both hosts and reconcile the endpoints. Verify the
-10.99 link before restarting DS4. This full module reload recovered the
-2026-08-30 TP production incident without a reboot; use a coordinated reboot
-only if the reload does not restore bidirectional ping. Do not attempt the
-reload while any process still holds `/dev/tbstream*`.
-
-## Maintenance cleanup and rollback
-
-First prevent both timer and udev activation, stop or switch DS4 away from NHI,
-and confirm no process holds any `/dev/tbstream*`. Then run:
+`tools/scripts/tbstream-setup.sh` creates the ConfigFS child, writes
+`ring_size`/`throttling` **before** the HopIDs activate the stream, and prints
+the resulting device path. The stream name must match on both hosts:
 
 ```sh
-systemctl mask --runtime --now ds4-tbstream-reconcile.service \
-    ds4-tbstream-reconcile-watchdog.service
-systemctl stop ds4-tbstream-reconcile.timer
-/usr/local/libexec/ds4-tbstream-cleanup.sh
+hostA$ sudo tools/scripts/tbstream-setup.sh link   # prints /dev/tbstreamX
+hostB$ sudo tools/scripts/tbstream-setup.sh link
 ```
 
-The command exits 75 and leaves ConfigFS intact if a holder remains. Do not
-force it, do not remove `/dev/tbstream*`, and do not unload the module while a
-holder exists. Keep both lifecycle services runtime-masked throughout the
-maintenance window. To resume, unmask them and start the main service and timer.
-For complete rollback, restore the prior TCP-only versioned DS4 units, run
-`systemctl disable --now` for the lifecycle service and timer, runtime-mask the
-main and watchdog services, remove and reload the udev event rule, daemon-reload
-systemd, run the explicit cleanup, `rm -f /etc/modprobe.d/ds4-tbstream-zc.conf`,
-`depmod -a`, rebuild initramfs (`dracut --force --kver "$(uname -r)"` on the
-tested Fedora hosts), reload `thunderbolt_stream`, and verify
-`/sys/module/thunderbolt_stream/parameters/zc_diagnostic_dmabuf` is `N`.
-Optionally unload `thunderbolt_stream`. A coordinated local reboot is the
-final ConfigFS reset.
+Each side requests automatic HopID allocation (`-1`) and the kernel protocol
+pairs the two ends. `RING_SIZE=4096` and `THROTTLING=0` are the values that
+matter at QD1 and are already the kernel defaults after the zero-copy series;
+both are overridable by environment. `SERVICE=<xdomain>.<service>` skips
+service autodetection. The script is lab-scoped: it refuses to create a second
+endpoint when one already exists (`TBSTREAM_SETUP_FORCE=1` overrides) and
+errors out when no peer `stream` service is visible.
+
+## Teardown and the wedge rules
+
+Hard-won ordering rules. Violating the first one can cost a reboot.
+
+1. **Never transmit toward a peer whose device is not open and enabled.** TX
+   toward an inactive peer stalls on zero E2E credits and can wedge the entire
+   XDomain connection, Thunderbolt-IP included. Reproduced 2026-08-24; it
+   survives a `thunderbolt-net` reload, a service rebind, and an NHI PCI
+   rebind.
+2. Sequence startup as: both sides open (and enable zero-copy) → out-of-band
+   barrier → first submit.
+3. Keep one side's device open across restarts of the other; do not leave both
+   ends closed for the duration of a session gap.
+4. Stop order is writer first. Keep the survivor open until it observes the
+   peer's CLOSE; patch 15 then skips the impossible reciprocal CLOSE toward an
+   already-closed peer.
+5. ConfigFS stream groups pin `thunderbolt_stream`: `rmdir` the ConfigFS child
+   before reloading the module. `ring_size`/`throttling` writes return `EBUSY`
+   while any fd is open.
+6. Concurrent readers on one fd steal frames, CLOSE included. Stop every
+   consumer (`pkill -f pingpong` in the lab) before reconfiguring.
+
+Recovery when the link is wedged: stop every holder, remove the ConfigFS
+child, reload `thunderbolt_stream` on **both** hosts, verify the
+Thunderbolt-IP link, then recreate the endpoint. A full coordinated reload
+healed the 2026-08-30 incident without a reboot; use a coordinated reboot only
+if the reload does not restore bidirectional traffic. Never attempt the reload
+while a process still holds `/dev/tbstream*`.
 
 ## Offline verification
-
-The mock suite never touches live ConfigFS, sysfs, or `/dev`:
 
 ```sh
 make -C tools/tests test
 ```
 
-It covers exact allocator/follower HopID pinning, invalid pairs, unavailable or
-mismatched exact allocations with no automatic fallback, netdev-carrier
-ordering, carrier wait/timeout and single-pass behavior, active idempotence,
-ambiguous service discovery, device verification, holder refusal,
-service-generation changes, and the observed stale `tbstream0` plus new
-`tbstream1` ordinal-swap state.
+Static assertions on the installed device-access policy. It never touches live
+sysfs, ConfigFS, or `/dev`.

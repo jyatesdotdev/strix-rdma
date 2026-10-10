@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Sweep pingpong latency over DS4-relevant message sizes and save CSV.
+# Sweep pingpong latency over transport-relevant message sizes and save CSV.
 #
 # Usage: run-pingpong.sh <device> [label]
 #   PEER=user@otherhost  if set, starts the echo side over ssh per size
 #   PEER_DEV=...         device path on the peer (default: same as local)
 #   PEER_BIN=...         pingpong path on the peer (default: pingpong in PATH)
 #   ITERS=1000 WARMUP=50 SIZES="4k 16k 64k 256k 1m 4m"
+#   OUT_DIR=.            directory for the CSV (default: current directory)
 #
 # Without PEER, start the echo side manually on the other host before each
 # size:  ./pingpong pong -d /dev/tbstreamX -s <size>
@@ -19,7 +20,7 @@ SIZES=${SIZES:-"4k 16k 64k 256k 1m 4m"}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN="$HERE/../../tools/pingpong/pingpong"
-OUT="$HERE/../results/pingpong-$LABEL-$(date +%Y%m%d-%H%M%S).csv"
+OUT="${OUT_DIR:-.}/pingpong-$LABEL-$(date +%Y%m%d-%H%M%S).csv"
 
 echo "mode,size,iters,min_us,p50_us,p90_us,p95_us,p99_us,max_us,mean_us,mbps" > "$OUT"
 
