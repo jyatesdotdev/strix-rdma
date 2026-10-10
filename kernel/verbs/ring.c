@@ -26,15 +26,16 @@ static bool sn_slot_done(struct sn_device *d, struct sn_slot *s)
 	spin_unlock_irqrestore(&d->ring_lock, flags);
 	return done;
 }
-static bool sn_slot_peek(struct sn_device *d, struct sn_slot *s)
+/* Advisory scheduling hint only, so it must be lock-free. The poller peeks
+ * roughly once per microsecond while cold; taking ring_lock that often
+ * contends with the ring callback that sets the flag, and measurably slows
+ * the receive path (a 2 ms spin window cost ~85% of throughput). A stale or
+ * torn read costs at most one extra spin iteration or one callback-driven
+ * wake, so correctness does not depend on it -- the drain re-reads under the
+ * lock in sn_slot_done. */
+static bool sn_slot_peek(struct sn_slot *s)
 {
-	unsigned long flags;
-	bool done;
-
-	spin_lock_irqsave(&d->ring_lock, flags);
-	done = s->done;
-	spin_unlock_irqrestore(&d->ring_lock, flags);
-	return done;
+	return READ_ONCE(s->done);
 }
 /* Lock-free hint for the idle spin: any completed ring work pending? */
 bool sn_ring_pending(struct sn_device *d)
@@ -44,13 +45,13 @@ bool sn_ring_pending(struct sn_device *d)
 	/* Only RX completions are latency-critical pending work. A completed TX
 	 * slot is bookkeeping: the send path reaps it before it needs the space.
 	 * Treating it as pending would pin the poller between sends. */
-	if (sn_slot_peek(d, &d->rx[d->rx_tail % SN_RING_SIZE]))
+	if (sn_slot_peek(&d->rx[d->rx_tail % SN_RING_SIZE]))
 		return true;
 	/* The zero-copy burst path lands on the second ring pair; the poller
 	 * must see it too or it sleeps mid-burst and pays a wake-up per frame.
 	 * Both are hints: a stale read only costs one callback-driven wake. */
 	if (READ_ONCE(d->zdata) && d->data_rx_tail != d->data_rx_head &&
-	    sn_slot_peek(d, &d->data_rx[d->data_rx_tail % SN_RING_SIZE]))
+	    sn_slot_peek(&d->data_rx[d->data_rx_tail % SN_RING_SIZE]))
 		return true;
 	return false;
 }
