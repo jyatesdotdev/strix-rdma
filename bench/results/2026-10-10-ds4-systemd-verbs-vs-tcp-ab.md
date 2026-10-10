@@ -135,25 +135,52 @@ enable/disable. Live adaptation would need a core patch plus a `thunderbolt.ko`
 reload, which is the most wedge-prone operation available; not worth it for a
 dial that measurably does not move this workload.
 
-## Current leading hypothesis
+## Root cause: round-trip-bound, not throughput-bound
 
 With bandwidth, retransmits, poller sleep, cold spin and interrupt moderation
-all excluded, what remains is **per-frame cost in the provider's completion
-path**. The numbers say the workload is dominated by small frames: 1,153,528
-frames per request carrying 384 MiB is **~350 bytes per frame**, at only
-66.7k frames/s per direction — versus the ~310k full 4 KiB frames/s this link
-sustains in bench. So DS4 is at ~21% of the provider's frame-rate capability
-while using 1.8% of its bandwidth.
+all excluded by measurement, the remaining explanation fits every observation.
+DS4's RoCE transport logs `window=4 chunk=2097152 host-staging=16MiB` and moves
+1,153,528 frames per request carrying 384 MiB — **~350 bytes per frame**. Treating
+the request/response exchanges as roughly half the frames and batching them at
+the transport's window depth of 4:
 
-19.6 ms/token over 5,768 frames/token is **~3.4 us per frame**, and the likely
-sink is `d->lock`: the poller took it 1.52M times in 17.3 s (~88k/s, one pass
-per ~1.3 frames) while DS4's own `poll_cq` calls need the same mutex. At that
-acquisition rate an average wait of a few microseconds is exactly the right
-order. This also explains why `idle_spin_us` changed nothing — pass count is
-driven by frame count, not by the spin, so the lock churn is identical at 0.
+```
+5768 frames/token -> ~2884 exchanges/token -> /4 deep = 721 serialized round trips/token
+721 x 35.1 us (measured ping-pong RTT) = 25.3 ms/token     observed overhead: 19.6 ms
+```
 
-The next measurement should be provider-side lock hold/wait time and
-`poll_cq` cost per call, not another transport-level sweep.
+The same request achieves an effective **90 MiB/s** against the **1211 MiB/s**
+this link sustains in bench — 13.4x under-utilised. The transport is not slow;
+it is idle, waiting on round trips.
+
+This explains all four negative results at once, which is why it is convincing:
+
+- moderation is irrelevant, because the cost is a hardware round trip, not
+  interrupt coalescing;
+- `idle_spin_us` is irrelevant, because the cost is not CPU;
+- bandwidth is irrelevant, because the link is 98% idle;
+- `zc_retries`/`bad_frames` are zero, because nothing is failing.
+
+And it explains why TCP wins on a **slower** link: TCP is a byte stream. DS4
+writes the same ~2884 small messages into a socket with 16 MiB of host staging,
+the kernel coalesces them, and only the TP gate barrier costs a round trip. The
+verbs path instead pays a round trip per window-full of messages. Note the
+credit window is separately the *bulk* limiter and is consistent with the same
+RTT: 14 credits x 4 KiB = 56 KiB in flight, which at 1211 MiB/s is one credit
+round trip per 45 us.
+
+**The window is not tunable.** The only RoCE options DS4 exposes are
+`--rdma-device`, `--rdma-gid-index` and `--rdma-port`; there is no window or
+chunk flag, and no `DS4_*` env var reaches it (`DS4_DIST_PREFILL_WINDOW=8` and
+`DS4_DIST_WORKER_FORWARD_WINDOW=8` were tried and the transport still logged
+`window=4` — those govern the prefill pipeline, not the RDMA transport). So
+`window=4` is hardcoded in DS4's RoCE transport.
+
+Which puts the fix outside this repository. The provider is already at its
+hardware floor (35 us RTT, 1211 MiB/s bulk); closing a 22.6% gap that is made of
+721 serialized round trips per token requires DS4's transport to stop paying a
+round trip per message — a deeper window, or RDMA WRITE-with-immediate so the
+sender does not wait on the peer. No provider-side change can substitute.
 
 ## Build recipe (the earlier blocker was a false alarm)
 
@@ -190,11 +217,16 @@ gamble: **do not build a tuning loop on module reloads.** Set the parameter via
 
 ## Verdict
 
-Do not make verbs the default yet. It is correct (bit-exact across twelve
-requests, two transports, three poller settings and two moderation settings;
-zero bad frames; real 2 MiB zero-copy bursts) and it holds a stable link under
-a real model server, but at the acceptance gate it is 22.6% behind plain TCP
-over a *slower* 5 GbE LAN — while using 1.8% of the TB link's measured capacity
-and 21% of the provider's own frame-rate capability. The transport is not
-bandwidth- or interrupt-limited here; the cost is per-frame, most likely `d->lock`
-contention between the resident poller and DS4's `poll_cq`.
+Do not make verbs the default yet, and do not keep tuning the provider for it.
+It is correct — bit-exact across twelve requests, two transports, three poller
+settings and two moderation settings, zero bad frames, real 2 MiB zero-copy
+bursts — and it holds a stable link under a real model server. But at the
+acceptance gate it is 22.6% behind plain TCP over a *slower* 5 GbE LAN, and the
+gap is 721 serialized round trips per token against a hardcoded `window=4` in
+DS4's RoCE transport.
+
+The provider is already at its hardware floor: 35 us RTT and 1211 MiB/s bulk, of
+which this workload uses 90 MiB/s and 1.8% respectively. **The remaining work is
+in DS4's transport, not in strix-rdma** — deepen the window, or replace the
+per-message request/response with RDMA WRITE-with-immediate. Until then the
+verbs path is the right substrate and the wrong default.
