@@ -41,18 +41,24 @@ Latency, 256 B ping-pong RTT over 2000 iterations (`... ping 2000`):
 | | min | avg | max tail |
 |---|---|---|---|
 | workqueue receive path (before) | 35-37 us | ~52 us | 773 us - 6.4 ms |
-| resident poller (now) | **32 us** | **36.4 us** | ~2.8 ms |
+| resident poller (now) | **31 us** | **35.1 us** | **345 us** |
 
 ~32 us is the hardware floor (two NHI hops plus the wire), so the average now
 sits within ~4 us of it.
 
 Throughput, window-4 x 2 MiB bidirectional (`... 200`):
 
-- **1016-1313 MiB/s (8.6-9.8 Gbps) per direction** when the run is healthy.
-  On-host 200 ms sampling of `placed_send_bytes` confirms it holds steady for
-  the whole run (1016/1066/1046/1016/1282/1037/1313/1095 MiB/s), not just a
-  warm-up burst.
-- Runs are **bimodal**: some come in at 20-200 MiB/s. Cause identified below.
+- **1182-1238 MiB/s (9.9-10.4 Gbps) per direction**, consistent across 8/8
+  consecutive runs, and sustained over a 6.4 GiB long run (800 iters,
+  5168 ms, 1238.39 MiB/s). This is at the link ceiling documented in
+  `bench/results/2026-09-18-link-rate-credits.md` (~9.5 Gbit/s per direction)
+  and above the USB4STREAM zero-copy path's 1146 MB/s.
+- Earlier builds were **bimodal** (18-1313 MiB/s run to run); root cause and
+  fix below.
+
+On-host 200 ms sampling of `placed_send_bytes` during a healthy run confirms the
+rate is steady, not a warm-up artifact (1066/1046/1016/1282/1037/1313/1095
+MiB/s across consecutive samples).
 
 ### Defects found and fixed
 
@@ -99,6 +105,13 @@ numbers are recorded with them.
    responses in 2000 iterations**, each retry then waiting on the 1 ms tick.
    Reported ~2000 us avg. Arming before echoing -> `rnr_sent` ~0 and the true
    36.4 us.
+9. **Per-frame interrupt storm on the data rings** -- the dominant defect, and
+   the cause of the bimodal throughput. Neither data ring had interrupt
+   moderation, so every 4 KiB frame raised an interrupt (~290k/s per ring per
+   host at wire speed), starving the softirq/workqueue layer that drives the
+   drain. `tb_ring_throttling(128 us)` on both data rings, as thunderbolt_net
+   does, cut interrupts 42x and made throughput consistent. Full analysis in
+   the next section.
 
 `native_stats` now exposes the diagnostics that produced all of the above:
 `data_tx`/`data_rx` head/tail, `zdata_posted`, `qp_zc_state`/`offset`/
@@ -107,7 +120,7 @@ numbers are recorded with them.
 `idle_spin_us` is a 0644 module param so the latency/CPU knee can be swept
 without a reload.
 
-### Open issue: intermittent multi-second E2E credit stall
+### Resolved: the intermittent multi-second stall was a per-frame interrupt storm
 
 The cause of the bimodal throughput. Captured simultaneously on both nodes
 mid-stall (250 ms sampling), frozen for ~6 s of a 7.7 s run:
@@ -120,20 +133,38 @@ max2: zc_expect=1       data_rx 3033462/3033399 (63 buffers armed) frozen
 ```
 
 Frames queued on one side, buffers armed on the other, nothing moving, then it
-self-resolves. `zc_timeouts` frozen proves **no retransmit was in flight**, so
-this is a hardware E2E-credit pause rather than the software ring-reset desync
-first suspected (tested and ruled out). Note `SN_ZC_SENDING` arms no deadline
-until the burst *completes*, so a stuck burst is bounded only by the 30 s
-`progress_deadline`.
+self-resolves. `zc_timeouts` frozen proves no retransmit was in flight, so this
+was not the software ring-reset desync first suspected (tested and ruled out),
+and not gradual E2E credit leakage either: raising `thunderbolt.dma_credits`
+from 14 to 64 left the degradation pattern unchanged.
 
-Attempted and reverted: a SENDING-state watchdog. It bounded the stall
-correctly but made outcomes worse (5/6 runs hard-failed) -- stalls last ~6 s,
-so a 67 ms watchdog always exhausts `retry_cnt=3` and errors the QP. A
-recoverable stall beats a dead QP.
+The actual cause was interrupt load. `/proc/interrupts` on a live link showed
+the two data rings at 6,042,981 and 6,043,218 interrupts against ~41k on the
+control rings -- **one interrupt per 4 KiB frame**, ~290k/s per ring per host
+at wire speed. Counting precisely over 4.7 GiB received (1,228,800 frames):
+RX ring 1,229,852 interrupts, TX ring 1,229,852 before moderation. That storm
+starves the softirq/workqueue layer that drives the drain, and the pipeline
+collapses into the frozen state above; whether a given run survived it was the
+per-run lottery.
 
-Next step is the E2E credit accounting in the thunderbolt core: either the
-receiver's credit advertisement stops reaching the sender after some transfer
-count, or credits leak until the sender reaches zero.
+`thunderbolt_net` avoids exactly this on the same NHI with
+`tb_ring_throttling(tx, 128000)` plus NAPI on the RX side. This driver had
+neither. Applying the same 128 us moderation to both data rings (the control
+ring stays unthrottled so ack latency keeps its floor) fixed it outright.
+
+Interrupts for 1,638,400 frames (6.4 GiB) after the change: data TX 38,728,
+data RX 38,656 -- a **42x reduction**, one interrupt per ~42 frames. Batching is
+safe because the drain consumes every pending frame per pass (~37 frames
+accumulate per 128 us at wire speed, well inside the 64-slot ring).
+
+Two fixes were tried and reverted along the way, both recorded so they are not
+retried:
+
+- A `SN_ZC_SENDING` watchdog. It bounded the stall correctly but 5/6 runs then
+  hard-failed: stalls last ~6 s, so a 67 ms watchdog always exhausts
+  `retry_cnt=3` and errors the QP. A recoverable stall beats a dead QP -- and
+  with moderation the stall no longer occurs.
+- Larger data rings (1024 slots), which broke correctness; see below.
 
 ### Operational notes
 
