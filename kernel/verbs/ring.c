@@ -96,6 +96,13 @@ int sn_data_rings_start(struct sn_device *d)
 		}
 		sn_data_slots_init(d, d->data_tx);
 		sn_data_slots_init(d, d->data_rx);
+		/* Moderate data TX completion interrupts before the ring goes live
+		 * (tb_ring_throttling requires a stopped ring). Without this the
+		 * per-frame interrupt rate at wire speed is what destabilises the
+		 * pipeline; the control ring stays unthrottled for ack latency. */
+		if (tb_ring_throttling(d->data_tx_ring, SN_DATA_TX_THROTTLE_NS))
+			dev_warn(&d->service->dev,
+				 "strix_nhi: data TX interrupt throttling unavailable\n");
 		tb_ring_start(d->data_tx_ring);
 		tb_ring_start(d->data_rx_ring);
 	}

@@ -12,6 +12,12 @@
 
 #define SN_ABI 1
 #define SN_RING_SIZE 64
+/* Data TX ring interrupt moderation, matching thunderbolt_net's proven
+ * TBNET_THROTTLING. At ~1.1 GiB/s a 4 KiB data frame otherwise raises one
+ * interrupt each: measured 6,042,981 and 6,043,218 interrupts on the two data
+ * rings against ~41k on the control rings. The control ring is deliberately
+ * left unthrottled so ack latency stays at the ~36 us ping-pong floor. */
+#define SN_DATA_TX_THROTTLE_NS 128000
 #define SN_CONTROL_RESERVE 8
 #define SN_SERVICE "strixv1"
 #define SN_CONTROL_BYTES 112
