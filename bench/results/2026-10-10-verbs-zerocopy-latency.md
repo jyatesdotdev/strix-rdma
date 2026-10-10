@@ -28,7 +28,26 @@ Throughput, DS4's shape (window 4 x 2 MiB, bidirectional, per direction):
 |---|---|---|
 | 8 consecutive 200-iter runs | **1182-1226 MiB/s (9.9-10.3 Gbps)** | 1.3-1.4 s each |
 | 800-iter long run (6.4 GiB/dir) | **1238.39 MiB/s (10.39 Gbps)** | 5168 ms |
+| **20000-iter endurance (156 GiB/dir)** | **1211.05 MiB/s (10.16 Gbps)** | 132 s |
 | before interrupt moderation | 18-1313 MiB/s (bimodal) | 1.4-77 s |
+
+The endurance run is the important one: 156 GiB per direction sustained at wire
+rate for over two minutes with `bad_frames 0` and a single abort, so there is no
+slow leak or drift in the data plane.
+
+One counter needs care when reading it. `zc_retries` (exposed as
+`zc_timeouts` on builds before the rename) rose 219 -> 7708 across the run
+(+7489 over 80000 bursts, ~9.4%) while throughput stayed at the ceiling and
+`zc_aborts` moved only 5 -> 6. That increment sits in the **shared** retry path,
+so it counts both RNR retries (`min_rnr_timer=12` -> 320 us) and ACK timeouts
+(`attr.timeout=14` -> 67 ms). The arithmetic shows which dominates: 7489 x
+67 ms would be 502 s, far more than the 132 s run, whereas 7489 x 320 us is
+2.4 s and fits easily. So these are cheap RNR retries, inherent to a window-4
+bidirectional bench that posts sends before the peer's receives are always
+armed, and handled correctly by the RC retry machinery. Not a defect, and not a
+stall indicator -- an earlier reading of this counter as "late ACKs causing
+whole-burst retransmission" was wrong and is recorded here so it is not
+re-derived.
 
 **8/8 runs consistent** after moderation; previously roughly 1 run in 4 landed
 in the fast regime and the rest fell to 18-225 MiB/s. Re-verified at the

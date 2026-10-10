@@ -115,7 +115,7 @@ numbers are recorded with them.
 
 `native_stats` now exposes the diagnostics that produced all of the above:
 `data_tx`/`data_rx` head/tail, `zdata_posted`, `qp_zc_state`/`offset`/
-`expect`/`received`, `zc_bursts`/`zc_timeouts`/`zc_aborts`, `poll_passes`/
+`expect`/`received`, `zc_bursts`/`zc_retries`/`zc_aborts`, `poll_passes`/
 `poll_sleeps`/`poll_wake_kick`/`poll_wake_tick`, `sched_calls`, `rnr_sent`.
 `idle_spin_us` is a 0644 module param so the latency/CPU knee can be swept
 without a reload.
@@ -133,7 +133,8 @@ max2: zc_expect=1       data_rx 3033462/3033399 (63 buffers armed) frozen
 ```
 
 Frames queued on one side, buffers armed on the other, nothing moving, then it
-self-resolves. `zc_timeouts` frozen proves no retransmit was in flight, so this
+self-resolves. `zc_timeouts` (renamed `zc_retries`; it counts RNR and ACK
+retries alike) frozen proves no retransmit was in flight, so this
 was not the software ring-reset desync first suspected (tested and ruled out),
 and not gradual E2E credit leakage either: raising `thunderbolt.dma_credits`
 from 14 to 64 left the degradation pattern unchanged.

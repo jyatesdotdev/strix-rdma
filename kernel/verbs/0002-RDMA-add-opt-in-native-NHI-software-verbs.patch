@@ -571,7 +571,7 @@ new file mode 100644
 +	unsigned int cq_count, mr_count;
 +	u64 pinned, key_serial, qpn_serial;
 +	u64 tx_frames, rx_frames, bad_frames, send_bytes, write_bytes, read_bytes;
-+	u64 zc_bursts, zc_aborts, zc_timeouts;
++	u64 zc_bursts, zc_aborts, zc_retries;
 +	/* Poller diagnostics: written only by the poller thread. */
 +	u64 poll_passes, poll_sleeps, poll_wake_kick, poll_wake_tick;
 +	u64 sched_calls, rnr_sent;
@@ -2096,9 +2096,9 @@ new file mode 100644
 +	ssize_t n;
 +
 +	mutex_lock(&d->lock);
-+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_timeouts %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\n",
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\n",
 +		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
-+		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_timeouts, d->zc_aborts,
++		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_retries, d->zc_aborts,
 +		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
 +		d->sched_calls, d->rnr_sent);
 +	if (d->qp) {
@@ -2316,7 +2316,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,592 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -2856,7 +2856,12 @@ new file mode 100644
 +		}
 +		q->rnr_wait = q->outgoing_sent = false;
 +		q->outgoing_offset = 0;
-+		if (q->zc_state != SN_ZC_NONE) d->zc_timeouts++;
++		/* Counts ZC send retries of BOTH kinds, since this path is shared:
++		 * RNR (peer had no receive armed; min_rnr_timer=12 -> 320 us) and
++		 * ACK timeout (attr.timeout=14 -> 67 ms). Do not read it as a stall
++		 * count -- a run can show thousands of these at wire rate, dominated
++		 * by cheap 320 us RNR retries. */
++		if (q->zc_state != SN_ZC_NONE) d->zc_retries++;
 +		q->zc_state = SN_ZC_NONE;
 +	}
 +	if (q->zc_state == SN_ZC_WAIT) {

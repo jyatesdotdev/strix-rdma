@@ -75,7 +75,7 @@ struct sn_device {
 	unsigned int head, count, sends, recvs, errors, placements, read_samples;
 	enum ib_wc_status last_error;
 	u64 bad_frames, send_bytes, write_bytes, read_bytes;
-	u64 zc_bursts, zc_timeouts, zc_aborts;
+	u64 zc_bursts, zc_retries, zc_aborts;
 	u64 sched_calls, rnr_sent;
 	bool check_ids;
 	u32 caps;

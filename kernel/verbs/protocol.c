@@ -537,7 +537,12 @@ void sn_engine_progress(struct sn_device *d)
 		}
 		q->rnr_wait = q->outgoing_sent = false;
 		q->outgoing_offset = 0;
-		if (q->zc_state != SN_ZC_NONE) d->zc_timeouts++;
+		/* Counts ZC send retries of BOTH kinds, since this path is shared:
+		 * RNR (peer had no receive armed; min_rnr_timer=12 -> 320 us) and
+		 * ACK timeout (attr.timeout=14 -> 67 ms). Do not read it as a stall
+		 * count -- a run can show thousands of these at wire rate, dominated
+		 * by cheap 320 us RNR retries. */
+		if (q->zc_state != SN_ZC_NONE) d->zc_retries++;
 		q->zc_state = SN_ZC_NONE;
 	}
 	if (q->zc_state == SN_ZC_WAIT) {
