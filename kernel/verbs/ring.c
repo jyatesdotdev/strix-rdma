@@ -96,13 +96,18 @@ int sn_data_rings_start(struct sn_device *d)
 		}
 		sn_data_slots_init(d, d->data_tx);
 		sn_data_slots_init(d, d->data_rx);
-		/* Moderate data TX completion interrupts before the ring goes live
-		 * (tb_ring_throttling requires a stopped ring). Without this the
-		 * per-frame interrupt rate at wire speed is what destabilises the
-		 * pipeline; the control ring stays unthrottled for ack latency. */
-		if (tb_ring_throttling(d->data_tx_ring, SN_DATA_TX_THROTTLE_NS))
+		/* Moderate data-ring interrupts before they go live
+		 * (tb_ring_throttling requires a stopped ring). Without this each
+		 * 4 KiB frame raises one interrupt: measured 1,229,852 RX
+		 * interrupts for 1,228,800 frames received. Batching them is safe
+		 * because the drain consumes every pending frame per pass (37 frames
+		 * accumulate per 128 us at wire speed, well inside the 64-slot ring).
+		 * The control ring stays unthrottled -- it carries the acks and
+		 * descriptors whose latency the 36 us ping-pong floor depends on. */
+		if (tb_ring_throttling(d->data_tx_ring, SN_DATA_THROTTLE_NS) ||
+		    tb_ring_throttling(d->data_rx_ring, SN_DATA_THROTTLE_NS))
 			dev_warn(&d->service->dev,
-				 "strix_nhi: data TX interrupt throttling unavailable\n");
+				 "strix_nhi: data ring interrupt throttling unavailable\n");
 		tb_ring_start(d->data_tx_ring);
 		tb_ring_start(d->data_rx_ring);
 	}
