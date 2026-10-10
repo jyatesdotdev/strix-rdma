@@ -234,6 +234,12 @@ static int sn_thread(void *arg)
 		 * sleep/wake round trip, then sleep on the 1 ms maintenance tick. */
 		if (++idle < READ_ONCE(idle_spin_us)) {
 			cpu_relax();
+			/* Yield regularly. Without this the spin monopolises the CPU and
+			 * starves the NHI's ring work that sets the slot-done flags this
+			 * loop is waiting for, so spinning longer made latency far worse
+			 * (measured: 1.3 ms at a 128 us window vs 17.6 ms at 20 ms). */
+			if (!(idle & 31))
+				cond_resched();
 			udelay(1);
 			continue;
 		}
