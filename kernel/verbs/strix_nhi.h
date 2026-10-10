@@ -19,6 +19,15 @@
  * left unthrottled so ack latency stays at the ~36 us ping-pong floor. */
 #define SN_DATA_THROTTLE_NS 128000
 #define SN_CONTROL_RESERVE 8
+
+/* Data-ring interrupt moderation, in ns; 0 disables it. Bulk throughput wants
+ * long batching -- 128 us took the link from bimodal 18-1313 MiB/s to a
+ * consistent 1182-1238 MiB/s by removing the per-frame interrupt storm -- but a
+ * latency-sensitive sender moving small batches pays up to one window per batch.
+ * Runtime-tunable (read-only: tb_ring_throttling requires a stopped ring, so a
+ * new value takes effect on the next module load) so the knee can be measured
+ * on hardware without a rebuild. Defined in main.c, consumed in ring.c. */
+extern unsigned int sn_data_throttle_ns;
 #define SN_SERVICE "strixv1"
 #define SN_CONTROL_BYTES 112
 /* Handshake retransmission intervals; loss is expected, peers retransmit. */

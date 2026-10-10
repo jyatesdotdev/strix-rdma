@@ -103,9 +103,12 @@ int sn_data_rings_start(struct sn_device *d)
 		 * because the drain consumes every pending frame per pass (37 frames
 		 * accumulate per 128 us at wire speed, well inside the 64-slot ring).
 		 * The control ring stays unthrottled -- it carries the acks and
-		 * descriptors whose latency the 36 us ping-pong floor depends on. */
-		if (tb_ring_throttling(d->data_tx_ring, SN_DATA_THROTTLE_NS) ||
-		    tb_ring_throttling(d->data_rx_ring, SN_DATA_THROTTLE_NS))
+		 * descriptors whose latency the 36 us ping-pong floor depends on.
+		 * The window is the data_throttle_ns module parameter; 0 leaves both
+		 * data rings unmoderated (lowest latency, per-frame interrupts). */
+		if (sn_data_throttle_ns &&
+		    (tb_ring_throttling(d->data_tx_ring, sn_data_throttle_ns) ||
+		     tb_ring_throttling(d->data_rx_ring, sn_data_throttle_ns)))
 			dev_warn(&d->service->dev,
 				 "strix_nhi: data ring interrupt throttling unavailable\n");
 		tb_ring_start(d->data_tx_ring);

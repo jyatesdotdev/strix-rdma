@@ -28,6 +28,13 @@ module_param(idle_spin_us, uint, 0644);
 MODULE_PARM_DESC(idle_spin_us,
 	"Microseconds the poller busy-polls while cold before sleeping (default 128)");
 
+/* Defined here, consumed by sn_data_rings_start(). See strix_nhi.h for the
+ * throughput/latency trade this dial controls. */
+unsigned int sn_data_throttle_ns = SN_DATA_THROTTLE_NS;
+module_param_named(data_throttle_ns, sn_data_throttle_ns, uint, 0444);
+MODULE_PARM_DESC(data_throttle_ns,
+	"Data ring interrupt moderation in ns, 0 to disable (default 128000; applied at ring start)");
+
 static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
 static struct tb_property_dir *sn_directory;

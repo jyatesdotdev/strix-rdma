@@ -104,42 +104,97 @@ Instrumented one gate request with full `native_stats` deltas on both hosts:
    nothing at gate granularity. It is still worth fixing for CPU efficiency,
    just not the cause of the regression.
 
-## Leading hypothesis (untested)
+## Tested and disproved: interrupt moderation
 
-`SN_DATA_THROTTLE_NS 128000`, the data-ring interrupt moderation that fixed the
-per-frame interrupt storm and took bulk throughput from bimodal 18–1313 MiB/s
-to a consistent 1182–1238 MiB/s. DS4's decode moves data in small batches, so
-each batch can wait up to one 128 us window for its interrupt. The request's
-5,768 frames/token at ~40 frames per window is ~145 windows/token, and
-145 x 128 us = **18.6 ms/token** — the size of the gap almost exactly.
+The leading suspect was `SN_DATA_THROTTLE_NS 128000`, the data-ring interrupt
+moderation that fixed the per-frame interrupt storm and took bulk throughput
+from bimodal 18–1313 MiB/s to a consistent 1182–1238 MiB/s. The arithmetic fit
+suspiciously well: 5,768 frames/token at ~40 frames per 128 us window is ~145
+windows/token, and 145 x 128 us = 18.6 ms/token — the size of the gap.
 
-That would make this a straightforward bulk-vs-latency trade: the moderation is
-right for a streaming bench and wrong for a latency-bound TP gate. The fix is
-not to remove it (that reintroduces the storm) but to make it adaptive — e.g.
-moderate only while the ring is actually backlogged, and leave it off when a
-pass drains the ring empty, so a lone batch is delivered immediately.
+It is wrong. `data_throttle_ns` was made a module parameter and the gate re-run
+with moderation **fully disabled**:
 
-A `data_throttle_ns` module parameter was added (main.c / ring.c / strix_nhi.h,
-**uncommitted**) to A/B the window without a rebuild per value.
+| `data_throttle_ns` | run 1 | run 2 | run 3 | median | sha |
+|---|---|---|---|---|---|
+| 128000 (default) | 10.99 | 11.56 | 11.52 | **11.52 t/s** | `d3d7c7514465a3e2` |
+| 0 (moderation off) | 10.77 | 11.44 | 11.55 | **11.44 t/s** | `d3d7c7514465a3e2` |
 
-## Blocker on testing that hypothesis
+No difference. Moderation is not the cause, and an adaptive-ITR scheme would
+have bought nothing — worth recording so it is not built.
 
-The module cannot be built against stock kernel headers. `main.c:163` reads
-`tb_service_parent(d->service)->native_dma_stopping`, a field added by
-`0001-thunderbolt-native-path-lifetime.patch`; an out-of-tree build against
-`/usr/src/kernels/7.2.8-100.fc43.x86_64` fails with
-`compiletime_assert_atomic_type` on that `smp_load_acquire`. The hosts run a
-patched `thunderbolt.ko` from `updates/`, and `native_dma_stopping` is absent
-from their stock headers — but the patched build tree is no longer present
-(only `~/linux-stable-handedits-backup-20260831.patch`). **So the param change
-has no compile verification and is deliberately not committed.** Restoring a
-patched tree is the prerequisite for any further kernel-side tuning.
+The parameter stays: it is now the only way to change the moderation window,
+it is verified end to end (module loads, both ports ACTIVE, DS4 bit-exact at
+both settings), and `/etc/modprobe.d/strix-nhi-throttle.conf` pins the
+bulk-safe 128000 as the boot default. It is read-only at runtime because
+`tb_ring_throttling()` requires a stopped ring, and the value lands in a
+hardware per-vector register — `nhi.c:125` does
+`itr = DIV_ROUND_UP(ring->interval_nsec, 256)` into
+`REG_INT_THROTTLING_RATE + ring->vector * 4`, written only at ring interrupt
+enable/disable. Live adaptation would need a core patch plus a `thunderbolt.ko`
+reload, which is the most wedge-prone operation available; not worth it for a
+dial that measurably does not move this workload.
+
+## Current leading hypothesis
+
+With bandwidth, retransmits, poller sleep, cold spin and interrupt moderation
+all excluded, what remains is **per-frame cost in the provider's completion
+path**. The numbers say the workload is dominated by small frames: 1,153,528
+frames per request carrying 384 MiB is **~350 bytes per frame**, at only
+66.7k frames/s per direction — versus the ~310k full 4 KiB frames/s this link
+sustains in bench. So DS4 is at ~21% of the provider's frame-rate capability
+while using 1.8% of its bandwidth.
+
+19.6 ms/token over 5,768 frames/token is **~3.4 us per frame**, and the likely
+sink is `d->lock`: the poller took it 1.52M times in 17.3 s (~88k/s, one pass
+per ~1.3 frames) while DS4's own `poll_cq` calls need the same mutex. At that
+acquisition rate an average wait of a few microseconds is exactly the right
+order. This also explains why `idle_spin_us` changed nothing — pass count is
+driven by frame count, not by the spin, so the lock churn is identical at 0.
+
+The next measurement should be provider-side lock hold/wait time and
+`poll_cq` cost per call, not another transport-level sweep.
+
+## Build recipe (the earlier blocker was a false alarm)
+
+The patched tree was present all along at `~/src/linux-stable` on both hosts —
+Linux 7.2.8, clean, at `6c7bcbd24` ("RDMA: add opt-in experimental native NHI
+software verbs"), with `native_dma_stopping` at `include/linux/thunderbolt.h:292`.
+The earlier "not in stock headers" finding was my own `head -5` truncating the
+grep.
+
+The top-level `Module.symvers` is stale, so an `M=` build fails modpost with
+`tb_xdomain_try_enable_native_paths` undefined. The patched core's symbols live
+in the subdirectory symvers:
+
+```sh
+cd ~/src/linux-stable
+make M=drivers/infiniband/hw/strix_nhi \
+     KBUILD_EXTRA_SYMBOLS=$PWD/drivers/thunderbolt/Module.symvers modules
+sudo cp drivers/infiniband/hw/strix_nhi/strix_nhi.ko /lib/modules/$(uname -r)/updates/
+sudo depmod -a
+```
+
+BTF generation is skipped (no vmlinux); harmless here.
+
+## Re-probe risk is real but survived twice
+
+`tools/scripts/strix-verbs-bringup.sh` warns to load `strix_nhi` **exactly once
+per boot**, because re-probing after heavy bursts has wedged the router's DMA
+path config space (`DMA RX path activation failed: -110`), survivable only by
+power cycle. This session re-probed both hosts twice — once after DS4 had
+pushed ~3.5 GiB — and both came back ACTIVE in ~3 s with a bit-exact gate
+afterwards. So the wedge is load-dependent, not guaranteed, but it is still a
+gamble: **do not build a tuning loop on module reloads.** Set the parameter via
+`modprobe.d` and take one boot per value.
 
 ## Verdict
 
-Do not make verbs the default yet. It is correct (bit-exact, zero bad frames,
-real 2 MiB zero-copy bursts) and it holds a stable link under a real model
-server, but at the acceptance gate it is 22.6% behind plain TCP over a *slower*
-5 GbE LAN — while using 1.8% of the TB link's measured capacity. The transport
-is leaving its advantage on the table in the latency regime DS4 actually runs
-in. Next step is the moderation knee, which needs the patched build tree back.
+Do not make verbs the default yet. It is correct (bit-exact across twelve
+requests, two transports, three poller settings and two moderation settings;
+zero bad frames; real 2 MiB zero-copy bursts) and it holds a stable link under
+a real model server, but at the acceptance gate it is 22.6% behind plain TCP
+over a *slower* 5 GbE LAN — while using 1.8% of the TB link's measured capacity
+and 21% of the provider's own frame-rate capability. The transport is not
+bandwidth- or interrupt-limited here; the cost is per-frame, most likely `d->lock`
+contention between the resident poller and DS4's `poll_cq`.
