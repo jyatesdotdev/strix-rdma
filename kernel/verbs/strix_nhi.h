@@ -87,9 +87,14 @@ struct sn_device {
 	struct mutex lock;
 	spinlock_t ring_lock;
 	/* Resident poller: replaces the delayed_work whose dispatch latency
-	 * (ring_work then the work item) dominated receive latency. */
+	 * (ring_work then the work item) dominated receive latency.
+	 * poll_kick is the explicit wake latch: wait_event re-tests its
+	 * condition on every wake and sleeps again when it is false, so a
+	 * bare wake_up can be lost when the ring peek has not yet observed
+	 * the frame. Every sn_schedule sets the latch first. */
 	struct task_struct *thread;
 	wait_queue_head_t poll_wait;
+	bool poll_kick;
 	struct tb_ring *tx_ring, *rx_ring;
 	struct sn_slot tx[SN_RING_SIZE], rx[SN_RING_SIZE];
 	unsigned int tx_head, tx_tail, rx_tail;

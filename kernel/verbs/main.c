@@ -30,8 +30,10 @@ static struct tb_property_dir *sn_directory;
  * thread has been stopped, so it needs no teardown ordering of its own. */
 void sn_schedule(struct sn_device *d)
 {
-	if (READ_ONCE(d->registered) && !READ_ONCE(d->dead))
+	if (READ_ONCE(d->registered) && !READ_ONCE(d->dead)) {
+		WRITE_ONCE(d->poll_kick, true);
 		wake_up(&d->poll_wait);
+	}
 }
 static void sn_gid_from_uuid(union ib_gid *gid, const uuid_t *uuid)
 {
@@ -219,8 +221,14 @@ static int sn_thread(void *arg)
 			udelay(1);
 			continue;
 		}
+		/* Clear the latch immediately before waiting. wait_event queues us
+		 * before testing the condition, so a sn_schedule racing with the
+		 * sleep either makes the test pass or wakes the queued entry --
+		 * the kick cannot be lost either way. */
+		WRITE_ONCE(d->poll_kick, false);
 		wait_event_timeout(d->poll_wait,
-			sn_ring_pending(d) || READ_ONCE(d->control_count) ||
+			READ_ONCE(d->poll_kick) || sn_ring_pending(d) ||
+			READ_ONCE(d->control_count) ||
 			READ_ONCE(d->dead) || kthread_should_stop(),
 			msecs_to_jiffies(1));
 		idle = 0;

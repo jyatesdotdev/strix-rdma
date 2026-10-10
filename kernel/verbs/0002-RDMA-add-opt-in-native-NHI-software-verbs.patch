@@ -435,7 +435,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,190 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -525,9 +525,14 @@ new file mode 100644
 +	struct mutex lock;
 +	spinlock_t ring_lock;
 +	/* Resident poller: replaces the delayed_work whose dispatch latency
-+	 * (ring_work then the work item) dominated receive latency. */
++	 * (ring_work then the work item) dominated receive latency.
++	 * poll_kick is the explicit wake latch: wait_event re-tests its
++	 * condition on every wake and sleeps again when it is false, so a
++	 * bare wake_up can be lost when the ring peek has not yet observed
++	 * the frame. Every sn_schedule sets the latch first. */
 +	struct task_struct *thread;
 +	wait_queue_head_t poll_wait;
++	bool poll_kick;
 +	struct tb_ring *tx_ring, *rx_ring;
 +	struct sn_slot tx[SN_RING_SIZE], rx[SN_RING_SIZE];
 +	unsigned int tx_head, tx_tail, rx_tail;
@@ -625,7 +630,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,468 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -658,8 +663,10 @@ new file mode 100644
 + * thread has been stopped, so it needs no teardown ordering of its own. */
 +void sn_schedule(struct sn_device *d)
 +{
-+	if (READ_ONCE(d->registered) && !READ_ONCE(d->dead))
++	if (READ_ONCE(d->registered) && !READ_ONCE(d->dead)) {
++		WRITE_ONCE(d->poll_kick, true);
 +		wake_up(&d->poll_wait);
++	}
 +}
 +static void sn_gid_from_uuid(union ib_gid *gid, const uuid_t *uuid)
 +{
@@ -847,8 +854,14 @@ new file mode 100644
 +			udelay(1);
 +			continue;
 +		}
++		/* Clear the latch immediately before waiting. wait_event queues us
++		 * before testing the condition, so a sn_schedule racing with the
++		 * sleep either makes the test pass or wakes the queued entry --
++		 * the kick cannot be lost either way. */
++		WRITE_ONCE(d->poll_kick, false);
 +		wait_event_timeout(d->poll_wait,
-+			sn_ring_pending(d) || READ_ONCE(d->control_count) ||
++			READ_ONCE(d->poll_kick) || sn_ring_pending(d) ||
++			READ_ONCE(d->control_count) ||
 +			READ_ONCE(d->dead) || kthread_should_stop(),
 +			msecs_to_jiffies(1));
 +		idle = 0;
