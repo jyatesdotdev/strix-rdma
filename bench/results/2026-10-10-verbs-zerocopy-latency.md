@@ -156,6 +156,9 @@ Two fixes were tried and reverted en route, recorded so they are not retried:
 ## Reproducing
 
 ```sh
+# bring the stack up (idempotent; no-ops if already ACTIVE)
+sudo tools/scripts/strix-verbs-bringup.sh
+
 # latency (connector prints avg/min/max RTT)
 ./strix-verbs-smoke --live strix_nhi0 listen  <ip> 4789 ping 2000
 ./strix-verbs-smoke --live strix_nhi0 connect <ip> 4789 ping 2000
@@ -168,5 +171,10 @@ Two fixes were tried and reverted en route, recorded so they are not retried:
 cat /sys/class/infiniband/strix_nhi0/native_stats
 ```
 
-Bring-up requires the no-TB-IP mode and a single load per boot; see
-`docs/ZEROCOPY_VERBS.md` ("Operational notes").
+Bring-up needs the no-TB-IP mode and a single load per boot; the script
+enforces both. See `docs/ZEROCOPY_VERBS.md` ("Operational notes") for why, and
+for the conflict with the USB4STREAM setup.
+
+Final confirmation after a clean reboot brought up entirely by the script:
+3/3 further runs at 1070-1156 MiB/s, smoke PASS -- 15/15 consistent runs
+overall since interrupt moderation landed.

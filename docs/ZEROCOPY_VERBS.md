@@ -168,18 +168,33 @@ retried:
 
 ### Operational notes
 
+`tools/scripts/strix-verbs-bringup.sh` performs the whole sequence below and is
+idempotent: if strix_nhi is already loaded and the port is ACTIVE it changes
+nothing, because reloading a live data plane is the one operation that can wedge
+the router. It exits 3 (advisory, not fatal) when the module loaded but the port
+has not gone ACTIVE yet, which is the normal case when both nodes boot together
+-- the handshake retransmits every 100 ms and converges without intervention.
+
 - The nodes' initramfs carries the **stock** thunderbolt module (no custom
   symbols). After any reboot, reload the stack from the updates build before
   strix_nhi will probe: `modprobe -r thunderbolt` then `modprobe thunderbolt`.
+  The script verifies the loaded core actually exports
+  `tb_xdomain_try_enable_native_paths` rather than trusting the path.
 - thunderbolt_net **auto-loads** via its module alias when the XDomain appears.
-  For no-TB-IP mode it must be blacklisted (`/etc/modprobe.d/strix-zc-test.conf`)
-  or NetworkManager brings it back and the carrier gate wedges.
+  For no-TB-IP mode it must be blacklisted; `blacklist` alone is insufficient
+  because it only suppresses alias-based autoload, so an explicit
+  modules-load.d entry (the stream path installs `ds4-tbnet.conf`) would still
+  pull it in. The script writes `blacklist` plus `install thunderbolt_net
+  /bin/false` to `/etc/modprobe.d/strix-nhi-verbs-zc.conf`.
 - `strix_nhi` is not auto-loaded at boot; load it **once** per boot.
-- Re-probe (`rmmod`/`modprobe`) has been reliable across ~6 cycles when only
+- Re-probe (`rmmod`/`modprobe`) has been reliable across many cycles when only
   the staged path or short benches ran. The router-level wedge seen earlier
   (`DMA RX path activation failed: -110`) correlated with heavy data-plane
   bursts, is not cleared by a clean teardown, a settle, or an NHI PCI FLR --
   only a power cycle. Treat reboot as the safe path after intensive benching.
+- This mode conflicts with the USB4STREAM setup, which requires thunderbolt_net
+  present and carrier up (see `tools/systemd/tbstream-lifecycle.md`). The two
+  cannot be enabled on the same link at the same time.
 
 ### Reverted experiments (recorded so they are not retried blind)
 
