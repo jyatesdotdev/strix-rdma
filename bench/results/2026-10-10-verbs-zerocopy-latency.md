@@ -31,7 +31,10 @@ Throughput, DS4's shape (window 4 x 2 MiB, bidirectional, per direction):
 | before interrupt moderation | 18-1313 MiB/s (bimodal) | 1.4-77 s |
 
 **8/8 runs consistent** after moderation; previously roughly 1 run in 4 landed
-in the fast regime and the rest fell to 18-225 MiB/s.
+in the fast regime and the rest fell to 18-225 MiB/s. Re-verified at the
+default `thunderbolt.dma_credits=14` (the 8/8 sweep had run at 64): 4/4 further
+runs at 1198-1247 MiB/s, so the fix does not depend on a larger credit window.
+12/12 consistent runs total.
 
 On-host 200 ms sampling of `placed_send_bytes` during a healthy run shows the
 rate is steady, not a warm-up artifact:
