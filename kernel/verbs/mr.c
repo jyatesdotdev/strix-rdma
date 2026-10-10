@@ -68,6 +68,8 @@ int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m)
 		return -ENOMEM;
 	m->map_dev = dev;
 	m->map_nents = n;
+	/* The segment list identity may have changed; drop any stale cursor. */
+	m->cur_sg = NULL; m->cur_idx = 0; m->cur_off = 0;
 	return 0;
 }
 /* NHI DMA address for an iova inside the MR, and the contiguous bytes
@@ -75,14 +77,23 @@ int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m)
 dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len)
 {
 	struct scatterlist *sg;
-	u64 skip = address - m->base + ib_umem_offset(m->umem), off = 0;
-	int i;
+	u64 skip = address - m->base + ib_umem_offset(m->umem), off;
+	unsigned int i;
 
 	*max_len = 0;
-	for_each_sg(m->umem->sgt_append.sgt.sgl, sg, m->map_nents, i) {
+	/* Resume from the cursor when the walk moves forward, which is the normal
+	 * case within a burst; otherwise restart from the head. */
+	if (m->cur_sg && skip >= m->cur_off) {
+		sg = m->cur_sg; off = m->cur_off; i = m->cur_idx;
+	} else {
+		sg = m->umem->sgt_append.sgt.sgl; off = 0; i = 0;
+	}
+	for (; i < (unsigned int)m->map_nents && sg; i++, sg = sg_next(sg)) {
 		if (skip < off + sg_dma_len(sg)) {
 			u64 inner = skip - off;
+
 			*max_len = sg_dma_len(sg) - inner;
+			m->cur_sg = sg; m->cur_idx = i; m->cur_off = off;
 			return sg_dma_address(sg) + inner;
 		}
 		off += sg_dma_len(sg);
@@ -127,6 +138,7 @@ struct ib_mr *sn_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	m->base = iova; m->size = length; m->pinned = pinned; m->access = access;
 	m->ib.iova = iova; m->ib.length = length;
 	m->map_nents = 0; m->map_dev = NULL;
+	m->cur_sg = NULL; m->cur_idx = 0; m->cur_off = 0;
 	list_add_tail(&m->entry, &d->mrs);
 	d->mr_count++; d->pinned += pinned;
 	mutex_unlock(&d->lock);

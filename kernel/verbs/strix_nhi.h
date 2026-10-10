@@ -32,6 +32,17 @@ struct sn_mr {
 	 * data-ring frames point directly at these addresses). 0 when unmapped. */
 	int map_nents;
 	struct device *map_dev;
+	/* Sequential DMA-lookup cursor, valid only while map_nents != 0 and
+	 * mutated only under d->lock. Bursts walk an MR forward one frame at a
+	 * time, so resuming from the last position makes each lookup O(1)
+	 * amortized instead of O(map_nents). Without it the per-frame walk was
+	 * quadratic over a burst, and because dma_map_sg's merged segment count
+	 * depends on allocation contiguity, throughput came out bimodal:
+	 * ~1100 MiB/s on a freshly allocated contiguous MR vs 45-150 MiB/s on a
+	 * fragmented one with ~2048 segments. */
+	struct scatterlist *cur_sg;
+	unsigned int cur_idx;
+	u64 cur_off;
 };
 struct sn_cq {
 	struct ib_cq ib;
