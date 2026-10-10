@@ -292,12 +292,6 @@ static void sn_receive_zc_ready(struct sn_qp *q, const struct sn_header *h)
 {
 	if (q->zc_state != SN_ZC_WAIT || h->ack_sequence != q->next_sequence) return;
 	q->zc_state = SN_ZC_SENDING;
-	/* Arm the stall watchdog on entry. A burst blocked on a full data TX ring
-	 * returns -EAGAIN without ever reaching the SN_ZC_SENT arm below, so
-	 * without this the state had no deadline at all and only the 30 s
-	 * progress_deadline could recover it -- measured as multi-second
-	 * throughput collapses with the ring frozen full. */
-	q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
 }
 /* Data-ring drain hook: header-less payload bytes landed for the expected
  * burst. Called by the platform receive path under d->lock. */
@@ -553,17 +547,6 @@ void sn_engine_progress(struct sn_device *d)
 		}
 		q->zc_state = SN_ZC_NONE;
 	}
-	/* Sending-side stall watchdog. Unlike SN_ZC_WAIT this must not return
-	 * while the deadline is still ahead: the burst has to keep queueing
-	 * frames every pass. Only act once it has expired with no progress. */
-	if (q->zc_state == SN_ZC_SENDING && now >= q->deadline) {
-		if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
-			sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
-		}
-		d->zc_timeouts++;
-		q->zc_state = SN_ZC_NONE;
-		q->zc_offset = 0;
-	}
 	h = sn_out_header(q, w->opcode);
 	h.sequence = q->next_sequence; h.total = w->length;
 	h.address = w->remote_address; h.rkey = w->rkey;
@@ -577,19 +560,13 @@ void sn_engine_progress(struct sn_device *d)
 				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
 			}
 			break;
-		case SN_ZC_SENDING: {
-			u32 before = q->zc_offset;
-
+		case SN_ZC_SENDING:
 			ret = sn_data_send_burst(d, q);
 			if (!ret) {
 				q->zc_state = SN_ZC_SENT; q->outgoing_sent = true;
-			}
-			/* Refresh the watchdog whenever the burst advanced, so a large
-			 * transfer that is merely slow is not mistaken for a stall. */
-			if (!ret || q->zc_offset != before)
 				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
+			}
 			break;
-		}
 		default:
 			ret = 0; break;
 		}
