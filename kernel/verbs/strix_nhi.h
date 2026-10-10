@@ -117,6 +117,8 @@ struct sn_device {
 	u64 pinned, key_serial, qpn_serial;
 	u64 tx_frames, rx_frames, bad_frames, send_bytes, write_bytes, read_bytes;
 	u64 zc_bursts, zc_aborts, zc_timeouts;
+	/* Poller diagnostics: written only by the poller thread. */
+	u64 poll_passes, poll_sleeps, poll_wake_kick, poll_wake_tick;
 	struct list_head mrs;
 	struct sn_qp *qp;
 	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */

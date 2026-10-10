@@ -17,9 +17,16 @@ MODULE_PARM_DESC(enable, "Explicitly enable experimental native NHI software ver
 /* Poller scheduling: drain this many passes per wake before yielding the
  * lock to uverbs, and busy-poll up to this many microseconds while cold
  * before sleeping. The 1 ms sleep keeps the maintenance tick (refresh,
- * rendezvous publish, handshake) that the old workqueue backstop provided. */
+ * rendezvous publish, handshake) that the old workqueue backstop provided.
+ * The spin window is a runtime-tunable so the latency/CPU knee can be
+ * measured on hardware without a rebuild or reload. */
 #define SN_PASS_BUDGET	8
 #define SN_IDLE_SPIN_US	128
+
+static unsigned int idle_spin_us = SN_IDLE_SPIN_US;
+module_param(idle_spin_us, uint, 0644);
+MODULE_PARM_DESC(idle_spin_us,
+	"Microseconds the poller busy-polls while cold before sleeping (default 128)");
 
 static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
@@ -212,6 +219,7 @@ static int sn_thread(void *arg)
 				WRITE_ONCE(d->poll_kick, false);
 			maintenance = false;
 			idle = 0;
+			d->poll_passes++;
 			if (sn_pass(d)) {
 				/* Still busy: yield the CPU to uverbs between passes
 				 * (d->lock is not held here) and go again. */
@@ -224,16 +232,23 @@ static int sn_thread(void *arg)
 		/* Cold: hold the CPU briefly so an imminent frame (a ping-pong
 		 * reply lands tens of microseconds away) is caught without a
 		 * sleep/wake round trip, then sleep on the 1 ms maintenance tick. */
-		if (++idle < SN_IDLE_SPIN_US) {
+		if (++idle < READ_ONCE(idle_spin_us)) {
 			cpu_relax();
 			udelay(1);
 			continue;
 		}
+		d->poll_sleeps++;
 		wait_event_timeout(d->poll_wait,
 			READ_ONCE(d->poll_kick) || sn_ring_pending(d) ||
 			READ_ONCE(d->control_count) ||
 			READ_ONCE(d->dead) || kthread_should_stop(),
 			msecs_to_jiffies(1));
+		/* Attribute the wake: the latch is only set by sn_schedule, so a
+		 * set latch means a kick reached us rather than the 1 ms tick. */
+		if (READ_ONCE(d->poll_kick))
+			d->poll_wake_kick++;
+		else
+			d->poll_wake_tick++;
 		idle = 0;
 		maintenance = true;
 	}
