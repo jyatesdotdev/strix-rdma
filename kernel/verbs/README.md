@@ -463,6 +463,30 @@ suites cover the happy path, lost `ZC_READY`, lost burst and the gate itself,
 but they model a *lost* burst rather than a *late* one arriving after
 completion, which is why they did not catch this.
 
+**Gated build re-validated after a second clean reboot (same day).** With
+`zc_write=N` (the default) all three modes pass on both sides:
+
+- SEND/RECV smoke: 18,878,353 bytes, byte-for-byte, `zc_bursts` exercised.
+- `write 200`: **PASS** — 1,677,721,600 bytes placed and verified byte-for-byte
+  in 27.2 s (58.81 MiB/s). This is the run that failed intermittently at
+  iteration 22–32 before the gate. `zc_bursts` rose by only 9 across the whole
+  sequence, confirming WRITE stayed on the staged control-ring path.
+- `read 200`: **PASS** — 1,677,721,600 bytes verified byte-for-byte in 25.6 s
+  (62.62 MiB/s).
+- `bad_frames 0` throughout.
+
+So the gate does what it exists to do: WRITE and READ are correct and safe today,
+at staged-path speed. **The gate costs roughly 7x WRITE throughput** — ~425 MiB/s
+for zero-copy WRITE in the short runs that completed, against 58.81 MiB/s staged —
+which is the size of the prize for root-causing the replay ordering.
+
+Bulk SEND throughput after the clean reboot was **1127–1191 MiB/s** over 5 runs
+(mean 1158), `bad_frames 0`, retry rate 462/6000 bursts = 7.7% (the recorded
+endurance run was 9.4%, so this is normal). That is at or above the 1070–1156
+MiB/s this stack recorded for previous script-brought-up post-reboot runs; the
+1182–1238 MiB/s headline band was measured pre-reboot and is not the like-for-like
+comparison.
+
 Also not yet run:
 hot-unplug/malformed-peer injection; sustained multi-hour endurance; an
 end-to-end inference re-run over the zero-copy data plane (the earlier proven run
