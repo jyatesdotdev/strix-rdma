@@ -181,11 +181,43 @@ static void test_zc_descriptors(void)
 	h.address = SN_FRAME; assert(!sn_header_valid(&h));
 	puts("ok 7 - zero-copy descriptors: ZC_WRITE requires rkey/address, ZC_SEND forbids them");
 }
+/* The zero-copy READ request names the responder's source MR exactly as a staged
+ * SN_READ does. The reply itself carries no header at all: it is payload frames
+ * on the data ring, so the descriptor must stay header-less like the other two
+ * burst descriptors and must not be confused with a staged SN_READ_REPLY. */
+static void test_zc_read_descriptor(void)
+{
+	struct sn_header h = header(), got;
+	sn_u8 p[SN_FRAME];
+
+	h.opcode = SN_ZC_READ; h.total = SN_MESSAGE;
+	assert(!sn_header_valid(&h));
+	h.address = SN_FRAME; assert(!sn_header_valid(&h));
+	h.rkey = 7; assert(sn_header_valid(&h));
+	h.address = 0; assert(sn_header_valid(&h));
+	h.address = ~(sn_u64)0; assert(!sn_header_valid(&h));
+	h.address = SN_FRAME;
+	assert(!sn_encode(p, sizeof(p), &h) && !sn_decode(&got, p, SN_HEADER));
+	assert(!memcmp(&got, &h, sizeof(h)));
+	assert(got.opcode == SN_ZC_READ && got.rkey == 7 && got.address == SN_FRAME &&
+	       got.total == SN_MESSAGE && got.sequence == 0xffffff &&
+	       !got.length && !got.offset && !got.status && !got.ack_sequence);
+	h.length = 1; assert(!sn_header_valid(&h)); h.length = 0;
+	h.offset = 1; assert(!sn_header_valid(&h)); h.offset = 0;
+	h.status = SN_ACCESS; assert(!sn_header_valid(&h)); h.status = SN_OK;
+	h.ack_sequence = 1; assert(!sn_header_valid(&h)); h.ack_sequence = 0;
+	h.sequence = 0; assert(!sn_header_valid(&h)); h.sequence = 0xffffff;
+	h.rkey = 0; assert(!sn_header_valid(&h)); h.rkey = 7;
+	h.total = 0; assert(!sn_header_valid(&h));
+	h.total = SN_MESSAGE + 1; assert(!sn_header_valid(&h)); h.total = SN_MESSAGE;
+	h.src_qpn = 0; assert(!sn_header_valid(&h));
+	puts("ok 9 - zero-copy READ request: source rkey/address required, reply stays header-less");
+}
 int main(void)
 {
 	unsigned int id;
 
-	puts("1..8");
+	puts("1..9");
 	test_codec(); test_admission(); test_opcodes(); test_zc_descriptors();
 	assert(sn_crc((const sn_u8 *)"123456789", 9) == 0xe3069283U);
 	for (id = 0; id <= 0xffff; id++) {
@@ -193,5 +225,6 @@ int main(void)
 		assert(sn_supported_nhi(id, 0x158e) == (id == 0x1022));
 	}
 	puts("ok 8 - CRC32C reference vector and exhaustive admitted PCI identity predicate");
+	test_zc_read_descriptor();
 	return 0;
 }

@@ -32,6 +32,8 @@ extern unsigned int sn_data_throttle_ns;
 /* Opt-in zero-copy RDMA WRITE, defined in main.c and latched into
  * sn_device::zc_write by ring.c when the data plane comes up. */
 extern bool sn_zc_write;
+/* Opt-in zero-copy RDMA READ, same shape and latched the same way. */
+extern bool sn_zc_read;
 #define SN_SERVICE "strixv1"
 #define SN_CONTROL_BYTES 112
 /* Handshake retransmission intervals; loss is expected, peers retransmit. */
@@ -102,11 +104,24 @@ struct sn_qp {
 	u32 zc_total, zc_received;
 	/* Landing zone of the burst this side is receiving: the matched receive
 	 * WQE's MR for SN_ZC_SEND, the requester-addressed remote MR for
-	 * SN_ZC_WRITE. Set by sn_receive_zc before sn_data_recv_start and cleared
-	 * the moment the expected byte count lands. Holds no reference of its own:
-	 * the owner is the receive WQE or q->remote_mr, which both outlive it. */
+	 * SN_ZC_WRITE, and for SN_ZC_READ the local MR of this side's own READ WQE,
+	 * which the requester arms before the descriptor goes out. Set by
+	 * sn_receive_zc (or the READ arm) before sn_data_recv_start and cleared the
+	 * moment the expected byte count lands. Holds no reference of its own:
+	 * the owner is the receive WQE, q->remote_mr or the SQ WQE, which all
+	 * outlive it. */
 	struct sn_mr *zc_mr;
 	u64 zc_address;
+	/* True while the armed landing zone belongs to this side's own zero-copy
+	 * READ rather than to a peer-initiated SEND/WRITE burst: the completion is
+	 * an SQ WQE and an SN_READ_ACK, not a receive WQE and an SN_ACK. */
+	bool zc_read_armed;
+	/* Inbound burst descriptor held because the landing zone was busy with our
+	 * own zero-copy READ response; re-driven by sn_engine_progress as soon as it
+	 * frees. Header-less frames from two bursts could not be told apart, so one
+	 * inbound burst at a time is the invariant this preserves. */
+	bool zc_held;
+	struct sn_header zc_held_header;
 };
 struct sn_slot {
 	struct ring_frame frame;
@@ -148,6 +163,8 @@ struct sn_device {
 	 * engine suite (which compiles protocol.c against stubs and never links
 	 * main.c) needs no new symbol. */
 	bool zc_write;
+	/* Latched from the zc_read module parameter the same way; default off. */
+	bool zc_read;
 	int in_hop, out_hop;
 	/* Zero-copy data-plane HopIDs (second path tuple); -1 when unavailable. */
 	int in_hop2, out_hop2;
@@ -217,10 +234,13 @@ dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len);
 /* Zero-copy data-plane platform hooks (kernel: ring.c; tests: modeled).
  * sn_data_send_burst queues header-less payload frames for the active SQ op
  * from its MR, returning 0 when the whole message is queued, -EAGAIN when
- * the data ring is full. sn_data_recv_start posts the q->zc_mr pages at
- * q->zc_address for the expected burst; sn_data_recv_restart re-posts them
- * from offset zero for a retried burst. */
+ * the data ring is full. sn_data_response_burst does the same for a zero-copy
+ * READ response, which has no SQ WQE and bursts from the source MR the request
+ * named. sn_data_recv_start posts the q->zc_mr pages at q->zc_address for the
+ * expected burst; sn_data_recv_restart re-posts them from offset zero for a
+ * retried burst. */
 int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
+int sn_data_response_burst(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_start(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 /* Abort an in-progress burst and reclaim both data rings (called from

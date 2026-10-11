@@ -36,7 +36,7 @@ enum sn_opcode {
 	SN_SEND = 1, SN_WRITE = 2, SN_READ = 3, SN_READ_REPLY = 4,
 	SN_ACK = 5, SN_READ_ACK = 6, SN_CREDIT = 7,
 	SN_HELLO = 8, SN_HELLO_ACK = 9, SN_BIND = 10, SN_BIND_ACK = 11,
-	SN_ZC_SEND = 12, SN_ZC_READY = 13, SN_ZC_WRITE = 14
+	SN_ZC_SEND = 12, SN_ZC_READY = 13, SN_ZC_WRITE = 14, SN_ZC_READ = 15
 };
 /* HELLO/HELLO_ACK capability bits in total: v1 is SEND/WRITE/READ. */
 #define SN_CAPS_V1 0x7U
@@ -144,6 +144,14 @@ static inline int sn_header_valid(const struct sn_header *h)
 		/* Zero-copy WRITE burst descriptor: same header-less data-ring payload,
 		 * but the responder places it in the requester's named remote MR, so
 		 * address/rkey are required exactly as they are for a staged SN_WRITE. */
+		return sn_qp_fields_valid(h) && h->total && h->sequence && !h->length &&
+		       !h->offset && h->rkey && !h->status && !h->ack_sequence &&
+		       h->address <= ~(sn_u64)0 - h->total;
+	case SN_ZC_READ:
+		/* Zero-copy READ request: the responder bursts the reply as header-less
+		 * frames from the named source MR, so address/rkey are required exactly
+		 * as they are for a staged SN_READ. The requester arms its own landing
+		 * zone before sending this, so no SN_ZC_READY follows it. */
 		return sn_qp_fields_valid(h) && h->total && h->sequence && !h->length &&
 		       !h->offset && h->rkey && !h->status && !h->ack_sequence &&
 		       h->address <= ~(sn_u64)0 - h->total;

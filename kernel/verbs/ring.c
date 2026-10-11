@@ -123,6 +123,7 @@ int sn_data_rings_start(struct sn_device *d)
 		return ret;	/* EAGAIN retries next pass; rings stay allocated. */
 	d->zdata = true;
 	d->zc_write = sn_zc_write;
+	d->zc_read = sn_zc_read;
 	d->caps = SN_CAPS_V1 | SN_CAP_ZDATA;
 	return 0;
 }
@@ -237,6 +238,7 @@ int sn_rings_stop(struct sn_device *d)
 	if (d->data_rx_ring) { tb_ring_free(d->data_rx_ring); d->data_rx_ring = NULL; }
 	d->zdata = false;
 	d->zc_write = false;
+	d->zc_read = false;
 	d->caps = SN_CAPS_V1;
 	d->data_tx_head = d->data_tx_tail = d->data_rx_head = d->data_rx_tail = 0;
 	d->rx_primed = false;
@@ -310,40 +312,43 @@ void sn_ring_receive(struct sn_device *d)
 			sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
 	}
 }
-/* Sender: queue header-less payload frames for the active SQ op from its MR.
- * Frames never span a physical page; the burst address must be page-aligned
- * (checked by the engine's eligibility). Returns 0 when the whole message is
- * queued, -EAGAIN when the data TX ring is full. */
-int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
+/* Queue header-less payload frames for one burst: the source MR, the address
+ * inside it, the total bytes, and the cursor to advance. Frames never span a
+ * physical page; the burst address must be page-aligned (checked by the
+ * engine's eligibility). Returns 0 when the whole message is queued, -EAGAIN
+ * when the data TX ring is full. The cursor belongs to the caller because not
+ * every burst has an SQ WQE: a READ response bursts from the source MR the
+ * request named and tracks its own offset. */
+static int sn_data_burst(struct sn_device *d, struct sn_mr *mr, u64 address,
+			 u32 total, u32 *offset)
 {
-	struct sn_wqe *w = &q->sq[q->sq_head];
 	int ret;
 
 	lockdep_assert_held(&d->lock);
 	if (!d->zdata || d->dead || d->reset_rings)
 		return -ENOLINK;
-	ret = sn_mr_ensure_mapped(d, w->mr);
+	ret = sn_mr_ensure_mapped(d, mr);
 	if (ret)
 		return ret;
-	dma_sync_sg_for_device(w->mr->map_dev, w->mr->umem->sgt_append.sgt.sgl,
-		w->mr->umem->sgt_append.sgt.orig_nents, DMA_TO_DEVICE);
+	dma_sync_sg_for_device(mr->map_dev, mr->umem->sgt_append.sgt.sgl,
+		mr->umem->sgt_append.sgt.orig_nents, DMA_TO_DEVICE);
 	while (d->data_tx_head != d->data_tx_tail &&
 	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE])) {
 		if (d->data_tx[d->data_tx_tail % SN_RING_SIZE].canceled)
 			return -EIO;
 		d->data_tx_tail++;
 	}
-	while (q->zc_offset < w->length) {
+	while (*offset < total) {
 		struct sn_slot *s;
 		dma_addr_t dma;
 		u32 max, size;
 
 		if (d->data_tx_head - d->data_tx_tail >= SN_RING_SIZE - 1)
 			return -EAGAIN;
-		dma = sn_mr_dma(w->mr, w->address + q->zc_offset, &max);
+		dma = sn_mr_dma(mr, address + *offset, &max);
 		if (!dma || !max)
 			return -EFAULT;
-		size = min3(max, (u32)SN_FRAME, w->length - q->zc_offset);
+		size = min3(max, (u32)SN_FRAME, total - *offset);
 		s = &d->data_tx[d->data_tx_head % SN_RING_SIZE];
 		s->frame.buffer_phy = dma;
 		s->frame.size = size & 0xfff;
@@ -356,14 +361,32 @@ int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
 			return ret;
 		d->data_tx_head++;
 		d->tx_frames++;
-		q->zc_offset += size;
+		*offset += size;
 	}
 	return 0;
 }
+/* Sender: queue the active SQ operation's payload from its own MR. */
+int sn_data_send_burst(struct sn_device *d, struct sn_qp *q)
+{
+	struct sn_wqe *w = &q->sq[q->sq_head];
+
+	return sn_data_burst(d, w->mr, w->address, w->length, &q->zc_offset);
+}
+/* Responder: queue a zero-copy READ response straight from the source MR the
+ * request named, which is retained until the READ_ACK. There is no SQ WQE for
+ * it, so the cursor is the response's own. */
+int sn_data_response_burst(struct sn_device *d, struct sn_qp *q)
+{
+	if (!q->remote_mr)
+		return -EFAULT;
+	return sn_data_burst(d, q->remote_mr, q->read_request.address,
+		q->read_request.total, &q->response_offset);
+}
 /* Post more of the expected burst's landing-zone pages to the data RX ring.
- * The zone is the matched receive WQE's MR for a SEND burst and the
- * requester-addressed remote MR for a WRITE burst; q->zc_mr names it and is
- * cleared the moment the expected byte count lands. */
+ * The zone is the matched receive WQE's MR for a SEND burst, the
+ * requester-addressed remote MR for a WRITE burst and the requester's own MR for
+ * a READ response; q->zc_mr names it and is cleared the moment the expected byte
+ * count lands. */
 static int sn_zdata_repost(struct sn_device *d, struct sn_qp *q)
 {
 	lockdep_assert_held(&d->lock);

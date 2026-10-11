@@ -119,12 +119,13 @@ static struct sn_header sn_out_header(struct sn_qp *q, u32 opcode)
 	h.src_epoch = q->binding.local_epoch; h.dst_epoch = q->binding.peer_epoch;
 	return h;
 }
-/* Large SENDs and WRITEs go header-less on the data ring when the peer
+/* Large SENDs, WRITEs and READs go header-less on the data ring when the peer
  * advertised SN_CAP_ZDATA; everything else uses the staged control-ring path.
  * A header-less frame never spans a page, so the local source must be frame
  * aligned; a WRITE must also name a frame-aligned remote destination, because
- * the responder posts that MR's pages directly. An unaligned WRITE stays on
- * the staged path rather than being rejected. */
+ * the responder posts that MR's pages directly, and a READ a frame-aligned
+ * remote source, because the responder bursts from it directly. An unaligned
+ * WRITE or READ stays on the staged path rather than being rejected. */
 static bool sn_zc_eligible(struct sn_device *d, struct sn_wqe *w)
 {
 	if (!d->zdata || !d->peer_zc || w->length <= SN_ZC_THRESHOLD ||
@@ -132,6 +133,13 @@ static bool sn_zc_eligible(struct sn_device *d, struct sn_wqe *w)
 		return false;
 	if (w->opcode == SN_SEND)
 		return true;
+	/* READ honours the zc_read kill-switch, latched into d->zc_read when the data
+	 * plane comes up and off until validated on hardware. The local address checked
+	 * above is the landing zone the requester arms itself; the remote address is the
+	 * source the responder bursts from, so it must be frame aligned for the same
+	 * reason a WRITE's destination must be. */
+	if (w->opcode == SN_READ)
+		return d->zc_read && !(w->remote_address & (SN_FRAME - 1));
 	/* WRITE honours the zc_write kill-switch, latched into d->zc_write when the
 	 * data plane comes up. A replayed SEND is harmless because it lands in a
 	 * receive WQE the peer already consumed; a replayed WRITE lands in live user
@@ -172,6 +180,7 @@ void sn_engine_reset(struct sn_qp *q)
 	q->zc_state = SN_ZC_NONE; q->zc_offset = 0;
 	q->zc_expect = false; q->zc_total = q->zc_received = 0;
 	q->zc_mr = NULL; q->zc_address = 0;
+	q->zc_read_armed = false; q->zc_held = false;
 	memset(&q->receive, 0, sizeof(q->receive));
 	memset(&q->read_receive, 0, sizeof(q->read_receive));
 	/* Reclaim the data rings so this aborted burst cannot leave posted RX
@@ -194,11 +203,41 @@ static void sn_send_complete(struct sn_qp *q)
 	q->progress_deadline = ktime_get_ns() + 30000000000ULL;
 	if (ret) sn_qp_error(q, IB_WC_GENERAL_ERR);
 }
+/* True while a zero-copy READ response owns the data TX ring: from the moment
+ * the request is accepted until the READ_ACK, or the next operation that
+ * implicitly acknowledges it, releases the retained source MR. */
+static bool sn_response_zc(const struct sn_qp *q)
+{
+	return q->response_active && q->read_request.opcode == SN_ZC_READ;
+}
+/* May a zero-copy response burst start queueing now? Never while an SQ burst is
+ * still queueing and never on top of frames still queued: the peer's inbound
+ * byte stream is header-less, so two bursts interleaved there could not be
+ * separated, and frames from a superseded attempt cannot be recalled. This is
+ * the guard zero-copy WRITE needed retrofitted; a response starts behind it. */
+static bool sn_response_may_burst(struct sn_device *d, struct sn_qp *q)
+{
+	return q->zc_state != SN_ZC_SENDING && sn_data_tx_drained(d);
+}
+/* Release the source MR a zero-copy READ response retains. The staged path
+ * snapshots into read_snapshot and drops the reference at once; the zero-copy
+ * path bursts from the MR itself, so it is held until the READ_ACK proves the
+ * peer stopped reading it. Both the ACK and the next operation release it, since
+ * a serial peer's next operation implicitly acknowledges the previous response. */
+static void sn_response_release(struct sn_qp *q)
+{
+	if (q->read_request.opcode == SN_ZC_READ) {
+		sn_mr_put(q->remote_mr);
+		q->remote_mr = NULL;
+	}
+}
 static void sn_receive_ack(struct sn_qp *q, const struct sn_header *h)
 {
 	if (h->opcode == SN_READ_ACK) {
-		if (q->response_active && h->ack_sequence == q->read_request.sequence)
+		if (q->response_active && h->ack_sequence == q->read_request.sequence) {
 			q->response_active = false;
+			sn_response_release(q);
+		}
 		return;
 	}
 	if (!q->active || !q->sq_count || h->ack_sequence != q->next_sequence)
@@ -255,10 +294,34 @@ static void sn_request_error(struct sn_qp *q, const struct sn_header *h, u32 sta
 	sn_ack(q, SN_ACK, h->sequence, status);
 	sn_mr_put(q->remote_mr); q->remote_mr = NULL;
 }
+/* A duplicate READ request means the requester never saw the response, so burst
+ * it again -- exactly what the staged path does for a duplicate SN_READ. Unlike
+ * the staged path this re-reads the live source MR instead of a snapshot, so a
+ * retry may observe newer data: RC guarantees per-operation consistency, not a
+ * snapshot held across retransmits. The MR is retained until the ACK, so it only
+ * needs re-resolving when an ACK crossed this retransmit. */
+static void sn_read_response_rearm(struct sn_qp *q, const struct sn_header *h)
+{
+	if (!q->remote_mr)
+		q->remote_mr = sn_mr_get(q, h->rkey, h->address, h->total,
+					   IB_ACCESS_REMOTE_READ);
+	if (!q->remote_mr) {
+		/* The source is gone. Reachable only when an ACK already completed the
+		 * operation, so the requester is not waiting for a burst. */
+		sn_ack(q, SN_ACK, h->sequence, SN_OK);
+		return;
+	}
+	if (!q->response_active || q->response_sent) {
+		q->response_active = true; q->response_sent = false;
+		q->response_offset = 0;
+		q->response_deadline = ktime_get_ns() + 30000000000ULL;
+	}
+}
 /* Receiver: a zero-copy burst descriptor arrived on the control ring. The
- * payload will land header-less on the data ring -- in the matched receive
- * WQE's MR for SN_ZC_SEND, in the requester-addressed remote MR for
- * SN_ZC_WRITE; only accounting happens here. */
+ * payload of an SN_ZC_SEND lands header-less in the matched receive WQE's MR and
+ * an SN_ZC_WRITE's in the requester-addressed remote MR; only accounting happens
+ * here. An SN_ZC_READ is the reverse direction: it names a source MR this side
+ * bursts from, so it commits at once and answers like a staged SN_READ. */
 static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 {
 	struct sn_device *d = sn_dev(q->ib.device);
@@ -270,6 +333,10 @@ static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 		if (!sn_same_operation(&q->receive.replay, h)) {
 			sn_ack(q, SN_ACK, h->sequence, SN_PROTOCOL);
 			sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
+		}
+		if (h->opcode == SN_ZC_READ && q->receive.replay_status == SN_OK) {
+			sn_read_response_rearm(q, h);
+			return;
 		}
 		sn_ack(q, SN_ACK, h->sequence, q->receive.replay_status);
 		return;
@@ -285,6 +352,42 @@ static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 		q->zc_received = 0;
 		if (!sn_data_recv_restart(d, q))
 			sn_ack(q, SN_ZC_READY, h->sequence, 0);
+		return;
+	}
+	if (q->zc_expect) {
+		/* Only one inbound burst at a time: the data RX landing zone is owned by
+		 * the response to our own zero-copy READ, and header-less frames from two
+		 * bursts could not be told apart there. Hold the request and let
+		 * sn_engine_progress re-drive it the moment the response lands; the peer's
+		 * own descriptor retransmit is the backstop. */
+		q->zc_held = true; q->zc_held_header = *h;
+		return;
+	}
+	/* A new operation implicitly acknowledges the previous READ response, so a
+	 * source MR retained for a zero-copy response is released here as well as on
+	 * the READ_ACK -- before anything below reassigns q->remote_mr. */
+	sn_response_release(q);
+	if (h->opcode == SN_ZC_READ) {
+		/* Zero-copy READ: commit at once and answer with a burst from the named
+		 * source MR, so unlike the staged path the reference is retained until
+		 * the READ_ACK. max_dest_rd_atomic and REMOTE_READ are enforced exactly
+		 * as for a staged SN_READ; frame alignment is the requester's job
+		 * (sn_zc_eligible) and is refused here so a non-conforming peer cannot
+		 * make us burst unaligned frames. */
+		if (!(q->attr.qp_access_flags & IB_ACCESS_REMOTE_READ) ||
+		    !q->attr.max_dest_rd_atomic ||
+		    (h->address & (SN_FRAME - 1))) {
+			sn_request_error(q, h, SN_ACCESS); return;
+		}
+		q->remote_mr = sn_mr_get(q, h->rkey, h->address, h->total,
+					 IB_ACCESS_REMOTE_READ);
+		if (!q->remote_mr) { sn_request_error(q, h, SN_ACCESS); return; }
+		q->read_request = *h;
+		q->response_active = true; q->response_sent = false;
+		q->response_offset = q->response_retries = 0;
+		q->response_deadline = ktime_get_ns() + 30000000000ULL;
+		sn_fragment_commit(&q->receive, h);
+		sn_operation_commit(&q->receive, SN_OK);
 		return;
 	}
 	if (h->opcode == SN_ZC_WRITE) {
@@ -339,6 +442,7 @@ static void sn_receive_zc_ready(struct sn_qp *q, const struct sn_header *h)
 void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 {
 	struct sn_device *d = sn_dev(q->ib.device);
+	bool read = q->zc_read_armed;
 	bool write = q->receive.operation.opcode == SN_ZC_WRITE;
 	struct sn_wqe *w;
 	int ret;
@@ -346,12 +450,33 @@ void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 	if (!q->zc_expect) return;
 	q->zc_received += bytes;
 	if (q->zc_received > q->zc_total) { sn_qp_error(q, IB_WC_GENERAL_ERR); return; }
-	if (q->zc_received < q->zc_total) return;
+	if (q->zc_received < q->zc_total) {
+		/* Bytes still landing are progress. A READ response is delivered by the
+		 * peer's burst rather than by a frame we can time against, so measure the
+		 * retransmit window from the last frame: without this a burst slower than
+		 * one window would be restarted on top of frames still in flight. */
+		if (read)
+			q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
+		return;
+	}
 	/* The burst landed. Drop the landing zone first: either completion path can
 	 * re-enter the data ring, and a retired WQE or MR must never be posted
 	 * again. A WRITE placement retires the requester's remote MR and consumes
 	 * no receive WQE, so it produces no receive CQE. */
 	q->zc_mr = NULL; q->zc_address = 0;
+	if (read) {
+		/* The landing zone is the READ WQE's own MR, synced for the CPU by the
+		 * receive path just before the completing byte count, so the SQ operation
+		 * completes here. The READ_ACK is what releases the responder's retained
+		 * source MR; q->receive never saw this operation, so there is nothing to
+		 * commit and no receive CQE. */
+		q->zc_expect = false; q->zc_read_armed = false;
+		d->read_bytes += q->zc_total;
+		d->zc_bursts++;
+		if (sn_ack(q, SN_READ_ACK, q->next_sequence, SN_OK)) return;
+		sn_send_complete(q);
+		return;
+	}
 	if (write) {
 		sn_mr_put(q->remote_mr); q->remote_mr = NULL;
 		d->write_bytes += q->zc_total;
@@ -397,6 +522,7 @@ static void sn_receive_request(struct sn_qp *q, const struct sn_header *h, const
 		/* A serial peer's next operation implicitly acknowledges its previous
 		 * READ response, allowing the single retained snapshot to advance. */
 		q->response_active = false;
+		sn_response_release(q);
 		if (h->opcode == SN_SEND) {
 			if (!q->rq_count) { sn_dev(q->ib.device)->rnr_sent++; sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
 			w = &q->rq[q->rq_head];
@@ -474,7 +600,7 @@ void sn_engine_receive(struct sn_device *d, const void *frame, size_t bytes)
 	switch (h.opcode) {
 	case SN_ACK: case SN_READ_ACK: sn_receive_ack(q, &h); break;
 	case SN_ZC_READY: sn_receive_zc_ready(q, &h); break;
-	case SN_ZC_SEND: case SN_ZC_WRITE: sn_receive_zc(q, &h); break;
+	case SN_ZC_SEND: case SN_ZC_WRITE: case SN_ZC_READ: sn_receive_zc(q, &h); break;
 	case SN_READ_REPLY: sn_receive_read_reply(q, &h, frame + SN_HEADER); break;
 	case SN_SEND: case SN_WRITE: case SN_READ:
 		sn_receive_request(q, &h, frame + SN_HEADER); break;
@@ -551,23 +677,58 @@ void sn_engine_progress(struct sn_device *d)
 			q->credit_sent = true;
 		}
 	}
+	/* An inbound burst descriptor held because the data RX landing zone was busy
+	 * with our own zero-copy READ response: re-drive it as soon as the zone frees,
+	 * instead of making the peer retransmit and spend its retry budget. */
+	if (q->zc_held && !q->zc_expect) {
+		h = q->zc_held_header;
+		q->zc_held = false;
+		sn_receive_zc(q, &h);
+	}
 	if (q->response_active) {
 		if (q->response_sent && now >= q->response_deadline) {
+			/* No READ_ACK: send the whole response again. A zero-copy response
+			 * re-bursts from the live source MR, so it must not restart while
+			 * frames from the superseded attempt are still queued or an SQ burst
+			 * is still queueing -- the peer counts everything that arrives into
+			 * one header-less byte stream. Defer instead, bounded by the same
+			 * retry budget as the SQ path, so a ring that never drains fails the
+			 * QP rather than deferring forever. */
+			bool defer = sn_response_zc(q) && !sn_response_may_burst(d, q);
+
 			if (!sn_retry_take(&q->response_retries, q->attr.retry_cnt)) {
 				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 			}
-			q->response_sent = false; q->response_offset = 0;
-			q->response_deadline = now + 30000000000ULL;
+			if (defer) {
+				q->response_deadline = now + sn_ack_timeout_ns(q->attr.timeout);
+			} else {
+				q->response_sent = false; q->response_offset = 0;
+				q->response_deadline = now + 30000000000ULL;
+			}
 		}
 		if (!q->response_sent) {
-			h = sn_out_header(q, SN_READ_REPLY);
-			h.sequence = q->read_request.sequence; h.total = q->read_request.total;
-			ret = sn_fragments_send(d, &h, q->read_snapshot, &q->response_offset, true);
-			if (!ret) {
-				q->response_sent = true;
-				q->response_deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
-			} else if (ret != -EAGAIN || now >= q->response_deadline) {
-				sn_qp_error(q, IB_WC_GENERAL_ERR); return;
+			if (sn_response_zc(q) && !sn_response_may_burst(d, q)) {
+				/* A response that cannot even start within its budget fails the
+				 * QP rather than deferring forever. */
+				if (now >= q->response_deadline) {
+					sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
+				}
+			} else {
+				if (sn_response_zc(q)) {
+					ret = sn_data_response_burst(d, q);
+				} else {
+					h = sn_out_header(q, SN_READ_REPLY);
+					h.sequence = q->read_request.sequence;
+					h.total = q->read_request.total;
+					ret = sn_fragments_send(d, &h, q->read_snapshot,
+								&q->response_offset, true);
+				}
+				if (!ret) {
+					q->response_sent = true;
+					q->response_deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
+				} else if (ret != -EAGAIN || now >= q->response_deadline) {
+					sn_qp_error(q, IB_WC_GENERAL_ERR); return;
+				}
 			}
 		}
 	}
@@ -614,6 +775,17 @@ void sn_engine_progress(struct sn_device *d)
 		 * by cheap 320 us RNR retries. */
 		if (q->zc_state != SN_ZC_NONE) d->zc_retries++;
 		q->zc_state = SN_ZC_NONE;
+		if (q->zc_read_armed) {
+			/* Retransmitting a zero-copy READ descriptor must find the landing
+			 * zone reset: flush the frames the previous attempt landed and repost
+			 * from offset zero, so the responder's re-burst from zero is counted
+			 * from zero. The flush cannot recall frames still in flight, which is
+			 * why the responder waits for its data TX ring to drain first. */
+			q->zc_received = 0;
+			if (sn_data_recv_restart(d, q)) {
+				sn_qp_error(q, IB_WC_GENERAL_ERR); return;
+			}
+		}
 	}
 	if (q->zc_state == SN_ZC_WAIT) {
 		if (now < q->deadline) return;
@@ -628,6 +800,35 @@ void sn_engine_progress(struct sn_device *d)
 	if (sn_zc_eligible(d, w)) {
 		switch (q->zc_state) {
 		case SN_ZC_NONE:
+			if (w->opcode == SN_READ) {
+				/* A READ requester already knows its landing zone -- the local MR
+				 * it posted -- so it arms its own data RX ring before the
+				 * descriptor goes out and needs no SN_ZC_READY round trip. Only
+				 * one inbound burst at a time, so wait while a peer-initiated
+				 * burst is still landing. zc_state stays NONE: this side queues
+				 * no payload, so the retransmit path below is the whole state
+				 * machine and q->zc_read_armed marks the landing zone as ours. */
+				if (!q->zc_read_armed) {
+					if (q->zc_expect) { ret = 0; break; }
+					q->zc_mr = w->mr; q->zc_address = w->address;
+					q->zc_total = w->length; q->zc_received = 0;
+					q->zc_expect = true; q->zc_read_armed = true;
+					if (sn_data_recv_start(d, q)) {
+						q->zc_expect = q->zc_read_armed = false;
+						q->zc_mr = NULL; q->zc_address = 0;
+						sn_qp_error(q, IB_WC_GENERAL_ERR); return;
+					}
+				}
+				/* The descriptor names the responder's source MR; the reply
+				 * itself is header-less payload on the data ring. */
+				h.opcode = SN_ZC_READ;
+				ret = sn_ring_send(d, &h, NULL, false);
+				if (!ret) {
+					q->outgoing_sent = true;
+					q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
+				}
+				break;
+			}
 			/* A ZC SEND lands in a buffer the peer posted, so it names no
 			 * remote MR; a ZC WRITE must keep address/rkey so the responder
 			 * places the header-less payload in the requester's MR. */
@@ -640,6 +841,10 @@ void sn_engine_progress(struct sn_device *d)
 			}
 			break;
 		case SN_ZC_SENDING:
+			/* One outbound burst at a time: a zero-copy READ response owns the
+			 * data TX ring until its READ_ACK. A burst that has already started
+			 * queueing always finishes, so neither side can wait on the other. */
+			if (!q->zc_offset && sn_response_zc(q)) { ret = 0; break; }
 			ret = sn_data_send_burst(d, q);
 			if (!ret) {
 				q->zc_state = SN_ZC_SENT; q->outgoing_sent = true;
