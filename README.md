@@ -93,15 +93,26 @@ Done and measured on the lab host pair:
 - Native verbs backend and provider, including the zero-copy data plane:
   256 B ping-pong round trip 35.1 µs average (31 µs min) and 1182–1238 MiB/s
   per direction on window-4 × 2 MiB bidirectional bursts, measured 2026-10-10
-  on the lab host pair in no-TB-IP mode. For scale, the same pair's practical
+  on the lab host pair in no-TB-IP mode. That band was measured *pre-reboot*;
+  after a clean reboot plus bring-up the same stack measures 1127–1191 MiB/s
+  (mean 1158 over 5 runs), which is at or above the 1070–1156 MiB/s previously
+  recorded for script-brought-up post-reboot runs — so compare post-reboot
+  numbers against post-reboot numbers. For scale, the same pair's practical
   link ceiling is ~9.5 Gbit/s per direction (iperf3 over `thunderbolt-net`,
   measured 2026-09-18) against a 20 Gb/s per-direction nominal rate.
+- RDMA WRITE and READ validated end to end on hardware (2026-10-10), including
+  **zero-copy WRITE at 356–456 MiB/s**: 16.8 GiB per direction verified
+  byte-for-byte in a single `write 2000` run, `bad_frames` 0, 10,400 zero-copy
+  bursts; READ verified byte-for-byte over 1,677,721,600 bytes. Zero-copy WRITE
+  is ~7× the staged path (449.78 vs 58.81 MiB/s) and is on by default, with
+  `zc_write=0` as a kill-switch. Hardware uncovered a burst-replay race that
+  silently corrupted payload; the diagnosis, the drain barrier that fixes it and
+  the offline test that now models it are in `kernel/verbs/README.md`.
 
 Open:
 
-- RC conformance breadth. Software READ/WRITE are implemented but have never
-  carried a byte on hardware; malformed-peer, packet-loss, reordering and
-  ACK-drop injection are unrun.
+- RC conformance breadth. READ/WRITE are hardware-validated (above), but
+  malformed-peer, packet-loss, reordering and ACK-drop injection are unrun.
 - Hot-unplug and abrupt peer loss, including the known inactive-peer NHI wedge.
   No recovery or non-disruption guarantee exists yet.
 - GPU-direct registration for the verbs path (it stages through pinned CPU

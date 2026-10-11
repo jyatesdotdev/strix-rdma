@@ -2,11 +2,13 @@
 
 **Hardware-validated on the lab nodes (Strix Halo pair, Fedora 43 / 7.2.8):
 two-host SEND/RECV exchange passes (0/1/3984-byte and 2 MiB windows, 18.9 MB),
-repeated unload/reload cycles pass, and an unmodified ROCm tensor-parallel
-inference workload runs over the provider: 377 MB placed through SEND/RECV,
-~140k frames per direction, zero bad frames, working inference. Not yet:
-hardware READ/WRITE (the validated consumer path is SEND-only), hot-unplug and
-malformed-peer injection.** Still not complete RC conformance, production-ready, or a
+repeated unload/reload cycles pass, an unmodified ROCm tensor-parallel
+inference workload runs over the provider (377 MB placed through SEND/RECV,
+~140k frames per direction, zero bad frames, working inference), and **RDMA
+WRITE and READ pass end to end verified byte-for-byte** — including zero-copy
+WRITE at 356–456 MiB/s with 16.8 GiB per direction checked in a single run,
+and READ over 1,677,721,600 bytes, `bad_frames` 0 throughout. Not yet:
+hot-unplug and malformed-peer injection.** Still not complete RC conformance, production-ready, or a
 performance claim. Existing series20
 USB4STREAM production behavior/configuration is unchanged. This separate service
 must not be tried alongside production traffic without operator-authorized

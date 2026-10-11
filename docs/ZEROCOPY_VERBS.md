@@ -55,7 +55,11 @@ Throughput, window-4 x 2 MiB bidirectional (`... 200`):
 
 - **1182-1238 MiB/s (9.9-10.4 Gbps) per direction**, consistent across 8/8
   consecutive runs, and sustained over a 6.4 GiB long run (800 iters,
-  5168 ms, 1238.39 MiB/s). That is the practical link ceiling: iperf3 over
+  5168 ms, 1238.39 MiB/s). These runs were measured *pre-reboot*. After a clean
+  reboot plus bring-up the same stack measures 1127-1191 MiB/s (mean 1158 over
+  5 runs, `bad_frames` 0), which is at or above the 1070-1156 MiB/s recorded for
+  previous script-brought-up post-reboot runs -- so a post-reboot number in the
+  1130s is normal for this stack, not a regression. That is the practical link ceiling: iperf3 over
   `thunderbolt-net` on the same pair tops out at 9.49-9.51 Gbit/s one-way
   (measured 2026-09-18) against a 20 Gb/s per-direction nominal rate, and
   raising `thunderbolt.dma_credits` above its default 14 did not lift it. It is

@@ -1,6 +1,68 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-10 — repository generalised; RDMA READ/WRITE hardware-validated
+- **What:** The repository stopped being a single-workload tensor transport and
+  became general RDMA support between two Strix Halo hosts. Every artifact of
+  the original workload-specific framing was deleted rather than renamed — 620
+  files, including all of `bench/results/`, the workload-shaped traffic tool,
+  the managed-lifecycle reconcile subsystem with its systemd units, udev rule,
+  modules-load and sysconfig files, the patch-swap helper, the profile-analysis
+  scripts and the workload integration contract doc. Docs were reframed, and figures whose
+  only provenance was a deleted result file are now quoted inline with their
+  measurement dates. `git grep -i` for the old workload names is empty;
+  `make`, `make check` and CI are green.
+- **Kept deliberately:** `tools/tests/` and `tools/systemd/tbstream-lifecycle.md`
+  in reduced form. What remains is workload-free general infra — one
+  least-privilege assertion that `99-tbstream.rules` keeps `MODE=0660` and
+  `GROUP=tbstream` on a DMA-mappable character device, and a doc that now states
+  plainly that no systemd units are involved and that the native verbs path does
+  not use this interface at all.
+- **Zero-copy RDMA WRITE:** `SN_ZC_WRITE = 14` added. An eligible WRITE now
+  places payload straight from MR pages into the peer's remote MR instead of
+  staging through `sn_mr_copy()`. On by default; `zc_write=0` is the
+  kill-switch. Unlike `SN_ZC_SEND`, which clears address/rkey because payload
+  lands in a receive WQE the peer posted, `SN_ZC_WRITE` carries both so the
+  responder can resolve the landing zone.
+- **The bug hardware found:** `write 200` failed 3/3 on payload verification —
+  retry-correlated, with both the failing iteration (22, then 32) and the
+  failing host moving between runs. Cause: restarting a burst re-sends the
+  descriptor, the peer zeroes `zc_received` for it, and frames from the
+  superseded attempt that were still queued in the data TX ring then get counted
+  into the new one. `sn_data_recv_restart()` flushes frames already received but
+  cannot recall frames still in flight, and a 2 MiB burst is 512 frames against
+  a 64-slot ring, so partial posting is the normal case. The byte count
+  overshot, the for-CPU sync that keyed on exact equality was skipped, and a
+  buffer assembled from two attempts completed as `IBV_WC_SUCCESS`.
+- **Fix:** the retry path defers the restart until `sn_data_tx_drained()`,
+  bounded by the retry budget so a ring that never drains fails the QP with
+  `IB_WC_RETRY_EXC_ERR`; plus an overshoot guard that fails the QP with
+  `IB_WC_GENERAL_ERR` instead of completing. The offline suites could not catch
+  this because their `sn_data_send_burst` is atomic — one `memcpy` plus an
+  immediate byte count — so a partial burst, a stale in-flight frame and an
+  overshooting count were all unrepresentable. `ok 17` now models it by losing
+  the completion ACK and refusing to drain. Reaching the transient `SN_ZC_SENT`
+  state needs hand-driven stepping: `sn_ack()` only queues into the control ring,
+  so the responder must be progressed before its `ZC_READY` can be delivered.
+- **Validated:** after a clean reboot and bring-up, `write 200` three times and
+  `write 2000` once all passed — 16.8 GiB per direction verified byte-for-byte
+  at 356–456 MiB/s, `bad_frames` 0, 10,400 zero-copy bursts, exact
+  `placed_write_bytes` accounting. `read 200` passed over 1,677,721,600 bytes
+  byte-for-byte. Zero-copy WRITE is ~7× the staged path (449.78 vs 58.81 MiB/s).
+  `check-native-verbs` went 31 → 38 assertions over the day.
+- **Baseline correction:** bulk SEND after the clean reboot measured 1127–1191
+  MiB/s (mean 1158 over 5 runs), at or above the 1070–1156 MiB/s previously
+  recorded for script-brought-up post-reboot runs. The 1182–1238 MiB/s headline
+  band was measured pre-reboot and is not the like-for-like comparison — worth
+  remembering before calling a post-reboot number a regression.
+- **Operational notes:** `strix_nhi` must still be loaded once per boot; two
+  re-probes survived this session but re-probing after heavy bursts can wedge the
+  router's DMA path config space, clearable only by power cycle, so it is a
+  gamble and not a tuning loop. Set module parameters via `modprobe.d` and take
+  one boot per value. The smoke tool's TCP rendezvous port must be open in
+  firewalld — a blocked port surfaces as `errno=113` on the RDMA connect and
+  reads exactly like a link failure.
+
 ## 2026-10-06 — native verbs: full two-host bring-up over the provider (hardware-validated)
 - **What:** The experimental native NHI verbs backend (`kernel/verbs/`,
   `providers/strix_nhi/`) passed its full bring-up on the lab nodes (max/max2,

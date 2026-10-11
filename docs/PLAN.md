@@ -8,7 +8,10 @@
 > but after its resident poller and data-ring interrupt moderation it is the
 > fastest measured path on the link: 35.1 µs average 256 B round trip and
 > 1182–1238 MiB/s per direction on window-4 × 2 MiB bidirectional bursts
-> (measured 2026-10-10 on the lab host pair, no-TB-IP mode). Native `hipMalloc`
+> (measured 2026-10-10 on the lab host pair, no-TB-IP mode; that band is
+> *pre-reboot* — after a clean reboot plus bring-up the same stack measures
+> 1127–1191 MiB/s, at or above the 1070–1156 MiB/s recorded for previous
+> post-reboot runs, so compare like with like). Native `hipMalloc`
 > DMA-BUF export works on Strix Halo; actual NHI import and a portable RX
 > system-acquire contract remain gated experiments
 > (`GPU_TO_GPU_FEASIBILITY.md`).
@@ -288,8 +291,11 @@ The page-backed proofs are complete on both planes. The native DMA-BUF variant
 is not a small buffer swap: it needs lazy path activation, transactional
 bounded import, exact SG tests, no-traffic hardware mapping, and a stale-cache
 ownership gate. On the verbs side the throughput A/B against the stream path
-is done; the open work is conformance breadth (hot-unplug, malformed peers,
-packet loss), hardware READ/WRITE, and GPU-direct registration instead of CPU
+is done; hardware READ/WRITE are now validated end to end (zero-copy WRITE at
+356–456 MiB/s with 16.8 GiB per direction verified byte-for-byte, READ over
+1,677,721,600 bytes, `bad_frames` 0); the open work is conformance breadth
+(hot-unplug, malformed peers,
+packet loss) and GPU-direct registration instead of CPU
 staging. Production
 work on any path remains dominated by disconnect/reset cancellation,
 synchronization, security, and compatibility rather than descriptor creation.

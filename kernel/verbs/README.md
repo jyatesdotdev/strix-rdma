@@ -427,7 +427,10 @@ ROCm tensor-parallel inference over the provider (`--transport rdma
 throughput and latency at the reference workload's message shape, which closes the A/B item below.
 Window-4 x 2 MiB bidirectional at **1182-1238 MiB/s (9.9-10.4 Gbps) per
 direction**, 15/15 consecutive runs consistent, including a 6.4 GiB long run;
-256 B ping-pong RTT **35.1 us avg / 31 us min / 345 us max**. Both are at or
+256 B ping-pong RTT **35.1 us avg / 31 us min / 345 us max**. These were measured
+pre-reboot; the like-for-like post-reboot band for this stack is 1127-1191 MiB/s
+(see "Gated build re-validated" below), so do not read a post-reboot number in
+the 1130s as a regression. Both are at or
 above the USB4STREAM zero-copy figures (1146 MB/s, 3837 us bidirectional p50)
 and at the ~9.5 Gbit/s per-direction link ceiling, so the keep-native-vs-stream
 decision now favours native on both axes. These figures are quoted here rather
