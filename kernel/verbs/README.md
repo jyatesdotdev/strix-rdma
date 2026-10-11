@@ -487,6 +487,48 @@ MiB/s this stack recorded for previous script-brought-up post-reboot runs; the
 1182–1238 MiB/s headline band was measured pre-reboot and is not the like-for-like
 comparison.
 
+**Diagnosis of the retry-correlated WRITE corruption.** The mechanism is now
+specific. When a ZC descriptor is retransmitted, the receiver resets
+`zc_received` to zero and calls `sn_data_recv_restart()`, which stops and restarts
+the data RX ring to flush partial postings. That flush can only discard frames
+this host has *already received*. It cannot recall frames still queued in the
+peer's data TX ring, or in flight on the wire — and a 2 MiB burst is 512 frames
+against a 64-slot ring, so a burst is normally posted in several `-EAGAIN`
+batches and frames are routinely still outstanding when a timeout fires. Those
+stale frames arrive after the reset and are counted into the new attempt.
+
+The corruption itself came from the RX completion path, which synced the burst
+pages for the CPU only on an **exact** equality:
+
+```c
+if (d->qp->zc_received + size == d->qp->zc_total)
+        dma_sync_sg_for_cpu(...);
+sn_engine_zc_bytes(d->qp, size);
+```
+
+An overshooting count never satisfies that equality, so the completing message
+was handed back **without** the for-CPU sync *and* assembled from two burst
+attempts. Both are silent: the completion still reports `IBV_WC_SUCCESS`.
+
+A guardrail now fails the QP with `IB_WC_GENERAL_ERR` on overshoot instead of
+completing. That converts the loud-but-late case into a visible error, and it is
+worth keeping regardless, but **it is not a fix**: a stale/new frame mix can
+still land exactly on `zc_total` and complete with wrong payload. The real fix
+has to stop a superseded attempt's frames from being counted at all — for example
+drain the data TX ring before allowing a descriptor retransmit, or make the
+completion ACK authoritative so a retransmit can only happen after the receiver
+has quiesced. An attempt/epoch tag the receiver could filter on is not available,
+because burst frames are header-less by design (framing comes from the NHI
+sof/eof PDFs).
+
+The offline suites cannot catch any of this. Their `sn_data_send_burst` is atomic
+— one `memcpy` plus an immediate `sn_engine_zc_bytes()` — so a partially posted
+burst, a stale in-flight frame and an overshooting byte count are all
+unrepresentable. Reproducing this offline needs the model to deliver a burst in
+bounded chunks across engine passes, with a descriptor retransmit interleaved
+between chunks. That harness change is the prerequisite for fixing the race
+without burning a reboot per hypothesis.
+
 Also not yet run:
 hot-unplug/malformed-peer injection; sustained multi-hour endurance; an
 end-to-end inference re-run over the zero-copy data plane (the earlier proven run

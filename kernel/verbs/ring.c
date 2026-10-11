@@ -475,6 +475,20 @@ void sn_data_receive(struct sn_device *d)
 		}
 		d->rx_frames++;
 		if (d->qp && d->qp->zc_expect) {
+			if (d->qp->zc_received + size > d->qp->zc_total) {
+				/* Overshoot: frames from a superseded burst attempt are still
+				 * arriving after a descriptor retransmit reset zc_received to
+				 * zero. sn_data_recv_restart() flushes the frames this host
+				 * already received, but it cannot recall frames still queued in
+				 * the peer's data TX ring or on the wire, so the byte stream now
+				 * describes parts of two attempts. Completing would hand the
+				 * caller a buffer assembled from both -- and because the sync
+				 * below keys on exact equality, it would also hand back pages
+				 * never synced for the CPU. Fail the QP loudly instead of
+				 * corrupting silently. */
+				sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
+				continue;
+			}
 			/* Sync the burst pages for the CPU just before the completing
 			 * byte count makes the placement visible. */
 			if (d->qp->zc_received + size == d->qp->zc_total) {
