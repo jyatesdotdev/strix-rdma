@@ -2497,7 +2497,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,871 @@
+@@ -0,0 +1,881 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -2854,12 +2854,22 @@ new file mode 100644
 +			sn_ack(q, SN_ZC_READY, h->sequence, 0);
 +		return;
 +	}
-+	if (q->zc_expect) {
-+		/* Only one inbound burst at a time: the data RX landing zone is owned by
++	if (q->zc_expect && h->opcode != SN_ZC_READ) {
++		/* Only one INBOUND burst at a time: the data RX landing zone is owned by
 +		 * the response to our own zero-copy READ, and header-less frames from two
 +		 * bursts could not be told apart there. Hold the request and let
 +		 * sn_engine_progress re-drive it the moment the response lands; the peer's
-+		 * own descriptor retransmit is the backstop. */
++		 * own descriptor retransmit is the backstop.
++		 *
++		 * SN_ZC_READ is exempt and must be: answering it bursts OUT on the data TX
++		 * ring and lands nothing inbound, so it does not contend for the landing
++		 * zone at all. The TX ring already serialises a response burst against our
++		 * own SQ burst (see the SN_ZC_SENDING case). Holding a READ request here
++		 * deadlocks simultaneous bidirectional READ -- each side arms its landing
++		 * zone for its own response, then holds the peer's request until that
++		 * response lands, and neither ever answers. Observed on hardware as
++		 * IBV_WC_RETRY_EXC_ERR on iteration 1 with zc_bursts 0 on both hosts:
++		 * descriptors exchanged, no response, no bad_frames. */
 +		q->zc_held = true; q->zc_held_header = *h;
 +		return;
 +	}

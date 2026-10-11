@@ -1066,9 +1066,41 @@ static void test_zc_write_refusal(void)
 	release(a); release(b);
 	puts("ok 16 - zero-copy WRITE refusal: no REMOTE_WRITE and an unaligned destination stay off the data ring");
 }
+/* Both sides post a zero-copy READ at once. Each arms its own data RX landing
+ * zone for the response it is owed, so q->zc_expect is set on both. A responder
+ * that held an inbound READ request until its own response landed would deadlock
+ * here: neither side ever answers. Answering a READ bursts OUT on the data TX ring
+ * and lands nothing inbound, so it must not be held. The unidirectional tests
+ * cannot reach this; on hardware it appeared as IBV_WC_RETRY_EXC_ERR on iteration
+ * 1 with zc_bursts 0 on both hosts -- descriptors exchanged, no response, no
+ * bad_frames. */
+static void test_zc_read_bidirectional(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(a->mr[1].data, 0xa5, SN_MESSAGE);
+	memset(b->mr[1].data, 0x5a, SN_MESSAGE);
+	post(a, SN_READ, SN_MESSAGE);
+	post(b, SN_READ, SN_MESSAGE);
+	for (i = 0; i < 2000 && (a->sends < 1 || b->sends < 1); i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && b->sends == 1 && !a->errors && !b->errors);
+	/* Each side landed the other's source bytes into its own local MR. */
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(!memcmp(b->mr[0].data, a->mr[1].data, SN_MESSAGE));
+	assert(a->read_bytes == SN_MESSAGE && b->read_bytes == SN_MESSAGE);
+	assert(a->zc_bursts == 1 && b->zc_bursts == 1);
+	assert(a->zc_tx_bursts == 1 && b->zc_tx_bursts == 1);
+	for (i = 0; i < 20; i++) step(a, b, NULL, NULL);
+	assert(!a->qp->remote_mr && !b->qp->remote_mr);
+	assert(!a->qp->response_active && !b->qp->response_active);
+	assert(!a->errors && !b->errors);
+	release(a); release(b);
+	puts("ok 25 - simultaneous bidirectional zero-copy READ: neither side holds the other's request");
+}
 int main(void)
 {
-	puts("1..24");
+	puts("1..25");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1080,6 +1112,7 @@ int main(void)
 	test_zc_read_fallback(); test_zc_read_refusal();
 	test_zc_read_serializes_inbound_bursts();
 	test_zc_read_lost_ack_is_fatal();
+	test_zc_read_bidirectional();
 	assert(!warnings);
 	return 0;
 }

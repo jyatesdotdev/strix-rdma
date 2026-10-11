@@ -380,8 +380,19 @@ int main(int argc, char **argv)
 				require(n >= 0 && milliseconds() < deadline, "RDMA poll/deadline");
 				for (int k = 0; k < n; k++) {
 					unsigned slot = wc[k].wr_id % 16;
-					require(wc[k].status == IBV_WC_SUCCESS && wc[k].wr_id/16 == it &&
-						wc[k].qp_num == qp->qp_num, "RDMA WC status/identity");
+					if (wc[k].status != IBV_WC_SUCCESS || wc[k].wr_id/16 != it ||
+					    wc[k].qp_num != qp->qp_num) {
+						/* A bare "WC status/identity" failure hides the one number that
+						 * distinguishes a remote access refusal from retry-exceeded from a
+						 * wr_id bookkeeping bug, so print the completion before failing. */
+						fprintf(stderr, "FAIL detail: iter=%u status=%d (%s) opcode=%d "
+							"wr_id=%llu (iter=%llu slot=%u) qp_num=%u want=%u\n",
+						it, wc[k].status, ibv_wc_status_str(wc[k].status), wc[k].opcode,
+						(unsigned long long)wc[k].wr_id,
+						(unsigned long long)(wc[k].wr_id/16), slot,
+						wc[k].qp_num, qp->qp_num);
+						fail("RDMA WC status/identity");
+					}
 					require(wc[k].opcode == (rdma_read ? IBV_WC_RDMA_READ : IBV_WC_RDMA_WRITE), "RDMA WC opcode");
 					require(slot < WINDOW && !(completed & (1u<<slot)) && slot == next++, "ordered unique RDMA completion");
 					completed |= 1u<<slot; done++;
