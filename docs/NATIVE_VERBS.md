@@ -6,7 +6,7 @@ repeated unload/reload cycles pass, an unmodified ROCm tensor-parallel
 inference workload runs over the provider (377 MB placed through SEND/RECV,
 ~140k frames per direction, zero bad frames, working inference), and **RDMA
 WRITE and READ pass end to end verified byte-for-byte** — including zero-copy
-WRITE at 356–456 MiB/s with 16.8 GiB per direction checked in a single run,
+WRITE at 356–456 MiB/s with 15.6 GiB (16,000 MiB) per direction checked in a single run,
 and READ over 1,677,721,600 bytes, `bad_frames` 0 throughout. Not yet:
 hot-unplug and malformed-peer injection.** Still not complete RC conformance, production-ready, or a
 performance claim. Existing series20
@@ -20,8 +20,12 @@ implemented in software over its DMA rings. This implementation is a real Linux
 `ib_device`/uverbs device plus ordinary rdma-core provider, **not** a verbs-lookalike
 API or library interposer. The first path is **CPU-copy staging**: pinned CPU MR
 pages -> coherent NHI staging -> cable -> staging -> pinned CPU MR pages. There
-is no IP/TCP payload fallback, GPU-direct, DMA-BUF registration, or zero-copy
-claim. TCP in the smoke tool is metadata/barriers only.
+is no IP/TCP payload fallback, and no GPU-direct or DMA-BUF registration. Zero
+copy is not a property of *this* first path — it is a separate,
+capability-negotiated data plane (`SN_CAP_ZDATA`) that carries large SEND and
+WRITE payloads directly between MR pages; see
+[ZEROCOPY_VERBS.md](ZEROCOPY_VERBS.md). TCP in the smoke tool is
+metadata/barriers only.
 
 ## Compatibility and limits
 
@@ -161,9 +165,13 @@ is implied by compilation or the above models. Still unrun:
 1. Strix x86_64 deployment-config compile/signing/whole-stack ABI packaging;
    real Linux registration, uverbs/provider discovery, normal memlock isolation,
    honest zero-protocol-bits/non-RoCE-GID/undefined-AH INIT/RTR/RTS path.
-2. Above two-host smoke; live READ/WRITE permission/replay and remote-key denial,
-   real partial posting, CQ notification races/overflow/unsignaled ordering,
-   short/unposted receives, memlock failures and unsupported-operation checks.
+2. Live fault and permission injection: READ/WRITE permission and remote-key
+   denial, CQ notification races/overflow/unsignaled ordering, short/unposted
+   receives, memlock failures and unsupported-operation checks. The two-host
+   smoke itself has run and passes, and live READ/WRITE have been verified
+   byte-for-byte on hardware (see `../kernel/verbs/README.md`); real partial
+   posting is the normal case rather than an edge case, since a 2 MiB burst is
+   512 frames against a 64-slot ring.
 3. Packet corruption/reordering/ACK drops/exhausted retries; bidirectional
    saturation/control reserve, epoch/QP churn, restart, carrier loss/hot unplug,
    concurrent reset/destroy/deregistration/context close, lockdep and pin/DMA

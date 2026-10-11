@@ -101,7 +101,7 @@ Done and measured on the lab host pair:
   link ceiling is ~9.5 Gbit/s per direction (iperf3 over `thunderbolt-net`,
   measured 2026-09-18) against a 20 Gb/s per-direction nominal rate.
 - RDMA WRITE and READ validated end to end on hardware (2026-10-10), including
-  **zero-copy WRITE at 356–456 MiB/s**: 16.8 GiB per direction verified
+  **zero-copy WRITE at 356–456 MiB/s**: 15.6 GiB (16,000 MiB) per direction verified
   byte-for-byte in a single `write 2000` run, `bad_frames` 0, 10,400 zero-copy
   bursts; READ verified byte-for-byte over 1,677,721,600 bytes. Zero-copy WRITE
   is ~7× the staged path (449.78 vs 58.81 MiB/s) and is on by default, with

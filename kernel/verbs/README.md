@@ -214,8 +214,8 @@ non-RoCE default, **not RoCEv2**. This metadata path still needs real uverbs tes
 
 Only PCI **1022:158d / 1022:158e** are admitted, before netdev lookup, allocation
 or RDMA registration. These Strix Halo IDs were observed at c4:00.5/c4:00.6 in the
-2026-08-25 compile-oracle dmesg capture on max2 (lines536/541 of its
-`max2-dmesg-prefix.txt`); they are not inferred from DMI/netdev names. At the pinned kernel,
+2026-08-25 compile-oracle dmesg capture on max2 (lines 536/541 of that capture,
+which is no longer in-tree); they are not inferred from DMI/netdev names. At the pinned kernel,
 `nhi.c:nhi_select_cm` selects software CM for native ACPI control, otherwise tries
 `icm_probe` and falls back to `tb_probe`. `icm.c:2463..2589` switches on PCI device
 ID (not vendor!) and neither admitted ID has an ICM case; absent `is_supported`

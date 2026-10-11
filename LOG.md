@@ -45,7 +45,7 @@ Running log of noteworthy work; newest first.
   state needs hand-driven stepping: `sn_ack()` only queues into the control ring,
   so the responder must be progressed before its `ZC_READY` can be delivered.
 - **Validated:** after a clean reboot and bring-up, `write 200` three times and
-  `write 2000` once all passed — 16.8 GiB per direction verified byte-for-byte
+  `write 2000` once all passed — 15.6 GiB (16,000 MiB) per direction verified byte-for-byte
   at 356–456 MiB/s, `bad_frames` 0, 10,400 zero-copy bursts, exact
   `placed_write_bytes` accounting. `read 200` passed over 1,677,721,600 bytes
   byte-for-byte. Zero-copy WRITE is ~7× the staged path (449.78 vs 58.81 MiB/s).
