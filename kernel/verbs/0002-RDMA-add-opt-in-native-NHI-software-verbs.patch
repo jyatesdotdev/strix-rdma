@@ -445,7 +445,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,235 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -476,6 +476,10 @@ new file mode 100644
 + * new value takes effect on the next module load) so the knee can be measured
 + * on hardware without a rebuild. Defined in main.c, consumed in ring.c. */
 +extern unsigned int sn_data_throttle_ns;
++
++/* Opt-in zero-copy RDMA WRITE, defined in main.c and latched into
++ * sn_device::zc_write by ring.c when the data plane comes up. */
++extern bool sn_zc_write;
 +#define SN_SERVICE "strixv1"
 +#define SN_CONTROL_BYTES 112
 +/* Handshake retransmission intervals; loss is expected, peers retransmit. */
@@ -587,6 +591,11 @@ new file mode 100644
 +	unsigned int data_tx_head, data_tx_tail, data_rx_head, data_rx_tail;
 +	u32 zdata_posted;	/* bytes of the expected burst posted to data_rx_ring */
 +	bool zdata;
++	/* Latched from the zc_write module parameter when the data plane comes up.
++	 * A per-device field rather than a global read in protocol.c so the offline
++	 * engine suite (which compiles protocol.c against stubs and never links
++	 * main.c) needs no new symbol. */
++	bool zc_write;
 +	int in_hop, out_hop;
 +	/* Zero-copy data-plane HopIDs (second path tuple); -1 when unavailable. */
 +	int in_hop2, out_hop2;
@@ -676,7 +685,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,501 @@
+@@ -0,0 +1,514 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -713,6 +722,19 @@ new file mode 100644
 +module_param_named(data_throttle_ns, sn_data_throttle_ns, uint, 0444);
 +MODULE_PARM_DESC(data_throttle_ns,
 +	"Data ring interrupt moderation in ns, 0 to disable (default 128000; applied at ring start)");
++
++/* Zero-copy RDMA WRITE is opt-in and OFF by default. Its placement is correct --
++ * verified byte-for-byte on hardware over 33 MiB per run -- but a retry that
++ * replays a burst can land stale payload into the requester's MR after that
++ * WRITE has already completed and the application has reused the buffer. Unlike
++ * a replayed SEND, which lands in a receive WQE that was already consumed, a
++ * replayed WRITE corrupts live user memory and still reports success. Eligible
++ * WRITEs therefore stay on the staged path until the replay ordering is
++ * root-caused. See kernel/verbs/README.md, "Zero-copy WRITE is opt-in". */
++bool sn_zc_write;
++module_param_named(zc_write, sn_zc_write, bool, 0444);
++MODULE_PARM_DESC(zc_write,
++	"Allow eligible RDMA WRITEs to take the zero-copy data ring (default off; staged WRITE path is the default)");
 +
 +static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 +				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
@@ -1182,7 +1204,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,494 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1307,6 +1329,7 @@ new file mode 100644
 +	if (ret)
 +		return ret;	/* EAGAIN retries next pass; rings stay allocated. */
 +	d->zdata = true;
++	d->zc_write = sn_zc_write;
 +	d->caps = SN_CAPS_V1 | SN_CAP_ZDATA;
 +	return 0;
 +}
@@ -1420,6 +1443,7 @@ new file mode 100644
 +	if (d->data_tx_ring) { tb_ring_free(d->data_tx_ring); d->data_tx_ring = NULL; }
 +	if (d->data_rx_ring) { tb_ring_free(d->data_rx_ring); d->data_rx_ring = NULL; }
 +	d->zdata = false;
++	d->zc_write = false;
 +	d->caps = SN_CAPS_V1;
 +	d->data_tx_head = d->data_tx_tail = d->data_rx_head = d->data_rx_tail = 0;
 +	d->rx_primed = false;
@@ -2357,7 +2381,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,642 @@
+@@ -0,0 +1,651 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -2492,7 +2516,16 @@ new file mode 100644
 +		return false;
 +	if (w->opcode == SN_SEND)
 +		return true;
-+	return w->opcode == SN_WRITE && !(w->remote_address & (SN_FRAME - 1));
++	/* WRITE is opt-in via the zc_write module parameter, latched into
++	 * d->zc_write when the data plane comes up. Placement itself is proven --
++	 * verified byte-for-byte on hardware -- but a retry that replays a burst can
++	 * land stale payload into the requester's MR after that WRITE has already
++	 * completed and the buffer been reused. A replayed SEND is harmless because
++	 * it lands in a receive WQE that was already consumed; a replayed WRITE
++	 * corrupts live user memory and still reports success. Eligible WRITEs stay
++	 * staged until that replay ordering is root-caused. */
++	return w->opcode == SN_WRITE && d->zc_write &&
++	       !(w->remote_address & (SN_FRAME - 1));
 +}
 +/* Returns nonzero after a full control queue failed the QP; the flush has
 + * already retired every SQ/RQ WQE, so callers must not touch them again. */

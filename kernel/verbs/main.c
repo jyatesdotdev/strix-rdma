@@ -35,6 +35,19 @@ module_param_named(data_throttle_ns, sn_data_throttle_ns, uint, 0444);
 MODULE_PARM_DESC(data_throttle_ns,
 	"Data ring interrupt moderation in ns, 0 to disable (default 128000; applied at ring start)");
 
+/* Zero-copy RDMA WRITE is opt-in and OFF by default. Its placement is correct --
+ * verified byte-for-byte on hardware over 33 MiB per run -- but a retry that
+ * replays a burst can land stale payload into the requester's MR after that
+ * WRITE has already completed and the application has reused the buffer. Unlike
+ * a replayed SEND, which lands in a receive WQE that was already consumed, a
+ * replayed WRITE corrupts live user memory and still reports success. Eligible
+ * WRITEs therefore stay on the staged path until the replay ordering is
+ * root-caused. See kernel/verbs/README.md, "Zero-copy WRITE is opt-in". */
+bool sn_zc_write;
+module_param_named(zc_write, sn_zc_write, bool, 0444);
+MODULE_PARM_DESC(zc_write,
+	"Allow eligible RDMA WRITEs to take the zero-copy data ring (default off; staged WRITE path is the default)");
+
 static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
 static struct tb_property_dir *sn_directory;

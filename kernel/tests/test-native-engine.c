@@ -83,7 +83,7 @@ struct sn_device {
 	u32 caps;
 	/* Zero-copy model state: peer link, expected-burst landing zone, drop knob.
 	 * The landing zone mirrors what the real data ring posts from q->zc_mr. */
-	bool peer_zc, zdata, zc_drop;
+	bool peer_zc, zdata, zc_write, zc_drop;
 	struct sn_device *zc_peer;
 	struct sn_mr *zc_land_mr;
 	u64 zc_land_addr;
@@ -466,6 +466,10 @@ static struct sn_device *zc_pair(struct sn_device **b)
 	*b = endpoint(20, 10, 200, 100);
 	a->peer_zc = (*b)->peer_zc = true;
 	a->zdata = (*b)->zdata = true;
+	/* Zero-copy WRITE is opt-in in the driver (module param zc_write, latched
+	 * into sn_device::zc_write when the data plane comes up). The suite exercises
+	 * the enabled path; the gated-off default is asserted separately. */
+	a->zc_write = (*b)->zc_write = true;
 	a->caps = (*b)->caps = SN_CAPS_V2;
 	a->zc_peer = *b; (*b)->zc_peer = a;
 	return a;
@@ -638,7 +642,21 @@ static void test_zc_write_fallback(void)
 	assert(!b->zc_land_mr && !b->zc_bursts && b->write_bytes == SN_MESSAGE);
 	for (i = 0; i < SN_MESSAGE; i++) assert(b->mr[1].data[SN_HEADER + i] == 0x6b);
 	release(a); release(b);
-	puts("ok 15 - zero-copy WRITE fallback: threshold and remote alignment keep a WRITE staged");
+	/* Opt-in gate off, which is the shipped default: a WRITE that is otherwise
+	 * fully eligible -- above the threshold, frame-aligned locally and remotely,
+	 * peer advertising ZDATA -- still stays staged and never reaches the data
+	 * ring. This is the assertion that keeps the replay-ordering bug unreachable
+	 * by default. */
+	a = zc_pair(&b);
+	a->zc_write = b->zc_write = false;
+	memset(a->mr[0].data, 0x7c, SN_MESSAGE);
+	post(a, SN_WRITE, SN_MESSAGE);
+	for (i = 0; i < 1000 && !a->sends; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && !b->recvs && !a->errors && !b->errors);
+	assert(!b->zc_land_mr && !b->zc_bursts && b->write_bytes == SN_MESSAGE);
+	for (i = 0; i < SN_MESSAGE; i++) assert(b->mr[1].data[i] == 0x7c);
+	release(a); release(b);
+	puts("ok 15 - zero-copy WRITE fallback: threshold, remote alignment and the opt-in gate keep a WRITE staged");
 }
 static void test_zc_write_refusal(void)
 {

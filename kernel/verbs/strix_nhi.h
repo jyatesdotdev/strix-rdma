@@ -28,6 +28,10 @@
  * new value takes effect on the next module load) so the knee can be measured
  * on hardware without a rebuild. Defined in main.c, consumed in ring.c. */
 extern unsigned int sn_data_throttle_ns;
+
+/* Opt-in zero-copy RDMA WRITE, defined in main.c and latched into
+ * sn_device::zc_write by ring.c when the data plane comes up. */
+extern bool sn_zc_write;
 #define SN_SERVICE "strixv1"
 #define SN_CONTROL_BYTES 112
 /* Handshake retransmission intervals; loss is expected, peers retransmit. */
@@ -139,6 +143,11 @@ struct sn_device {
 	unsigned int data_tx_head, data_tx_tail, data_rx_head, data_rx_tail;
 	u32 zdata_posted;	/* bytes of the expected burst posted to data_rx_ring */
 	bool zdata;
+	/* Latched from the zc_write module parameter when the data plane comes up.
+	 * A per-device field rather than a global read in protocol.c so the offline
+	 * engine suite (which compiles protocol.c against stubs and never links
+	 * main.c) needs no new symbol. */
+	bool zc_write;
 	int in_hop, out_hop;
 	/* Zero-copy data-plane HopIDs (second path tuple); -1 when unavailable. */
 	int in_hop2, out_hop2;

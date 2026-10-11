@@ -132,7 +132,16 @@ static bool sn_zc_eligible(struct sn_device *d, struct sn_wqe *w)
 		return false;
 	if (w->opcode == SN_SEND)
 		return true;
-	return w->opcode == SN_WRITE && !(w->remote_address & (SN_FRAME - 1));
+	/* WRITE is opt-in via the zc_write module parameter, latched into
+	 * d->zc_write when the data plane comes up. Placement itself is proven --
+	 * verified byte-for-byte on hardware -- but a retry that replays a burst can
+	 * land stale payload into the requester's MR after that WRITE has already
+	 * completed and the buffer been reused. A replayed SEND is harmless because
+	 * it lands in a receive WQE that was already consumed; a replayed WRITE
+	 * corrupts live user memory and still reports success. Eligible WRITEs stay
+	 * staged until that replay ordering is root-caused. */
+	return w->opcode == SN_WRITE && d->zc_write &&
+	       !(w->remote_address & (SN_FRAME - 1));
 }
 /* Returns nonzero after a full control queue failed the QP; the flush has
  * already retired every SQ/RQ WQE, so callers must not touch them again. */

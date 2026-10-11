@@ -435,11 +435,35 @@ than linked: the dated result files that originally recorded the runs were
 removed when this repository stopped being workload-specific, so the numbers
 below are the surviving record of what was measured on the lab host pair.
 
-Not yet run: RDMA READ/WRITE on hardware. The zero-copy WRITE path and the
-`strix-verbs-smoke ... write|read` modes are implemented and covered by the
-offline suites, but no WRITE or READ has ever carried a byte on hardware
-(`placed_write_bytes`/`placed_read_bytes` have only ever read 0), because the
-reference workload's RoCE path is SEND-only. Also not yet run:
+**RDMA READ and WRITE on hardware (2026-10-10, first live exercise).** After a
+clean reboot plus bring-up on both hosts, with `data_throttle_ns` at its 128000
+boot default:
+
+- `strix-verbs-smoke ... read 200` **passes**: 200 iters x window 4 x 2 MiB =
+  1,677,721,600 bytes placed and verified byte-for-byte on both sides,
+  `placed_read_bytes` non-zero for the first time, `bad_frames 0`, 61.96 MiB/s.
+- `... write 4` **passes 3/3**: 33,554,432 bytes verified byte-for-byte per run
+  at ~425 MiB/s, `placed_write_bytes` non-zero for the first time,
+  `bad_frames 0`, `zc_retries` unchanged.
+- `... write 200` **fails intermittently** on payload verification. It is
+  retry-correlated and reproducible: every failing run incremented
+  `zc_retries`, the failing iteration moved (22, then 32), and the failing side
+  flipped between hosts. Short runs that finish without a retry always pass.
+- The default CPU SEND/RECV smoke still passes (18,878,353 bytes, `zc_bursts 9`,
+  `bad_frames 0`), so this is specific to zero-copy WRITE.
+
+**Zero-copy WRITE is opt-in (`zc_write`, off by default) because of that
+failure.** The mechanism is a replayed burst: when a ZC WRITE is retried, stale
+payload can land in the requester's MR *after* that WRITE already completed and
+the application reused the buffer. A replayed SEND is harmless because it lands
+in a receive WQE the peer already consumed; a replayed WRITE corrupts live user
+memory and still reports `IBV_WC_SUCCESS`. Silent corruption, so eligible WRITEs
+stay on the staged path until the replay ordering is root-caused. The offline
+suites cover the happy path, lost `ZC_READY`, lost burst and the gate itself,
+but they model a *lost* burst rather than a *late* one arriving after
+completion, which is why they did not catch this.
+
+Also not yet run:
 hot-unplug/malformed-peer injection; sustained multi-hour endurance; an
 end-to-end inference re-run over the zero-copy data plane (the earlier proven run
 predates it). Do not describe this bounded experimental implementation as

@@ -122,6 +122,7 @@ int sn_data_rings_start(struct sn_device *d)
 	if (ret)
 		return ret;	/* EAGAIN retries next pass; rings stay allocated. */
 	d->zdata = true;
+	d->zc_write = sn_zc_write;
 	d->caps = SN_CAPS_V1 | SN_CAP_ZDATA;
 	return 0;
 }
@@ -235,6 +236,7 @@ int sn_rings_stop(struct sn_device *d)
 	if (d->data_tx_ring) { tb_ring_free(d->data_tx_ring); d->data_tx_ring = NULL; }
 	if (d->data_rx_ring) { tb_ring_free(d->data_rx_ring); d->data_rx_ring = NULL; }
 	d->zdata = false;
+	d->zc_write = false;
 	d->caps = SN_CAPS_V1;
 	d->data_tx_head = d->data_tx_tail = d->data_rx_head = d->data_rx_tail = 0;
 	d->rx_primed = false;
