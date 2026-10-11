@@ -326,3 +326,102 @@ during zero-copy runs is survivable — to be confirmed on hardware.
 - Retry: a ZC burst is retried as a whole message (descriptor + payload), same
   as staged multi-fragment messages today; the receiver's byte accounting
   resets on a duplicate descriptor (same sequence).
+
+## Next: zero-copy READ (`SN_ZC_READ`) — design
+
+Measured 2026-10-10 on the lab host pair after the WRITE work landed:
+
+| op | path | throughput |
+|---|---|---|
+| SEND bulk | zero-copy data ring | 1127–1191 MiB/s |
+| WRITE | zero-copy data ring | 456 MiB/s |
+| **READ** | **staged control ring** | **62.6 MiB/s** |
+
+READ is the last verb that does not use the data ring, and it is ~7x slower than
+WRITE. The cost is framing, not copying: a 2 MiB READ reply is pushed through the
+**control** ring as ~512 individually headered fragments by `sn_fragments_send()`,
+then reassembled by `sn_fragment()`/`sn_fragment_commit()` into `read_incoming`
+and copied into the requester's MR — about 32 ms per 2 MiB chunk. The responder's
+`sn_mr_copy()` into `read_snapshot` is a ~0.2 ms memcpy and is not the bottleneck.
+
+### Why READ is simpler than WRITE
+
+The WRITE requester does not know where its payload will land until the responder
+picks a posted receive WQE, so `SN_ZC_SEND`/`SN_ZC_WRITE` need an `SN_ZC_READY`
+round trip before the burst may start. A READ requester *already* knows its
+landing zone — it is the local MR and address it posted. So it can arm its own
+data RX ring **before** sending the descriptor, and **no `ZC_READY` exchange is
+needed**. One fewer round trip than either existing ZC path.
+
+### Flow
+
+1. Requester posts `IBV_WR_RDMA_READ`. If eligible, it sets
+   `q->zc_mr = w->mr`, `q->zc_address = w->address`, `q->zc_total = w->length` and
+   calls `sn_data_recv_start()` — the same arming `sn_zdata_repost()` already
+   implements for the responder side — then sends an `SN_ZC_READ` descriptor
+   carrying the *source* `rkey`, `address` and `total`.
+2. Responder validates `IB_ACCESS_REMOTE_READ` and `max_dest_rd_atomic`, resolves
+   and **retains** `q->remote_mr` (unlike the staged path, which copies and drops
+   it immediately), records `read_request`, and sets `response_active`.
+3. Responder bursts payload straight from `q->remote_mr` at `h->address` onto its
+   data TX ring as header-less frames. No snapshot copy, no fragmentation.
+4. Requester's data RX harvest counts bytes; at `total` it does the
+   `dma_sync_sg_for_cpu()`, completes the READ WQE and sends `SN_READ_ACK`.
+5. Responder releases `q->remote_mr` on the ACK and clears `response_active`.
+
+### Required changes
+
+- `native_wire.h`: `SN_ZC_READ` opcode (new value; do not renumber existing
+  opcodes) plus decode validation — like `SN_ZC_WRITE` it *requires* rkey and
+  address, and the reply carries no payload header at all.
+- `ring.c`: `sn_data_send_burst()` currently reads `w = &q->sq[q->sq_head]` and
+  bursts from that WQE's MR. A READ response has no SQ WQE, so generalise it to
+  take an explicit `(mr, address, total, offset)` — or add a sibling — and have
+  the SQ path call through. Land this refactor on its own with no behaviour
+  change; the existing 38 assertions are its regression net.
+- `protocol.c`: eligibility for READ (length above `SN_ZC_THRESHOLD`, local
+  address frame-aligned, `d->zdata && d->peer_zc`, and a `zc_read` gate);
+  requester arming and descriptor emission; a responder branch for `SN_ZC_READ`;
+  a response-burst path parallel to the existing `response_active` block; and a
+  READ case in `sn_engine_zc_bytes()` completion.
+- `main.c`: `zc_read` module parameter, defaulting **off** until validated on
+  hardware, exactly as `zc_write` did; flip it only after a clean run.
+
+### Retry safety — apply the WRITE lesson up front
+
+The WRITE replay race was found the hard way, so build the guards in from the
+start rather than retrofitting them:
+
+- The responder is now the burst *sender*, so its response-retry path must call
+  `sn_data_tx_drained()` and defer the re-burst until every posted frame has been
+  consumed, bounded by the retry budget. Restarting on top of frames still queued
+  is what corrupted WRITE.
+- The requester, on a duplicate descriptor, must reset `zc_received` and call
+  `sn_data_recv_restart()` to flush its RX ring — which discards frames already
+  received but cannot recall frames still in flight, hence the drain barrier
+  above.
+- The overshoot guard in the RX harvest already fails the QP rather than
+  completing; it covers READ for free.
+
+### One deliberate semantic change
+
+The staged path snapshots into `read_snapshot` so a retried READ returns the
+*original* bytes (offline assertion "READ retry returns original snapshot").
+Zero-copy READ re-reads the source MR on retry, so a retry may observe newer
+data. That is what a real RNIC does — RC guarantees per-operation consistency,
+not a snapshot held across retransmits — so it is defensible, but it is a
+difference between the two paths and must be documented, not discovered. Small
+or unaligned READs keep the staged path and therefore keep the snapshot
+guarantee.
+
+### Test plan
+
+Offline first, because the harness is the only way to iterate without a reboot
+per hypothesis: extend the atomic `sn_data_send_burst` model to cover the
+response direction, then mirror the existing ZC WRITE assertions — descriptor
+validation, happy-path placement into the requester's MR, lost-ACK retry with the
+drain barrier deferring, duplicate-descriptor restart, threshold/alignment
+fallback to staged, and refusal without `IB_ACCESS_REMOTE_READ` or
+`max_dest_rd_atomic`. Then hardware: `read 200` and `read 2000` verified
+byte-for-byte against the 62.6 MiB/s staged baseline, `bad_frames` 0, and a
+bulk SEND run to confirm nothing regressed.
