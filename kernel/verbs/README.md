@@ -544,6 +544,17 @@ bounded chunks across engine passes, with a descriptor retransmit interleaved
 between chunks. That harness change is the prerequisite for fixing the race
 without burning a reboot per hypothesis.
 
+**Zero-copy READ exists but is gated off.** `SN_ZC_READ` is implemented and
+offline-covered, and `zc_read=1` measured **410.68 MiB/s against the staged
+path's 62.61 MiB/s** with 1,677,721,600 bytes verified byte-for-byte — but
+`read 2000` fails at iteration 390 with `IBV_WC_RETRY_EXC_ERR` once retries
+start, the same class of failure as the WRITE replay race. `zc_read` therefore
+defaults **off** and the staged READ path above is the correct one; it also keeps
+the snapshot guarantee that zero-copy READ gives up. Full results, the two
+hardware-only bugs found on the way (a bidirectional deadlock, and a smoke tool
+that hid the completion status) and the next diagnostic step are in
+`docs/ZEROCOPY_VERBS.md`, "Hardware result: implemented, gated OFF".
+
 Also not yet run:
 hot-unplug/malformed-peer injection; sustained multi-hour endurance; an
 end-to-end inference re-run over the zero-copy data plane (the earlier proven run

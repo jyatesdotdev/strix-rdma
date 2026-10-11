@@ -425,3 +425,54 @@ fallback to staged, and refusal without `IB_ACCESS_REMOTE_READ` or
 `max_dest_rd_atomic`. Then hardware: `read 200` and `read 2000` verified
 byte-for-byte against the 62.6 MiB/s staged baseline, `bad_frames` 0, and a
 bulk SEND run to confirm nothing regressed.
+
+### Hardware result: implemented, gated OFF, not yet safe to enable
+
+`SN_ZC_READ` is implemented and offline-covered (47 assertions) but `zc_read`
+**defaults off** and must stay off. Measured 2026-10-11 on the lab host pair
+after a clean reboot and bring-up, `zc_read=1` forced via modprobe.d:
+
+| run | result |
+|---|---|
+| `read 200` | **PASS** — 1,677,721,600 B/direction verified byte-for-byte, 410.68 MiB/s, 800 bursts, `bad_frames` 0 |
+| `read 2000` | **FAIL at iteration 390** — `IBV_WC_RETRY_EXC_ERR` (status 12), `zc_retries` 37 and 48 |
+| `write 200` (regression) | PASS, 451.09 MiB/s |
+| SEND smoke (regression) | PASS, 18,878,353 B byte-for-byte |
+| bulk SEND ×2 (regression) | 1230.14 / 1212.73 MiB/s |
+
+So zero-copy READ is **6.6x the staged path** (410.68 vs 62.61 MiB/s) and correct
+over 1.6 GB, but it does not survive sustained volume: it fails once retries
+start occurring, at roughly the same place the WRITE replay race did. The
+signature is the same class — the offline model's `sn_data_send_burst` is atomic,
+so a partially posted response burst, a stale in-flight frame and an overshooting
+byte count are all still unrepresentable, and the drain barrier that fixed WRITE
+is present here (ok 20) without being sufficient.
+
+Two bugs were found and fixed on the way, both only visible on hardware:
+
+1. **Bidirectional deadlock.** `sn_receive_zc()` held *any* inbound burst
+   descriptor while `q->zc_expect` was set. Correct for `SN_ZC_SEND`/`SN_ZC_WRITE`,
+   which land inbound, but `SN_ZC_READ` answers by bursting OUT on the data TX
+   ring and lands nothing, so holding it deadlocked simultaneous bidirectional
+   READ: each side armed its landing zone for the response it was owed, then held
+   the peer's request until that response landed. Symptom was `RETRY_EXC_ERR` on
+   iteration 1 with `zc_bursts` 0 on both hosts, descriptors exchanged, no
+   response, no `bad_frames`. Fixed by exempting `SN_ZC_READ` from the hold;
+   ok 25 pins it and was verified differentially (reverting the one-line
+   condition fails ok 25 alone).
+2. **The smoke tool hid the diagnosis.** A bare "RDMA WC status/identity" failure
+   does not distinguish retry-exceeded from a remote access refusal from a `wr_id`
+   bookkeeping bug. It now prints status, `ibv_wc_status_str`, opcode, the
+   `wr_id` decode and `qp_num` before failing.
+
+Next step for whoever enables this: reproduce `read 2000` with the responder's
+response-retry path instrumented, and extend the offline harness to deliver a
+response burst in bounded chunks across engine passes so the overlap is
+representable at all. Until then the staged READ path is the correct one and
+keeps its snapshot guarantee.
+
+Incidental: bulk SEND measured 1230/1213 MiB/s in this session, back inside the
+1182-1238 MiB/s band and above the 1127-1191 MiB/s recorded for the previous
+post-reboot runs. Post-reboot throughput on this stack varies run to run by more
+than the ~4% that separates those two bands, so a single post-reboot measurement
+is not evidence of regression in either direction.
