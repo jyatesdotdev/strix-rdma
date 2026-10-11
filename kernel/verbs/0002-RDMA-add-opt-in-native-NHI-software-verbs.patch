@@ -445,7 +445,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,242 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -674,6 +674,13 @@ new file mode 100644
 +/* Abort an in-progress burst and reclaim both data rings (called from
 + * sn_engine_reset so an aborted burst cannot poison the rings). */
 +void sn_data_abort(struct sn_device *d);
++/* True once every burst frame this host posted has been consumed by the NHI.
++ * The zero-copy retry path must not restart a burst while frames are still
++ * queued: they cannot be recalled, and the peer counts them into the new attempt
++ * after it zeroes zc_received for the retransmitted descriptor. E2E neither loses
++ * nor reorders frames, so once every posted slot is done, nothing more from the
++ * superseded attempt can still arrive. */
++bool sn_data_tx_drained(struct sn_device *d);
 +void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes);
 +int sn_data_rings_start(struct sn_device *d);
 +int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m);
@@ -685,7 +692,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,522 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -723,18 +730,26 @@ new file mode 100644
 +MODULE_PARM_DESC(data_throttle_ns,
 +	"Data ring interrupt moderation in ns, 0 to disable (default 128000; applied at ring start)");
 +
-+/* Zero-copy RDMA WRITE is opt-in and OFF by default. Its placement is correct --
-+ * verified byte-for-byte on hardware over 33 MiB per run -- but a retry that
-+ * replays a burst can land stale payload into the requester's MR after that
-+ * WRITE has already completed and the application has reused the buffer. Unlike
-+ * a replayed SEND, which lands in a receive WQE that was already consumed, a
-+ * replayed WRITE corrupts live user memory and still reports success. Eligible
-+ * WRITEs therefore stay on the staged path until the replay ordering is
-+ * root-caused. See kernel/verbs/README.md, "Zero-copy WRITE is opt-in". */
-+bool sn_zc_write;
++/* Zero-copy RDMA WRITE, on by default; zc_write=0 is the kill-switch that puts
++ * eligible WRITEs back on the staged control-ring path.
++ *
++ * This was briefly opt-in because a retry could corrupt payload: restarting a
++ * burst re-sends the descriptor, the peer zeroes zc_received for it, and frames
++ * from the superseded attempt that were still queued on the data TX ring then got
++ * counted into the new one -- overshooting the byte count, skipping the for-CPU
++ * sync that keyed on exact equality, and completing a buffer assembled from two
++ * attempts as IBV_WC_SUCCESS.
++ *
++ * Two changes make it safe. The retry path now waits for the data TX ring to
++ * drain before restarting a burst (sn_data_tx_drained), bounded by the normal
++ * retry budget, so no stale frame can outlive the reset; and an overshooting
++ * byte count fails the QP instead of completing. Validated on hardware over
++ * 16.8 GiB per direction verified byte-for-byte at 449 MiB/s, bad_frames 0.
++ * See kernel/verbs/README.md. */
++bool sn_zc_write = true;
 +module_param_named(zc_write, sn_zc_write, bool, 0444);
 +MODULE_PARM_DESC(zc_write,
-+	"Allow eligible RDMA WRITEs to take the zero-copy data ring (default off; staged WRITE path is the default)");
++	"Let eligible RDMA WRITEs take the zero-copy data ring (default on; 0 forces the staged WRITE path)");
 +
 +static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 +				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
@@ -1204,7 +1219,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,522 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1599,6 +1614,20 @@ new file mode 100644
 +		d->zdata_posted += size;
 +	}
 +	return 0;
++}
++/* Harvest completed data TX slots and report whether the ring is now empty.
++ * A canceled slot is deliberately not harvested here, so it reads as not drained
++ * and the caller's bounded retry budget fails the QP instead of spinning. */
++bool sn_data_tx_drained(struct sn_device *d)
++{
++	lockdep_assert_held(&d->lock);
++	while (d->data_tx_head != d->data_tx_tail &&
++	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE])) {
++		if (d->data_tx[d->data_tx_tail % SN_RING_SIZE].canceled)
++			break;
++		d->data_tx_tail++;
++	}
++	return d->data_tx_head == d->data_tx_tail;
 +}
 +int sn_data_recv_start(struct sn_device *d, struct sn_qp *q)
 +{
@@ -2395,7 +2424,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,651 @@
+@@ -0,0 +1,666 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -2530,14 +2559,12 @@ new file mode 100644
 +		return false;
 +	if (w->opcode == SN_SEND)
 +		return true;
-+	/* WRITE is opt-in via the zc_write module parameter, latched into
-+	 * d->zc_write when the data plane comes up. Placement itself is proven --
-+	 * verified byte-for-byte on hardware -- but a retry that replays a burst can
-+	 * land stale payload into the requester's MR after that WRITE has already
-+	 * completed and the buffer been reused. A replayed SEND is harmless because
-+	 * it lands in a receive WQE that was already consumed; a replayed WRITE
-+	 * corrupts live user memory and still reports success. Eligible WRITEs stay
-+	 * staged until that replay ordering is root-caused. */
++	/* WRITE honours the zc_write kill-switch, latched into d->zc_write when the
++	 * data plane comes up. A replayed SEND is harmless because it lands in a
++	 * receive WQE the peer already consumed; a replayed WRITE lands in live user
++	 * memory, so the retry path waits for the data TX ring to drain before
++	 * restarting a burst and an overshooting byte count fails the QP. With those
++	 * two guards the placement is verified byte-for-byte on hardware. */
 +	return w->opcode == SN_WRITE && d->zc_write &&
 +	       !(w->remote_address & (SN_FRAME - 1));
 +}
@@ -2985,6 +3012,23 @@ new file mode 100644
 +	}
 +	if (q->outgoing_sent) {
 +		if (now < q->deadline) return;
++		/* Restarting a zero-copy burst re-sends the descriptor and reposts payload
++		 * from offset zero, and the peer zeroes zc_received when that duplicate
++		 * descriptor lands. Frames from the previous attempt still queued on the
++		 * data TX ring cannot be recalled, so they arrive after the reset and get
++		 * counted into the new attempt: the byte count overshoots, the
++		 * exact-equality for-CPU sync is skipped, and a buffer assembled from two
++		 * attempts completes as IBV_WC_SUCCESS. Wait for the ring to drain first.
++		 * Bounded by the normal retry budget, so a ring that never drains fails
++		 * the QP instead of deferring forever. A descriptor retransmit from
++		 * SN_ZC_WAIT needs no such barrier -- nothing has been posted yet. */
++		if (q->zc_state == SN_ZC_SENT && !sn_data_tx_drained(d)) {
++			if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
++				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
++			}
++			q->deadline = now + sn_ack_timeout_ns(q->attr.timeout);
++			return;
++		}
 +		if (!q->rnr_wait && !sn_retry_take(&q->retries, q->attr.retry_cnt)) {
 +			sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 +		}

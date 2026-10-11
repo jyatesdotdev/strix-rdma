@@ -84,6 +84,9 @@ struct sn_device {
 	/* Zero-copy model state: peer link, expected-burst landing zone, drop knob.
 	 * The landing zone mirrors what the real data ring posts from q->zc_mr. */
 	bool peer_zc, zdata, zc_write, zc_drop;
+	/* Models a data TX ring whose posted burst frames have not been consumed,
+	 * so sn_data_tx_drained() reports false and the retry path must defer. */
+	bool zc_tx_stuck;
 	struct sn_device *zc_peer;
 	struct sn_mr *zc_land_mr;
 	u64 zc_land_addr;
@@ -143,6 +146,7 @@ int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_start(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 void sn_data_abort(struct sn_device *d);
+bool sn_data_tx_drained(struct sn_device *d);
 #include "../verbs/protocol.c"
 /* Modeled zero-copy data plane: the sender copies payload from the active SQ
  * WQE's MR straight into the peer's expected-burst landing zone and feeds the
@@ -176,6 +180,7 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 	return 0;
 }
 void sn_data_abort(struct sn_device *d) { (void)d; }
+bool sn_data_tx_drained(struct sn_device *d) { return !d->zc_tx_stuck; }
 static void sn_qp_error(struct sn_qp *q, enum ib_wc_status status)
 {
 	struct sn_device *d = q->ib.device;
@@ -618,6 +623,48 @@ static void test_zc_write_retry_burst(void)
 	release(a); release(b);
 	puts("ok 14 - lost ZC_WRITE burst: whole-message retry reposts the remote MR from offset zero");
 }
+/* The retry that restarts a burst must not fire while burst frames are still
+ * queued on the data TX ring. The peer zeroes zc_received when the retransmitted
+ * descriptor lands, so frames from the superseded attempt would be counted into
+ * the new one: the byte count overshoots and a buffer assembled from two attempts
+ * completes as IBV_WC_SUCCESS. The guard defers instead, bounded by the retry
+ * budget so a ring that never drains fails the QP rather than spinning. */
+static void test_zc_retry_waits_for_drain(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x9e, SN_MESSAGE);
+	post(a, SN_WRITE, SN_MESSAGE);
+	sn_engine_progress(a);
+	deliver(a, b, NULL);
+	/* sn_ack() queues into the control queue, which only reaches the packet ring
+	 * on the responder's next progress -- so b must be stepped before its
+	 * ZC_READY can be delivered. The step()-driven tests self-correct here. */
+	sn_engine_progress(b);
+	deliver(b, a, NULL);			/* ZC_READY -> requester goes SENDING */
+	sn_engine_progress(a);			/* burst posted: requester now in SENT */
+	sn_engine_progress(b);			/* responder counts bytes, retires the MR */
+	/* step() would complete the whole exchange in one pass, so drive the states
+	 * by hand to observe the transient SN_ZC_SENT the guard keys on. */
+	assert(a->qp->zc_state == SN_ZC_SENT && a->qp->outgoing_sent);
+	assert(b->write_bytes == SN_MESSAGE && b->zc_bursts == 1);
+
+	/* Drop the completion ACK so the requester keeps waiting, and refuse to drain.
+	 * The engine must keep deferring: no descriptor retransmit, no second burst,
+	 * and the payload that already landed must never be counted twice. */
+	{ int drop_ack = SN_ACK; deliver(b, a, &drop_ack); }
+	a->zc_tx_stuck = true;
+	for (i = 0; i < 500 && !a->errors; i++) {
+		now += 1000000;
+		sn_engine_progress(a);
+		assert(b->write_bytes == SN_MESSAGE);
+	}
+	assert(a->errors == 1 && a->last_error == IB_WC_RETRY_EXC_ERR);
+	assert(!a->sends && a->zc_retries == 0);
+	release(a); release(b);
+	puts("ok 17 - burst restart waits for the data TX ring to drain; a ring that never drains fails the QP");
+}
 static void test_zc_write_fallback(void)
 {
 	struct sn_device *b, *a = zc_pair(&b);
@@ -693,13 +740,14 @@ static void test_zc_write_refusal(void)
 }
 int main(void)
 {
-	puts("1..16");
+	puts("1..17");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
 	test_zc_fallback();
 	test_zc_write(); test_zc_write_retry_ready(); test_zc_write_retry_burst();
 	test_zc_write_fallback(); test_zc_write_refusal();
+	test_zc_retry_waits_for_drain();
 	assert(!warnings);
 	return 0;
 }

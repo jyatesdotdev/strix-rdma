@@ -132,14 +132,12 @@ static bool sn_zc_eligible(struct sn_device *d, struct sn_wqe *w)
 		return false;
 	if (w->opcode == SN_SEND)
 		return true;
-	/* WRITE is opt-in via the zc_write module parameter, latched into
-	 * d->zc_write when the data plane comes up. Placement itself is proven --
-	 * verified byte-for-byte on hardware -- but a retry that replays a burst can
-	 * land stale payload into the requester's MR after that WRITE has already
-	 * completed and the buffer been reused. A replayed SEND is harmless because
-	 * it lands in a receive WQE that was already consumed; a replayed WRITE
-	 * corrupts live user memory and still reports success. Eligible WRITEs stay
-	 * staged until that replay ordering is root-caused. */
+	/* WRITE honours the zc_write kill-switch, latched into d->zc_write when the
+	 * data plane comes up. A replayed SEND is harmless because it lands in a
+	 * receive WQE the peer already consumed; a replayed WRITE lands in live user
+	 * memory, so the retry path waits for the data TX ring to drain before
+	 * restarting a burst and an overshooting byte count fails the QP. With those
+	 * two guards the placement is verified byte-for-byte on hardware. */
 	return w->opcode == SN_WRITE && d->zc_write &&
 	       !(w->remote_address & (SN_FRAME - 1));
 }
@@ -587,6 +585,23 @@ void sn_engine_progress(struct sn_device *d)
 	}
 	if (q->outgoing_sent) {
 		if (now < q->deadline) return;
+		/* Restarting a zero-copy burst re-sends the descriptor and reposts payload
+		 * from offset zero, and the peer zeroes zc_received when that duplicate
+		 * descriptor lands. Frames from the previous attempt still queued on the
+		 * data TX ring cannot be recalled, so they arrive after the reset and get
+		 * counted into the new attempt: the byte count overshoots, the
+		 * exact-equality for-CPU sync is skipped, and a buffer assembled from two
+		 * attempts completes as IBV_WC_SUCCESS. Wait for the ring to drain first.
+		 * Bounded by the normal retry budget, so a ring that never drains fails
+		 * the QP instead of deferring forever. A descriptor retransmit from
+		 * SN_ZC_WAIT needs no such barrier -- nothing has been posted yet. */
+		if (q->zc_state == SN_ZC_SENT && !sn_data_tx_drained(d)) {
+			if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
+				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
+			}
+			q->deadline = now + sn_ack_timeout_ns(q->attr.timeout);
+			return;
+		}
 		if (!q->rnr_wait && !sn_retry_take(&q->retries, q->attr.retry_cnt)) {
 			sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 		}

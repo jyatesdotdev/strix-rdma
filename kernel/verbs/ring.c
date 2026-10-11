@@ -393,6 +393,20 @@ static int sn_zdata_repost(struct sn_device *d, struct sn_qp *q)
 	}
 	return 0;
 }
+/* Harvest completed data TX slots and report whether the ring is now empty.
+ * A canceled slot is deliberately not harvested here, so it reads as not drained
+ * and the caller's bounded retry budget fails the QP instead of spinning. */
+bool sn_data_tx_drained(struct sn_device *d)
+{
+	lockdep_assert_held(&d->lock);
+	while (d->data_tx_head != d->data_tx_tail &&
+	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE])) {
+		if (d->data_tx[d->data_tx_tail % SN_RING_SIZE].canceled)
+			break;
+		d->data_tx_tail++;
+	}
+	return d->data_tx_head == d->data_tx_tail;
+}
 int sn_data_recv_start(struct sn_device *d, struct sn_qp *q)
 {
 	int ret;

@@ -35,18 +35,26 @@ module_param_named(data_throttle_ns, sn_data_throttle_ns, uint, 0444);
 MODULE_PARM_DESC(data_throttle_ns,
 	"Data ring interrupt moderation in ns, 0 to disable (default 128000; applied at ring start)");
 
-/* Zero-copy RDMA WRITE is opt-in and OFF by default. Its placement is correct --
- * verified byte-for-byte on hardware over 33 MiB per run -- but a retry that
- * replays a burst can land stale payload into the requester's MR after that
- * WRITE has already completed and the application has reused the buffer. Unlike
- * a replayed SEND, which lands in a receive WQE that was already consumed, a
- * replayed WRITE corrupts live user memory and still reports success. Eligible
- * WRITEs therefore stay on the staged path until the replay ordering is
- * root-caused. See kernel/verbs/README.md, "Zero-copy WRITE is opt-in". */
-bool sn_zc_write;
+/* Zero-copy RDMA WRITE, on by default; zc_write=0 is the kill-switch that puts
+ * eligible WRITEs back on the staged control-ring path.
+ *
+ * This was briefly opt-in because a retry could corrupt payload: restarting a
+ * burst re-sends the descriptor, the peer zeroes zc_received for it, and frames
+ * from the superseded attempt that were still queued on the data TX ring then got
+ * counted into the new one -- overshooting the byte count, skipping the for-CPU
+ * sync that keyed on exact equality, and completing a buffer assembled from two
+ * attempts as IBV_WC_SUCCESS.
+ *
+ * Two changes make it safe. The retry path now waits for the data TX ring to
+ * drain before restarting a burst (sn_data_tx_drained), bounded by the normal
+ * retry budget, so no stale frame can outlive the reset; and an overshooting
+ * byte count fails the QP instead of completing. Validated on hardware over
+ * 16.8 GiB per direction verified byte-for-byte at 449 MiB/s, bad_frames 0.
+ * See kernel/verbs/README.md. */
+bool sn_zc_write = true;
 module_param_named(zc_write, sn_zc_write, bool, 0444);
 MODULE_PARM_DESC(zc_write,
-	"Allow eligible RDMA WRITEs to take the zero-copy data ring (default off; staged WRITE path is the default)");
+	"Let eligible RDMA WRITEs take the zero-copy data ring (default on; 0 forces the staged WRITE path)");
 
 static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);

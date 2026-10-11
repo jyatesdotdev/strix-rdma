@@ -226,6 +226,13 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 /* Abort an in-progress burst and reclaim both data rings (called from
  * sn_engine_reset so an aborted burst cannot poison the rings). */
 void sn_data_abort(struct sn_device *d);
+/* True once every burst frame this host posted has been consumed by the NHI.
+ * The zero-copy retry path must not restart a burst while frames are still
+ * queued: they cannot be recalled, and the peer counts them into the new attempt
+ * after it zeroes zc_received for the retransmitted descriptor. E2E neither loses
+ * nor reorders frames, so once every posted slot is done, nothing more from the
+ * superseded attempt can still arrive. */
+bool sn_data_tx_drained(struct sn_device *d);
 void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes);
 int sn_data_rings_start(struct sn_device *d);
 int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m);

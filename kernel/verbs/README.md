@@ -452,13 +452,13 @@ boot default:
 - The default CPU SEND/RECV smoke still passes (18,878,353 bytes, `zc_bursts 9`,
   `bad_frames 0`), so this is specific to zero-copy WRITE.
 
-**Zero-copy WRITE is opt-in (`zc_write`, off by default) because of that
-failure.** The mechanism is a replayed burst: when a ZC WRITE is retried, stale
-payload can land in the requester's MR *after* that WRITE already completed and
-the application reused the buffer. A replayed SEND is harmless because it lands
-in a receive WQE the peer already consumed; a replayed WRITE corrupts live user
-memory and still reports `IBV_WC_SUCCESS`. Silent corruption, so eligible WRITEs
-stay on the staged path until the replay ordering is root-caused. The offline
+**That failure was root-caused and fixed; zero-copy WRITE is now on by default**
+(`zc_write=0` remains as a kill-switch that puts eligible WRITEs back on the
+staged path). The mechanism was a replayed burst: when a ZC WRITE was retried,
+stale payload could land in the requester's MR *after* that WRITE already
+completed and the application reused the buffer. A replayed SEND is harmless
+because it lands in a receive WQE the peer already consumed; a replayed WRITE
+corrupts live user memory and still reports `IBV_WC_SUCCESS`. The offline
 suites cover the happy path, lost `ZC_READY`, lost burst and the gate itself,
 but they model a *lost* burst rather than a *late* one arriving after
 completion, which is why they did not catch this.
@@ -475,10 +475,11 @@ completion, which is why they did not catch this.
   (62.62 MiB/s).
 - `bad_frames 0` throughout.
 
-So the gate does what it exists to do: WRITE and READ are correct and safe today,
-at staged-path speed. **The gate costs roughly 7x WRITE throughput** — ~425 MiB/s
-for zero-copy WRITE in the short runs that completed, against 58.81 MiB/s staged —
-which is the size of the prize for root-causing the replay ordering.
+So the gate did what it existed to do: WRITE and READ stayed correct while the
+replay bug was open, at staged-path speed. Staging cost roughly 7x WRITE
+throughput — 58.81 MiB/s against the ~450 MiB/s zero-copy WRITE reaches — which
+was the size of the prize for root-causing it, and why gating was worth doing
+rather than shipping a known-corrupting path.
 
 Bulk SEND throughput after the clean reboot was **1127–1191 MiB/s** over 5 runs
 (mean 1158), `bad_frames 0`, retry rate 462/6000 bursts = 7.7% (the recorded
@@ -510,16 +511,27 @@ An overshooting count never satisfies that equality, so the completing message
 was handed back **without** the for-CPU sync *and* assembled from two burst
 attempts. Both are silent: the completion still reports `IBV_WC_SUCCESS`.
 
-A guardrail now fails the QP with `IB_WC_GENERAL_ERR` on overshoot instead of
-completing. That converts the loud-but-late case into a visible error, and it is
-worth keeping regardless, but **it is not a fix**: a stale/new frame mix can
-still land exactly on `zc_total` and complete with wrong payload. The real fix
-has to stop a superseded attempt's frames from being counted at all — for example
-drain the data TX ring before allowing a descriptor retransmit, or make the
-completion ACK authoritative so a retransmit can only happen after the receiver
-has quiesced. An attempt/epoch tag the receiver could filter on is not available,
-because burst frames are header-less by design (framing comes from the NHI
-sof/eof PDFs).
+Two changes fix it. The retry path now calls `sn_data_tx_drained()` and **defers
+the restart until every posted burst frame has been consumed by the NHI**, bounded
+by the normal retry budget so a ring that never drains fails the QP with
+`IB_WC_RETRY_EXC_ERR` instead of spinning. E2E neither loses nor reorders frames,
+so once the ring is empty nothing from the superseded attempt can still arrive —
+which is what makes the restart safe. A descriptor retransmit from `SN_ZC_WAIT`
+needs no such barrier, because nothing has been posted yet. As a backstop, an
+overshooting byte count now fails the QP with `IB_WC_GENERAL_ERR` rather than
+completing, so even an unmodelled overlap becomes a visible error instead of
+silent corruption. An attempt/epoch tag the receiver could filter on is not
+available, because burst frames are header-less by design (framing comes from the
+NHI sof/eof PDFs) — which is why the fix is a drain barrier rather than a tag.
+
+Validated after the fix with `zc_write=Y`: `write 200` three times and `write
+2000` once — 1,677,721,600 and 16,777,216,000 bytes per direction, each
+**verified byte-for-byte** on both sides at 356–456 MiB/s, `bad_frames 0`, 10,400
+zero-copy bursts, `placed_write_bytes` accounting exact. Before the fix `write
+200` failed 3/3. Note `zc_retries` stayed 0 throughout, so the *defer* path was
+exercised by the offline suite (`ok 17 - burst restart waits for the data TX ring
+to drain; a ring that never drains fails the QP`) rather than on hardware; the
+hardware runs prove the common path, the offline test proves the guard.
 
 The offline suites cannot catch any of this. Their `sn_data_send_burst` is atomic
 — one `memcpy` plus an immediate `sn_engine_zc_bytes()` — so a partially posted
