@@ -181,6 +181,7 @@ void sn_engine_reset(struct sn_qp *q)
 	q->zc_expect = false; q->zc_total = q->zc_received = 0;
 	q->zc_mr = NULL; q->zc_address = 0;
 	q->zc_read_armed = false; q->zc_held = false;
+	q->zc_read_staged = false; q->response_fallback = false;
 	memset(&q->receive, 0, sizeof(q->receive));
 	memset(&q->read_receive, 0, sizeof(q->read_receive));
 	/* Reclaim the data rings so this aborted burst cannot leave posted RX
@@ -281,6 +282,17 @@ static void sn_receive_read_reply(struct sn_qp *q, const struct sn_header *h, co
 	if (sn_mr_copy(w->mr, w->address, q->read_incoming, w->length, true)) {
 		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
 	}
+	if (q->zc_read_armed) {
+		/* Staged fallback of a zero-copy READ completed. The responder drained its
+		 * data TX ring before serving this reply and E2E neither loses nor reorders
+		 * frames, so no burst is live: only now is the landing zone disarmed and the
+		 * data RX ring reclaimed, before the WQE's MR is handed back. */
+		q->zc_expect = false; q->zc_read_armed = false; q->zc_read_staged = false;
+		q->zc_mr = NULL; q->zc_address = 0;
+		if (sn_data_recv_restart(sn_dev(q->ib.device), q)) {
+			sn_qp_error(q, IB_WC_GENERAL_ERR); return;
+		}
+	}
 	sn_dev(q->ib.device)->read_bytes += h->total;
 	q->last_read = h->sequence; q->last_read_length = h->total; q->have_last_read = true;
 	if (sn_ack(q, SN_READ_ACK, h->sequence, SN_OK)) return;
@@ -300,6 +312,32 @@ static void sn_request_error(struct sn_qp *q, const struct sn_header *h, u32 sta
  * retry may observe newer data: RC guarantees per-operation consistency, not a
  * snapshot held across retransmits. The MR is retained until the ACK, so it only
  * needs re-resolving when an ACK crossed this retransmit. */
+/* Serve a zero-copy READ through the staged path instead: snapshot the source
+ * MR, drop the retained reference exactly as the staged path always does, and
+ * re-arm the response as SN_READ. The staged reply regains the snapshot
+ * guarantee for any further retries. */
+static int sn_response_to_staged(struct sn_device *d, struct sn_qp *q)
+{
+	const struct sn_header *r = &q->read_request;
+	int ret;
+
+	if (!q->remote_mr)
+		q->remote_mr = sn_mr_get(q, r->rkey, r->address, r->total,
+					 IB_ACCESS_REMOTE_READ);
+	if (!q->remote_mr)
+		return -EFAULT;
+	ret = sn_mr_copy(q->remote_mr, r->address, q->read_snapshot, r->total, false);
+	sn_mr_put(q->remote_mr); q->remote_mr = NULL;
+	if (ret)
+		return ret;
+	q->read_request.opcode = SN_READ;
+	q->response_fallback = false;
+	q->response_active = true; q->response_sent = false;
+	q->response_offset = q->response_retries = 0;
+	q->response_deadline = ktime_get_ns() + 30000000000ULL;
+	d->zc_read_fallback_served++;
+	return 0;
+}
 static void sn_read_response_rearm(struct sn_device *d, struct sn_qp *q,
 				  const struct sn_header *h)
 {
@@ -498,7 +536,7 @@ void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 		 * peer's burst rather than by a frame we can time against, so measure the
 		 * retransmit window from the last frame: without this a burst slower than
 		 * one window would be restarted on top of frames still in flight. */
-		if (read)
+		if (read && !q->zc_read_staged)
 			q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
 		return;
 	}
@@ -507,6 +545,12 @@ void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 	 * again. A WRITE placement retires the requester's remote MR and consumes
 	 * no receive WQE, so it produces no receive CQE. */
 	q->zc_mr = NULL; q->zc_address = 0;
+	if (read && q->zc_read_staged) {
+		/* Late frames of the abandoned zero-copy attempt finished landing. The
+		 * staged reply owns completion; keep the zone armed so any further frame
+		 * trips the overshoot check rather than completing anything. */
+		return;
+	}
 	if (read) {
 		/* The landing zone is the READ WQE's own MR, synced for the CPU by the
 		 * receive path just before the completing byte count, so the SQ operation
@@ -547,6 +591,13 @@ static void sn_receive_request(struct sn_qp *q, const struct sn_header *h, const
 
 	if (result == SN_FRAGMENT_REPLAY) {
 		if (h->opcode == SN_READ && q->receive.replay_status == SN_OK) {
+			if (q->read_request.opcode == SN_ZC_READ) {
+				/* The requester abandoned the zero-copy reply and fell back to a
+				 * staged SN_READ for the same operation. The response block
+				 * switches it to staged once any queued burst has drained. */
+				q->response_fallback = true; q->response_active = true;
+				return;
+			}
 			/* Never resample a live MR for a duplicate READ. */
 			if (!q->response_active || q->response_sent) {
 				q->response_active = true; q->response_sent = false;
@@ -729,6 +780,17 @@ void sn_engine_progress(struct sn_device *d)
 		sn_receive_zc(q, &h);
 	}
 	if (q->response_active) {
+		if (q->response_fallback) {
+			/* A burst that started queueing always finishes, and a fully posted
+			 * one must drain first, so nothing from it can land after the staged
+			 * reply. Until then the zero-copy deadline below keeps running. */
+			bool mid_post = q->response_offset && !q->response_sent;
+
+			if (!mid_post && (!q->response_offset || sn_data_tx_drained(d)) &&
+			    sn_response_to_staged(d, q)) {
+				sn_qp_error(q, IB_WC_GENERAL_ERR); return;
+			}
+		}
 		if (q->response_sent && now >= q->response_deadline) {
 			/* No READ_ACK: send the whole response again. A zero-copy response
 			 * re-bursts from the live source MR, so it must not restart while
@@ -737,7 +799,11 @@ void sn_engine_progress(struct sn_device *d)
 			 * one header-less byte stream. Defer instead, bounded by the same
 			 * retry budget as the SQ path, so a ring that never drains fails the
 			 * QP rather than deferring forever. */
-			bool defer = sn_response_zc(q) && !sn_response_may_burst(d, q);
+			/* A zero-copy response is never re-burst on this side's own timer.
+			 * Recovery is requester-driven: the requester keeps its landing zone
+			 * armed and asks again with a staged SN_READ, so a second burst here
+			 * would overshoot that zone. Wait, bounded by the retry budget. */
+			bool defer = sn_response_zc(q);
 
 			if (!sn_retry_take(&q->response_retries, q->attr.retry_cnt)) {
 				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
@@ -819,18 +885,18 @@ void sn_engine_progress(struct sn_device *d)
 		if (q->zc_state != SN_ZC_NONE) d->zc_retries++;
 		q->zc_state = SN_ZC_NONE;
 		if (q->zc_read_armed) {
-			/* Counted here because zc_retries above cannot see it: a zero-copy
-			 * READ requester queues no payload, so its zc_state is always
-			 * SN_ZC_NONE and that increment never fires for READ. */
+			/* Counted here because zc_retries above cannot see it: a zero-copy READ
+			 * requester queues no payload, so its zc_state stays SN_ZC_NONE. */
 			d->zc_read_retx++;
-			/* Retransmitting a zero-copy READ descriptor must find the landing
-			 * zone reset: flush the frames the previous attempt landed and repost
-			 * from offset zero, so the responder's re-burst from zero is counted
-			 * from zero. The flush cannot recall frames still in flight, which is
-			 * why the responder waits for its data TX ring to drain first. */
-			q->zc_received = 0;
-			if (sn_data_recv_restart(d, q)) {
-				sn_qp_error(q, IB_WC_GENERAL_ERR); return;
+			/* Never stop/start the data RX ring here. Hardware showed that doing so
+			 * under a live peer burst strands that burst in the responder's TX ring
+			 * for the rest of the boot, and then zero-copy SEND fails too. Keep the
+			 * landing zone armed and complete the same operation through a staged
+			 * SN_READ; the zone is reclaimed only once that reply proves no burst is
+			 * still live. */
+			if (!q->zc_read_staged) {
+				q->zc_read_staged = true;
+				d->zc_read_fallback++;
 			}
 		}
 	}
@@ -844,7 +910,7 @@ void sn_engine_progress(struct sn_device *d)
 	h = sn_out_header(q, w->opcode);
 	h.sequence = q->next_sequence; h.total = w->length;
 	h.address = w->remote_address; h.rkey = w->rkey;
-	if (sn_zc_eligible(d, w)) {
+	if (sn_zc_eligible(d, w) && !(w->opcode == SN_READ && q->zc_read_staged)) {
 		switch (q->zc_state) {
 		case SN_ZC_NONE:
 			if (w->opcode == SN_READ) {

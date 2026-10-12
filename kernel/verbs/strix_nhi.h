@@ -116,6 +116,10 @@ struct sn_qp {
 	 * READ rather than to a peer-initiated SEND/WRITE burst: the completion is
 	 * an SQ WQE and an SN_READ_ACK, not a receive WQE and an SN_ACK. */
 	bool zc_read_armed;
+	/* Requester: this zero-copy READ timed out and is being completed by a
+	 * staged SN_READ. Responder: a staged SN_READ replaced the zero-copy
+	 * response for the same operation and is waiting to be served. */
+	bool zc_read_staged, response_fallback;
 	/* Inbound burst descriptor held because the landing zone was busy with our
 	 * own zero-copy READ response; re-driven by sn_engine_progress as soon as it
 	 * frees. Header-less frames from two bursts could not be told apart, so one
@@ -186,6 +190,7 @@ struct sn_device {
 	u64 zc_read_retx, zc_read_dup_inflight, zc_read_rearm, zc_seq_ahead, zc_seq_stale;
 	/* zc_read_dup_inflight = posting + undrained. */
 	u64 zc_read_dup_posting, zc_read_dup_undrained;
+	u64 zc_read_fallback, zc_read_fallback_served;
 	struct list_head mrs;
 	struct sn_qp *qp;
 	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */

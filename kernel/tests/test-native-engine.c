@@ -61,7 +61,7 @@ struct sn_qp {
 	u32 zc_total, zc_received;
 	struct sn_mr *zc_mr;
 	u64 zc_address;
-	bool zc_read_armed, zc_held;
+	bool zc_read_armed, zc_held, zc_read_staged, response_fallback;
 	struct sn_header zc_held_header;
 };
 struct packet { u8 data[SN_FRAME]; size_t bytes; };
@@ -82,6 +82,11 @@ struct sn_device {
 	u64 zc_bursts, zc_retries, zc_aborts, zc_tx_bursts;
 	u64 zc_read_retx, zc_read_dup_inflight, zc_read_rearm, zc_seq_ahead, zc_seq_stale;
 	u64 zc_read_dup_posting, zc_read_dup_undrained;
+	u64 zc_read_fallback, zc_read_fallback_served;
+	/* Set when this side's queued burst was stranded by the peer stopping and
+	 * restarting its data RX ring underneath it. Observed on hardware: the ring
+	 * then never drains and its frames never land, for the rest of the boot. */
+	bool zc_tx_stranded;
 	u64 sched_calls, rnr_sent;
 	bool check_ids;
 	u32 caps;
@@ -233,6 +238,8 @@ int sn_data_recv_start(struct sn_device *d, struct sn_qp *q)
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 {
 	(void)q;
+	/* Restarting the RX ring under a live peer burst strands it (round 4). */
+	if (d->zc_peer && d->zc_peer->inflight_count) d->zc_peer->zc_tx_stranded = true;
 	d->zc_land_landed = 0;
 	return 0;
 }
@@ -245,6 +252,8 @@ void sn_data_abort(struct sn_device *d) { (void)d; }
 static void flush_inflight(struct sn_device *d)
 {
 	unsigned i;
+
+	if (d->zc_tx_stranded) { d->inflight_count = 0; return; }
 
 	for (i = 0; i < d->inflight_count; i++) {
 		struct sn_device *p = d->inflight[i].dst;
@@ -259,7 +268,7 @@ static void flush_inflight(struct sn_device *d)
 	}
 	d->inflight_count = 0;
 }
-bool sn_data_tx_drained(struct sn_device *d) { return !d->zc_tx_stuck && !d->inflight_count; }
+bool sn_data_tx_drained(struct sn_device *d) { return !d->zc_tx_stuck && !d->inflight_count && !d->zc_tx_stranded; }
 static void sn_qp_error(struct sn_qp *q, enum ib_wc_status status)
 {
 	struct sn_device *d = q->ib.device;
@@ -806,23 +815,27 @@ static void test_zc_read_retry_burst(void)
 	sn_engine_progress(b);
 	b->zc_drop = false;
 	assert(b->qp->response_sent && b->zc_tx_bursts == 1 && !a->zc_bursts);
-	/* The requester never sees the completing count, so its ACK timeout retransmits
-	 * the descriptor after flushing its own landing zone; the duplicate re-arms the
-	 * response, which re-bursts from offset zero. */
+	/* The requester never sees the completing count. Its ACK timeout no longer
+	 * flushes the landing zone and re-requests a burst -- that recovery strands
+	 * live bursts on hardware. It falls back to a staged SN_READ for the same
+	 * operation; the responder serves it from a snapshot, never bursting again. */
 	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, NULL);
 	assert(a->sends == 1 && !a->recvs && !b->recvs && !a->errors && !b->errors);
 	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
-	assert(a->zc_bursts == 1 && a->read_bytes == SN_MESSAGE && b->zc_tx_bursts == 2);
-	assert(a->qp->retries == 1 && !a->qp->zc_read_armed && !a->qp->zc_expect);
+	assert(!a->zc_bursts && a->read_bytes == SN_MESSAGE && b->zc_tx_bursts == 1);
+	assert(a->zc_read_fallback == 1 && b->zc_read_fallback_served == 1);
+	assert(a->qp->retries == 1 && !a->qp->zc_read_armed && !a->qp->zc_expect &&
+	       !a->qp->zc_read_staged);
 	for (i = 0; i < 5; i++) step(a, b, NULL, NULL);
 	assert(!b->qp->remote_mr && !b->qp->response_active && !a->mr[0].users &&
 	       !b->mr[1].users);
 	release(a); release(b);
 
-	/* A response truncated on the wire is the case the restart exists for: part of
-	 * it landed, so the retransmit must flush the landing zone and zero the byte
-	 * count before the responder re-bursts from offset zero. Without that the two
-	 * attempts add up past total and the overshoot guard fails the QP. */
+	/* A response truncated on the wire: half of it landed. The old recovery flushed
+	 * the landing zone and re-burst from zero, which needs the RX ring restarted
+	 * under a possibly live burst. Now nothing bursts again: the staged reply is
+	 * placed over the whole WQE and the half that landed is simply superseded, so
+	 * the two attempts can never add up past total. */
 	a = zc_pair(&b);
 	memset(b->mr[1].data, 0x9e, SN_MESSAGE);
 	post(a, SN_READ, SN_MESSAGE);
@@ -833,11 +846,12 @@ static void test_zc_read_retry_burst(void)
 	b->zc_stall_after = 0;
 	assert(b->qp->response_sent && a->zc_land_landed == SN_MESSAGE / 2 && !a->sends);
 	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, NULL);
-	assert(a->sends == 1 && !a->errors && !b->errors && a->zc_bursts == 1);
+	assert(a->sends == 1 && !a->errors && !b->errors && !a->zc_bursts);
 	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
-	assert(a->read_bytes == SN_MESSAGE && b->zc_tx_bursts == 2 && a->qp->retries == 1);
+	assert(a->read_bytes == SN_MESSAGE && b->zc_tx_bursts == 1 && a->qp->retries == 1);
+	assert(a->zc_read_fallback == 1 && b->zc_read_fallback_served == 1);
 	release(a); release(b);
-	puts("ok 19 - lost zero-copy READ response: descriptor retransmit restarts the landing zone and re-bursts from zero");
+	puts("ok 19 - lost zero-copy READ response: the timeout falls back to a staged SN_READ, no second burst");
 }
 /* The response retry is the zero-copy READ's exposed replay path: the responder is
  * the burst sender, so it must not restart a burst while frames from the
@@ -1201,61 +1215,92 @@ static void test_zc_burst_inflight_overlap(void)
 	release(a); release(b);
 	puts("ok 26 - in-flight burst frames survive an ACK timeout: the restart defers until the ring drains");
 }
-/* A duplicate READ descriptor arriving while the response is still queued must
- * NOT trigger a second burst. The requester zeroed its landing zone when it
- * retransmitted, so the frames already in flight complete the message on their
- * own; re-bursting as well puts two full messages into one zone and overshoots it.
- * The requester cannot guard against this itself, because the frames sit in the
- * responder's ring. This is what zero-copy READ hit on hardware at volume. */
-static void test_zc_read_duplicate_while_inflight(void)
+static void inject_header(struct sn_device *to, const struct sn_header *h)
+{
+	u8 buf[SN_FRAME];
+
+	assert(!sn_encode(buf, sizeof(buf), h));
+	sn_engine_receive(to, buf, SN_HEADER);
+}
+/* A zero-copy READ times out while its reply is still queued in the responder's
+ * data TX ring. Restarting the requester's RX ring under that burst strands it
+ * (hardware round 4: the ring never drains, the duplicate is ignored forever, the
+ * requester exhausts its retries). The requester must instead keep its landing zone
+ * armed and fall back to a staged SN_READ; the queued frames then drain, the
+ * staged reply completes the READ exactly once and byte-for-byte. */
+static void test_zc_read_timeout_staged_fallback(void)
 {
 	struct sn_device *b, *a = zc_pair(&b);
 	unsigned int i;
 
 	memset(b->mr[1].data, 0x77, SN_MESSAGE);
 	post(a, SN_READ, SN_MESSAGE);
-	/* Queue the whole reply as one in-flight unit. The reply must be fully POSTED
-	 * (response_offset at total, response_sent set) while its frames have not yet
-	 * landed -- that is the window the duplicate descriptor falls into. Chunking it
-	 * instead would stall here, because sn_response_may_burst() keys on
-	 * sn_data_tx_drained() and this model does not distinguish "posted but not
-	 * consumed by the NHI" from "consumed but not yet landed at the peer". */
 	b->zc_defer = SN_MESSAGE;
-	sn_engine_progress(a);		/* a arms its own RX and sends the descriptor */
-	deliver(a, b, NULL);		/* b resolves the source, response_active */
+	sn_engine_progress(a);
+	deliver(a, b, NULL);
 	for (i = 0; i < 100 && !b->qp->response_sent; i++) sn_engine_progress(b);
-	assert(b->qp->response_sent && b->qp->response_offset == SN_MESSAGE);
-	assert(b->inflight_count == 1 && !sn_data_tx_drained(b));
-	assert(!a->zc_land_landed && !a->read_bytes);	/* nothing has landed yet */
-
-	/* a times out with the reply still in flight, retransmits and resets its zone. */
+	assert(b->qp->response_sent && b->inflight_count == 1 && !a->zc_land_landed);
 	now += 1000000000ULL;
-	sn_engine_progress(a);
-	assert(a->qp->zc_received == 0 && a->qp->zc_read_armed);
-	deliver(a, b, NULL);		/* the duplicate descriptor reaches b */
-	sn_engine_progress(b);
-
-	/* b must leave the queued response alone rather than restart it. */
-	assert(b->qp->response_sent && b->qp->response_offset == SN_MESSAGE);
-	assert(b->inflight_count == 1 && b->zc_tx_bursts == 1);
-	/* The reply was fully posted, so the duplicate is attributed to the
-	 * undrained side of the split, never the still-posting side. */
-	assert(b->zc_read_dup_inflight == 1 && b->zc_read_dup_undrained == 1 &&
-	       !b->zc_read_dup_posting && !b->zc_read_rearm);
-
-	/* Those frames land exactly once and complete the READ. */
-	flush_inflight(b);
-	assert(a->zc_land_landed == SN_MESSAGE && a->read_bytes == SN_MESSAGE);
-	sn_engine_progress(a);
-	for (i = 0; i < 20 && a->sends < 1; i++) { sn_engine_progress(a); deliver(a, b, NULL); deliver(b, a, NULL); sn_engine_progress(b); }
+	sn_engine_progress(a);			/* the zero-copy READ times out */
+	for (i = 0; i < 400 && !a->sends && !a->errors; i++) {
+		flush_inflight(b);
+		step(a, b, NULL, NULL);
+	}
+	assert(!b->zc_tx_stranded);		/* no RX restart under a live burst */
 	assert(a->sends == 1 && !a->errors && !b->errors);
 	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(a->zc_read_fallback == 1 && b->zc_read_fallback_served == 1);
+	for (i = 0; i < 20; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && !a->errors && !b->errors);	/* exactly one completion */
 	release(a); release(b);
-	puts("ok 27 - duplicate READ descriptor while the reply is in flight does not double-burst");
+	puts("ok 27 - zero-copy READ timeout with the reply queued falls back to staged, no ring restart, one completion");
+}
+/* A staged SN_READ reusing the sequence of a committed SN_ZC_READ is the same
+ * operation, not a protocol violation. sn_same_operation() compares opcode, so
+ * today the responder rejects it with IB_WC_REM_INV_REQ_ERR. */
+static void test_zc_read_cross_path_identity(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	const struct packet *desc;
+	struct sn_header got;
+
+	memset(b->mr[1].data, 0x3c, SN_MESSAGE);
+	post(a, SN_READ, SN_MESSAGE);
+	sn_engine_progress(a);
+	desc = &a->packets[(a->head + a->count - 1) % SN_RING_SIZE];
+	assert(!sn_decode(&got, desc->data, desc->bytes) && got.opcode == SN_ZC_READ);
+	deliver(a, b, NULL);			/* b commits the zero-copy READ */
+	assert(b->qp->response_active && b->qp->read_request.opcode == SN_ZC_READ);
+	got.opcode = SN_READ;			/* the requester's staged fallback */
+	inject_header(b, &got);
+	sn_engine_progress(b);
+	assert(!b->errors);
+	/* Nothing had been queued, so the responder serves it staged at once. */
+	assert(b->qp->response_active && b->qp->read_request.opcode == SN_READ);
+	assert(b->zc_read_fallback_served == 1);
+	release(a); release(b);
+	puts("ok 28 - a staged SN_READ under a committed SN_ZC_READ sequence is the same operation");
+}
+/* The zero-copy reply never lands at all -- lost on the wire every time. Re-bursting
+ * on the data ring cannot recover; the staged path must. */
+static void test_zc_read_never_lands(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(b->mr[1].data, 0xe1, SN_MESSAGE);
+	b->zc_drop = true;
+	post(a, SN_READ, SN_MESSAGE);
+	for (i = 0; i < 400 && !a->sends && !a->errors; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(a->zc_read_fallback == 1);
+	release(a); release(b);
+	puts("ok 29 - a zero-copy READ reply that never lands completes through the staged fallback");
 }
 int main(void)
 {
-	puts("1..27");
+	puts("1..29");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1269,7 +1314,9 @@ int main(void)
 	test_zc_read_lost_ack_is_fatal();
 	test_zc_read_bidirectional();
 	test_zc_burst_inflight_overlap();
-	test_zc_read_duplicate_while_inflight();
+	test_zc_read_timeout_staged_fallback();
+	test_zc_read_cross_path_identity();
+	test_zc_read_never_lands();
 	assert(!warnings);
 	return 0;
 }

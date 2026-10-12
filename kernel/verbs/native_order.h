@@ -18,7 +18,13 @@ enum sn_fragment_result {
 static inline int sn_same_operation(const struct sn_header *a,
 				     const struct sn_header *b)
 {
-	return a->opcode == b->opcode && a->sequence == b->sequence &&
+	/* SN_ZC_READ and SN_READ are one operation class: a timed-out zero-copy READ
+	 * is retransmitted as a staged SN_READ under the same sequence, and the two
+	 * must replay as the same operation. Every other opcode compares exactly. */
+	int read_class = (a->opcode == SN_READ || a->opcode == SN_ZC_READ) &&
+			 (b->opcode == SN_READ || b->opcode == SN_ZC_READ);
+
+	return (a->opcode == b->opcode || read_class) && a->sequence == b->sequence &&
 	       a->total == b->total && a->address == b->address && a->rkey == b->rkey;
 }
 /* Binding and wire validation MUST precede this operation-level check. */
