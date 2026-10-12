@@ -175,10 +175,14 @@ is implied by compilation or the above models. Still unrun:
    byte-for-byte on hardware (see `../kernel/verbs/README.md`); real partial
    posting is the normal case rather than an edge case, since a 2 MiB burst is
    512 frames against a 64-slot ring.
-3. Packet corruption/reordering/ACK drops/exhausted retries; bidirectional
+3. Packet corruption/reordering/exhausted retries; bidirectional
    saturation/control reserve, epoch/QP churn, restart, carrier loss/hot unplug,
    concurrent reset/destroy/deregistration/context close, lockdep and pin/DMA
    lifetime checks. No peer ACK may be needed to safely release local ownership.
+   Partly run on hardware since 2026-10-12: ACK/READ_ACK loss (`ack_drop`),
+   lost and late ZC_READY (`zc_send_fault`) and forced zero-copy READ timeouts
+   (`zc_read_fault`) at volume, every operation completing once byte-for-byte
+   (`ZEROCOPY_VERBS.md`, rounds ten, eleven and thirteen).
 4. Hardware qualification of separate HopIDs/rings and exact tunnel cleanup,
    coexistence with TB-IP/series20, abrupt peer-loss/unload and the **known
    inactive-peer NHI wedge**. READY means primed/started/locally activated with

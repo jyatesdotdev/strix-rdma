@@ -89,6 +89,7 @@ struct sn_device {
 	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
 	u64 zc_read_ops, zc_read_fault_injected;
 	u64 zc_send_ops, zc_send_fault_injected, zc_desc_dup, zc_ack_probe;
+	u64 ack_seen, ack_dropped;
 	/* Set when this side's queued burst was stranded by the peer stopping and
 	 * restarting its data RX ring underneath it. Observed on hardware: the ring
 	 * then never drains and its frames never land, for the rest of the boot. */
@@ -190,6 +191,7 @@ void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status);
 bool sn_data_tx_drained(struct sn_device *d);
 unsigned int sn_zc_read_fault;
 unsigned int sn_zc_send_fault;
+unsigned int sn_ack_drop;
 #define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
 #include "../verbs/protocol.c"
 /* Modeled zero-copy data plane: one burst copies payload from an explicit source
@@ -1536,9 +1538,34 @@ static void test_zc_send_fault_injection(void)
 	release(a); release(b);
 	puts("ok 35 - zc_send_fault loses or delays a ZC_READY; every selected SEND/WRITE completes once");
 }
+/* ack_drop (diagnostic) loses every Nth ACK/READ_ACK. Zero-copy SEND and WRITE
+ * recover through the sender's ACK probe and the receiver's retained re-ACK; a
+ * zero-copy READ's lost READ_ACK is covered by the next request, which
+ * acknowledges the previous READ implicitly. Every operation completes once. */
+static void test_ack_drop(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i, sends = 0;
+
+	sn_ack_drop = 3;
+	for (i = 0; i < 9; i++) {
+		if (i % 3 == 2) {
+			memset(b->mr[1].data, 0x30 + i, SN_MESSAGE);
+			post(a, SN_READ, SN_MESSAGE);
+			read_until(a, b, ++sends);
+		} else {
+			zc_op(a, b, i % 3 ? SN_WRITE : SN_SEND, 0x30 + i, ++sends);
+		}
+	}
+	sn_ack_drop = 0;
+	assert(b->ack_dropped >= 2 && a->zc_ack_probe >= 1);
+	assert(!a->errors && !b->errors);
+	release(a); release(b);
+	puts("ok 36 - ack_drop: every lost ACK/READ_ACK is recovered, every operation completes once");
+}
 int main(void)
 {
-	puts("1..35");
+	puts("1..36");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1561,6 +1588,7 @@ int main(void)
 	test_zc_lost_ready_keeps_ring_usable();
 	test_zc_late_ready_mid_burst();
 	test_zc_send_fault_injection();
+	test_ack_drop();
 	assert(!warnings);
 	return 0;
 }

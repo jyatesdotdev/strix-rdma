@@ -98,6 +98,14 @@ unsigned int sn_zc_send_fault;
 module_param_named(zc_send_fault, sn_zc_send_fault, uint, 0644);
 MODULE_PARM_DESC(zc_send_fault,
 	"Diagnostic: lose or delay the ZC_READY of every Nth zero-copy SEND/WRITE (default 0 = off)");
+/* Fault injection for protocol loss recovery: every Nth ACK or READ_ACK this host
+ * sends is dropped as if lost on the wire, exercising the sender's ACK probe and
+ * the receiver's retained-replay re-ACK at volume. Writable at runtime; 0 (the
+ * default) never drops. */
+unsigned int sn_ack_drop;
+module_param_named(ack_drop, sn_ack_drop, uint, 0644);
+MODULE_PARM_DESC(ack_drop,
+	"Diagnostic: drop every Nth ACK/READ_ACK this host sends (default 0 = off)");
 MODULE_PARM_DESC(zc_read_fault,
 	"Diagnostic: force every Nth zero-copy READ to time out near its tail (default 0 = off)");
 

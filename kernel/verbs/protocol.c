@@ -163,6 +163,16 @@ static int sn_ack(struct sn_qp *q, u32 opcode, u64 sequence, u32 status)
 	struct sn_header h = sn_out_header(q, opcode);
 	unsigned int i;
 
+	if (opcode == SN_ACK || opcode == SN_READ_ACK) {
+		/* ack_drop: lose every Nth ACK/READ_ACK as if on the wire. One read:
+		 * the parameter is writable at runtime. */
+		unsigned int every = READ_ONCE(sn_ack_drop);
+
+		if (every && !(++d->ack_seen % every)) {
+			d->ack_dropped++;
+			return 0;
+		}
+	}
 	h.ack_sequence = sequence; h.status = status;
 	for (i = 0; i < d->control_count; i++) {
 		struct sn_header *old = &d->control[(d->control_head + i) % ARRAY_SIZE(d->control)];

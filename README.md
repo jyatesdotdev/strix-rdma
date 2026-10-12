@@ -118,7 +118,10 @@ Done and measured on the lab host pair:
 Open:
 
 - RC conformance breadth. READ/WRITE are hardware-validated (above), but
-  malformed-peer, packet-loss, reordering and ACK-drop injection are unrun.
+  Lost/late ZC_READY, lost ACK/READ_ACK and forced zero-copy timeouts are now
+  injected on hardware at volume (`zc_send_fault`, `ack_drop`, `zc_read_fault`;
+  see `docs/ZEROCOPY_VERBS.md`), but malformed-peer frames and control-ring
+  loss are still covered only offline.
 - Hot-unplug and abrupt peer loss, including the known inactive-peer NHI wedge.
   No recovery or non-disruption guarantee exists yet.
 - GPU-direct registration for the verbs path (it stages through pinned CPU

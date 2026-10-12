@@ -1242,3 +1242,26 @@ eight) also means a conclusive A/B needs several reboot cycles per arm.
 Dropping hardware E2E altogether, as thunderbolt-ibverbs does, needs a
 software credit scheme on the data ring, because the zero-copy recovery design
 rests on E2E being lossless. Both are design decisions, not fixes.
+
+## Round thirteen (2026-10-12): ACK loss at volume
+
+`ack_drop=N` (0644, default 0, diagnostic) drops every Nth ACK or READ_ACK a
+host sends, as if lost on the wire, and counts it in `ack_dropped`. Offline
+test ok 36 covers it (differentially verified).
+
+Hardware, fresh boot, `ack_drop=100` on both hosts, all other faults 0:
+
+- `write 2000` 3/3 and `send 2000` 3/3 PASS byte-for-byte at 363–378 MiB/s.
+  Each run dropped 80–81 ACKs per side, and each was recovered by exactly one
+  ACK probe (`zc_ack_probe` equals `ack_dropped`; one run had one extra probe
+  from a natural stall), with no QP error.
+- `read 2000` 3/3 PASS at 411–413 MiB/s. Each run dropped 80–86 READ_ACKs per
+  side, and every one was covered by the next request's implicit
+  acknowledgement, the run-final READs included, with no QP error. Two runs
+  also had one natural round-twelve stall each, handled by the fallback.
+
+Known limit, unchanged (ok 24): a zero-copy READ whose READ_ACK is lost, and
+which is followed by no further request from that requester, eventually fails
+the responder's QP. The responder never re-bursts, and the requester only
+re-sends a READ_ACK when it sees a duplicate reply. A connection that goes
+idle right after a READ whose ACK was lost would hit it.

@@ -36,6 +36,7 @@ extern bool sn_zc_write;
 extern bool sn_zc_read;
 extern unsigned int sn_zc_read_fault;
 extern unsigned int sn_zc_send_fault;
+extern unsigned int sn_ack_drop;
 #define SN_SERVICE "strixv1"
 #define SN_CONTROL_BYTES 112
 /* Handshake retransmission intervals; loss is expected, peers retransmit. */
@@ -230,6 +231,8 @@ struct sn_device {
 	u64 zc_send_ops, zc_send_fault_injected, zc_desc_dup;
 	/* Descriptor re-sends as ACK probes after a drained burst timed out. */
 	u64 zc_ack_probe;
+	/* ACK/READ_ACKs sent (counted only while ack_drop is set) and dropped. */
+	u64 ack_seen, ack_dropped;
 	struct sn_stall_snap snap_drain, snap_err, snap_tmo;
 	/* Poller timing for stall diagnosis: when a data frame was last harvested,
 	 * when the last pass started and whether it left work outstanding, and the

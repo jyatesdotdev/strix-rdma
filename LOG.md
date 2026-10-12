@@ -1,6 +1,14 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — ACK loss injected at volume
+- `ack_drop=N` drops every Nth ACK or READ_ACK. With `ack_drop=100`, 3 runs
+  each of `write 2000`, `send 2000` and `read 2000` passed byte-for-byte, about
+  80 drops per side per run. SEND/WRITE recover through exactly one ACK probe
+  each, and READ through the next request's implicit acknowledgement. No QP
+  error. Known limit kept: a lost READ_ACK followed by an idle connection fails
+  the responder (ok 24). `docs/ZEROCOPY_VERBS.md`, round thirteen.
+
 ## 2026-10-12 — natural timeouts traced to a withheld last frame at the NHI
 - **What:** a new `stall_snap` `tmo_*` snapshot, taken at every zero-copy
   timeout, plus `since_land_us` and `max_pass_gap_us`. On a fresh boot, 6 of
