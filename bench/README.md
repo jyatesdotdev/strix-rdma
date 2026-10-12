@@ -112,6 +112,24 @@ make -C ../tools/verbs
 # count (e.g. "200") for the window-4 x 2 MiB bidirectional throughput run.
 ```
 
+From a third machine with ssh access to both hosts, two scripts drive the same
+tool. Each needs `CONNECT=user@hostA LISTEN=user@hostB LISTEN_IP=<hostB IPv4>`,
+and optionally `PORT` (default 19476, which must be open in hostB's firewall),
+`DEV` and `TOOL_DIR`:
+
+```sh
+scripts/run-verbs-smoke.sh read 200        # one exchange, both sides' output
+scripts/verbs-streak.sh 1 20 read 2000     # stop at the first failure
+scripts/verbs-streak.sh 1 5 write 2000
+scripts/verbs-streak.sh 1 5 send
+```
+
+`verbs-streak.sh` passes a run only if both sides print PASS with the exact
+expected byte count. Under `OUT_DIR` (default `./verbs-streak`) it keeps each
+run's logs, every `native_stats` counter that moved on each host, and the
+`stall_snap` snapshots. That is the evidence format of the zero-copy validation
+rounds in `docs/ZEROCOPY_VERBS.md`.
+
 It cannot be compared against the stream path on the same link at the same
 time: zero-copy verbs mode blacklists `thunderbolt-net` and claims both ring
 HopIDs. Run one, tear it down, run the other.
