@@ -123,6 +123,9 @@ struct sn_qp {
 	bool zc_read_staged, response_fallback;
 	/* This zero-copy READ was selected by zc_read_fault; cleared once injected. */
 	bool zc_read_fault;
+	/* The staged reply of a fallen-back zero-copy READ is assembled and waits for
+	 * the abandoned burst to finish landing before the READ completes. */
+	bool zc_read_reply_ready;
 	/* Inbound burst descriptor held because the landing zone was busy with our
 	 * own zero-copy READ response; re-driven by sn_engine_progress as soon as it
 	 * frees. Header-less frames from two bursts could not be told apart, so one

@@ -459,7 +459,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,304 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -585,6 +585,9 @@ new file mode 100644
 +	bool zc_read_staged, response_fallback;
 +	/* This zero-copy READ was selected by zc_read_fault; cleared once injected. */
 +	bool zc_read_fault;
++	/* The staged reply of a fallen-back zero-copy READ is assembled and waits for
++	 * the abandoned burst to finish landing before the READ completes. */
++	bool zc_read_reply_ready;
 +	/* Inbound burst descriptor held because the landing zone was busy with our
 +	 * own zero-copy READ response; re-driven by sn_engine_progress as soon as it
 +	 * frees. Header-less frames from two bursts could not be told apart, so one
@@ -2637,7 +2640,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,1019 @@
+@@ -0,0 +1,1036 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -2822,6 +2825,7 @@ new file mode 100644
 +	q->zc_mr = NULL; q->zc_address = 0;
 +	q->zc_read_armed = false; q->zc_held = false;
 +	q->zc_read_staged = false; q->response_fallback = false;
++	q->zc_read_reply_ready = false;
 +	memset(&q->receive, 0, sizeof(q->receive));
 +	memset(&q->read_receive, 0, sizeof(q->read_receive));
 +	/* Reclaim the data rings so this aborted burst cannot leave posted RX
@@ -2897,6 +2901,31 @@ new file mode 100644
 +		sn_send_complete(q);
 +	}
 +}
++/* Complete the active READ from its fully assembled staged reply. A zero-copy
++ * READ that fell back gets here only once its landing zone has also filled: the
++ * zone is then disarmed with every posted data RX buffer consumed, so nothing is
++ * left to reclaim. The data RX ring is never restarted here. Hardware round nine
++ * showed that a one-sided restart starves the peer's data TX of E2E credits: its
++ * next burst sits in the TX ring against posted RX buffers and is never sent, so
++ * the next zero-copy READ fails. */
++static void sn_read_reply_finish(struct sn_qp *q)
++{
++	struct sn_wqe *w = &q->sq[q->sq_head];
++
++	if (sn_mr_copy(w->mr, w->address, q->read_incoming, w->length, true)) {
++		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
++	}
++	if (q->zc_read_armed) {
++		q->zc_expect = false; q->zc_read_armed = false; q->zc_read_staged = false;
++		q->zc_mr = NULL; q->zc_address = 0;
++	}
++	q->zc_read_reply_ready = false;
++	sn_dev(q->ib.device)->read_bytes += w->length;
++	q->last_read = q->next_sequence; q->last_read_length = w->length;
++	q->have_last_read = true;
++	if (sn_ack(q, SN_READ_ACK, q->next_sequence, SN_OK)) return;
++	sn_send_complete(q);
++}
 +static void sn_receive_read_reply(struct sn_qp *q, const struct sn_header *h, const u8 *payload)
 +{
 +	struct sn_wqe *w;
@@ -2919,24 +2948,15 @@ new file mode 100644
 +	memcpy(q->read_incoming + h->offset, payload, h->length);
 +	sn_fragment_commit(&q->read_receive, h);
 +	if (q->read_receive.received != h->total) return;
-+	if (sn_mr_copy(w->mr, w->address, q->read_incoming, w->length, true)) {
-+		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
++	if (q->zc_read_armed && q->zc_received < q->zc_total) {
++		/* The staged reply of a zero-copy READ that fell back is complete, but its
++		 * abandoned burst has not finished landing. The responder posts that burst
++		 * in full and drains it before serving this reply, so the rest is already on
++		 * its way; sn_engine_zc_bytes() finishes the READ when the last byte lands. */
++		q->zc_read_reply_ready = true;
++		return;
 +	}
-+	if (q->zc_read_armed) {
-+		/* Staged fallback of a zero-copy READ completed. The responder drained its
-+		 * data TX ring before serving this reply and E2E neither loses nor reorders
-+		 * frames, so no burst is live: only now is the landing zone disarmed and the
-+		 * data RX ring reclaimed, before the WQE's MR is handed back. */
-+		q->zc_expect = false; q->zc_read_armed = false; q->zc_read_staged = false;
-+		q->zc_mr = NULL; q->zc_address = 0;
-+		if (sn_data_recv_restart(sn_dev(q->ib.device), q)) {
-+			sn_qp_error(q, IB_WC_GENERAL_ERR); return;
-+		}
-+	}
-+	sn_dev(q->ib.device)->read_bytes += h->total;
-+	q->last_read = h->sequence; q->last_read_length = h->total; q->have_last_read = true;
-+	if (sn_ack(q, SN_READ_ACK, h->sequence, SN_OK)) return;
-+	sn_send_complete(q);
++	sn_read_reply_finish(q);
 +}
 +static void sn_request_error(struct sn_qp *q, const struct sn_header *h, u32 status)
 +{
@@ -3176,8 +3196,11 @@ new file mode 100644
 +		 * peer's burst rather than by a frame we can time against, so measure the
 +		 * retransmit window from the last frame: without this a burst slower than
 +		 * one window would be restarted on top of frames still in flight. */
-+		if (read && !q->zc_read_staged) {
-+			if (q->zc_read_fault && q->zc_total - q->zc_received <= 32 * SN_FRAME) {
++		if (read) {
++			/* After a fallback too: the abandoned burst must land in full
++			 * before the zone can be disarmed, so its frames are progress. */
++			if (q->zc_read_fault && !q->zc_read_staged &&
++			    q->zc_total - q->zc_received <= 32 * SN_FRAME) {
 +				/* zc_read_fault: time out now, with the tail of the burst
 +				 * still queued in the responder's data TX ring. */
 +				q->zc_read_fault = false;
@@ -3197,7 +3220,10 @@ new file mode 100644
 +	if (read && q->zc_read_staged) {
 +		/* Late frames of the abandoned zero-copy attempt finished landing. The
 +		 * staged reply owns completion; keep the zone armed so any further frame
-+		 * trips the overshoot check rather than completing anything. */
++		 * trips the overshoot check rather than completing anything. If the
++		 * staged reply is already assembled, the READ completes now. */
++		if (q->zc_read_reply_ready)
++			sn_read_reply_finish(q);
 +		return;
 +	}
 +	if (read) {
@@ -3434,23 +3460,17 @@ new file mode 100644
 +	}
 +	if (q->response_active) {
 +		if (q->response_fallback) {
-+			/* A burst that started queueing always finishes, and a fully posted
-+			 * one must drain first, so nothing from it can land after the staged
-+			 * reply. Until then the zero-copy deadline below keeps running. */
-+			bool mid_post = q->response_offset && !q->response_sent;
-+
-+			if (mid_post) {
-+				/* The zero-copy reply is superseded the moment the requester falls
-+				 * back, so stop posting the rest of it. Finishing it would only wait
-+				 * on the consumption that already failed: hardware showed an
-+				 * unanswered fallback parked here (zc_fb_wait_midpost) while the
-+				 * requester exhausted its retries. Frames already queued still drain
-+				 * before the staged reply, so the requester never sees a zero-copy
-+				 * frame after it. */
++			/* The requester keeps its landing zone armed until every byte of
++			 * the zero-copy reply has landed, because the only other way to
++			 * reclaim posted data RX buffers is a one-sided ring restart, which
++			 * starves this side's TX of E2E credits (hardware round nine). So the
++			 * reply is always posted in full -- started if it never was, finished
++			 * if it was mid-post, by the posting path below -- and drained before
++			 * the staged reply goes out. Until then the zero-copy deadline below
++			 * keeps running. */
++			if (!q->response_sent)
 +				d->zc_fb_wait_midpost++;
-+				q->response_sent = true;
-+			}
-+			else if (q->response_offset && !sn_data_tx_drained(d)) {
++			else if (!sn_data_tx_drained(d)) {
 +				d->zc_fb_wait_drain++;
 +				sn_stall_snapshot(d, q, 0);
 +			}

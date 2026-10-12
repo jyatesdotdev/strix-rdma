@@ -944,3 +944,48 @@ for the requester's re-posted buffers. It begins exactly at a one-sided
 data TX ring stays up, and it clears when both ends restart together. This also
 explains rounds 5–7: in each, the first fallback of a run was served, and a
 *later* zero-copy READ stalled.
+
+### Decision: fixable in this driver (Branch A) — never restart one data RX ring alone
+
+The round-nine capture rules out the NHI losing frames or holding stale ring
+state of its own. TX completed equals RX completed, and driver and core indices
+agree. Starvation begins at a single driver action, `sn_data_recv_restart()`
+when a fallen-back READ completes. That restart existed only to reclaim
+landing-zone buffers the truncated zero-copy reply would never fill, and the
+driver created those buffers itself. In 7977ae2 the responder stopped posting
+the moment a fallback arrived, so the zone could not fill and had to be
+reclaimed. The cause is in this driver, so the thunderbolt core is not touched.
+
+The fix: the zone always fills, so it never needs reclaiming.
+
+- **Responder:** a fallback no longer truncates the zero-copy reply. The reply
+  is posted in full (started if it never was, finished if it was mid-post), the
+  data TX ring drains, and only then is the staged reply served. 7977ae2's
+  truncation is reverted. Round six's mid-post stall was this same starvation,
+  caused by an earlier fallback in the run, not by finishing the post.
+- **Requester:** the staged reply completes the READ only once the abandoned
+  burst has fully landed too (`zc_read_reply_ready` parks an assembled reply
+  until the last byte lands). Frames that land after the fallback still count
+  as progress against the retransmit deadline. The zone is then disarmed with
+  every posted buffer consumed, and the data RX ring is never restarted on this
+  path.
+- **What this gives up:** a zero-copy reply that never fully lands now fails the
+  READ with RETRY_EXC instead of completing through the staged copy. That can
+  only happen if the lossless E2E data hop loses frames, and reclaiming the zone
+  one-sided would starve the peer anyway. ok 19 and ok 29 now assert that loud
+  failure, with no ring restart.
+
+Offline: the harness gains an `e2e_model` in which a one-sided RX restart
+starves the peer's TX: posts are accepted, never sent, and the ring never reads
+as drained again. ok 32 replays round nine (a faulted READ, then the next one)
+and failed first against the old code, at the third READ, with RETRY_EXC and
+the responder parked in drain wait, which is the hardware signature. ok 19, 28,
+29 and 30 were rewritten to the new contract. Differential check: each engine
+test run in isolation passes 32/32 with the fix. With only `protocol.c` and
+`strix_nhi.h` reverted to the previous commit, exactly those five fail and the
+other 27 pass.
+
+Out of scope and unchanged: a retried zero-copy SEND or WRITE descriptor still
+restarts the receiver's data RX ring (`sn_receive_zc`, duplicate descriptor).
+The same starvation may apply there, but that path was not exercised in this
+work.

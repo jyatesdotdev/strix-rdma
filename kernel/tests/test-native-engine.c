@@ -62,6 +62,7 @@ struct sn_qp {
 	struct sn_mr *zc_mr;
 	u64 zc_address;
 	bool zc_read_armed, zc_held, zc_read_staged, response_fallback, zc_read_fault;
+	bool zc_read_reply_ready;
 	struct sn_header zc_held_header;
 };
 struct packet { u8 data[SN_FRAME]; size_t bytes; };
@@ -89,6 +90,11 @@ struct sn_device {
 	 * restarting its data RX ring underneath it. Observed on hardware: the ring
 	 * then never drains and its frames never land, for the rest of the boot. */
 	bool zc_tx_stranded;
+	/* Round nine (hardware): a one-sided restart of this side's data RX ring
+	 * starves the peer's data TX of E2E credits, so nothing it posts afterwards
+	 * is ever sent. Opt-in so the SEND/WRITE retry models stay as they were. */
+	bool e2e_model, zc_tx_starved;
+	unsigned int rx_restarts;
 	u64 sched_calls, rnr_sent;
 	bool check_ids;
 	u32 caps;
@@ -197,6 +203,11 @@ static int sn_data_burst(struct sn_device *d, struct sn_mr *mr, u64 address,
 	assert(p && mr && n <= total);
 	d->zc_tx_bursts++;
 	if (d->zc_drop) { *offset = total; return 0; }
+	/* A starved TX ring accepts the frames and never sends them: the ring reads as
+	 * drained until the first post after the starving restart, then never again. */
+	if (d->zc_tx_starved || d->zc_tx_stranded) {
+		d->zc_tx_stranded = true; *offset = total; return 0;
+	}
 	if (d->zc_stall_after && n > d->zc_stall_after) n = d->zc_stall_after;
 	if (!p->qp->zc_expect) { *offset = total; return 0; }
 	if (d->zc_defer) {
@@ -243,8 +254,11 @@ int sn_data_recv_start(struct sn_device *d, struct sn_qp *q)
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 {
 	(void)q;
-	/* Restarting the RX ring under a live peer burst strands it (round 4). */
+	d->rx_restarts++;
+	/* Restarting the RX ring under a live peer burst strands it (round 4), and
+	 * under the E2E model any one-sided restart starves the peer (round 9). */
 	if (d->zc_peer && d->zc_peer->inflight_count) d->zc_peer->zc_tx_stranded = true;
+	if (d->zc_peer && d->e2e_model) d->zc_peer->zc_tx_starved = true;
 	d->zc_land_landed = 0;
 	return 0;
 }
@@ -821,27 +835,25 @@ static void test_zc_read_retry_burst(void)
 	sn_engine_progress(b);
 	b->zc_drop = false;
 	assert(b->qp->response_sent && b->zc_tx_bursts == 1 && !a->zc_bursts);
-	/* The requester never sees the completing count. Its ACK timeout no longer
-	 * flushes the landing zone and re-requests a burst -- that recovery strands
-	 * live bursts on hardware. It falls back to a staged SN_READ for the same
-	 * operation; the responder serves it from a snapshot, never bursting again. */
-	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, NULL);
-	assert(a->sends == 1 && !a->recvs && !b->recvs && !a->errors && !b->errors);
-	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
-	assert(!a->zc_bursts && a->read_bytes == SN_MESSAGE && b->zc_tx_bursts == 1);
+	/* The requester never sees the completing count. A burst lost on the wire
+	 * cannot happen on E2E hardware -- the data hop is lossless -- and the only
+	 * way to reclaim the posted landing zone it leaves behind is a one-sided RX
+	 * ring restart, which starves the peer's TX (hardware round nine). So the
+	 * requester falls back, the responder serves the staged reply, never bursting
+	 * again, and the READ then fails loudly: no completion, no ring restart, and
+	 * the half-assembled zone is never handed back as success. */
+	for (i = 0; i < 2000 && !a->sends && !a->errors; i++) step(a, b, NULL, NULL);
+	assert(!a->sends && a->errors == 1 && a->last_error == IB_WC_RETRY_EXC_ERR);
+	assert(!a->recvs && !b->recvs && !b->errors && !a->rx_restarts);
+	assert(!a->zc_bursts && !a->read_bytes && b->zc_tx_bursts == 1);
 	assert(a->zc_read_fallback == 1 && b->zc_read_fallback_served == 1);
-	assert(a->qp->retries == 1 && !a->qp->zc_read_armed && !a->qp->zc_expect &&
-	       !a->qp->zc_read_staged);
-	for (i = 0; i < 5; i++) step(a, b, NULL, NULL);
-	assert(!b->qp->remote_mr && !b->qp->response_active && !a->mr[0].users &&
-	       !b->mr[1].users);
 	release(a); release(b);
 
 	/* A response truncated on the wire: half of it landed. The old recovery flushed
 	 * the landing zone and re-burst from zero, which needs the RX ring restarted
-	 * under a possibly live burst. Now nothing bursts again: the staged reply is
-	 * placed over the whole WQE and the half that landed is simply superseded, so
-	 * the two attempts can never add up past total. */
+	 * under a possibly live burst. Nothing bursts again and nothing restarts: the
+	 * half that never lands keeps the zone from being disarmed, so the READ fails
+	 * loudly rather than reclaim the zone one-sided. */
 	a = zc_pair(&b);
 	memset(b->mr[1].data, 0x9e, SN_MESSAGE);
 	post(a, SN_READ, SN_MESSAGE);
@@ -851,13 +863,13 @@ static void test_zc_read_retry_burst(void)
 	sn_engine_progress(b);
 	b->zc_stall_after = 0;
 	assert(b->qp->response_sent && a->zc_land_landed == SN_MESSAGE / 2 && !a->sends);
-	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, NULL);
-	assert(a->sends == 1 && !a->errors && !b->errors && !a->zc_bursts);
-	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
-	assert(a->read_bytes == SN_MESSAGE && b->zc_tx_bursts == 1 && a->qp->retries == 1);
+	for (i = 0; i < 2000 && !a->sends && !a->errors; i++) step(a, b, NULL, NULL);
+	assert(!a->sends && a->errors == 1 && a->last_error == IB_WC_RETRY_EXC_ERR);
+	assert(!b->errors && !a->zc_bursts && !a->rx_restarts);
+	assert(!a->read_bytes && b->zc_tx_bursts == 1);
 	assert(a->zc_read_fallback == 1 && b->zc_read_fallback_served == 1);
 	release(a); release(b);
-	puts("ok 19 - lost zero-copy READ response: the timeout falls back to a staged SN_READ, no second burst");
+	puts("ok 19 - lost zero-copy READ response: staged fallback, no second burst, no ring restart, fails loudly");
 }
 /* The response retry is the zero-copy READ's exposed replay path: the responder is
  * the burst sender, so it must not restart a burst while frames from the
@@ -1279,16 +1291,24 @@ static void test_zc_read_cross_path_identity(void)
 	assert(b->qp->response_active && b->qp->read_request.opcode == SN_ZC_READ);
 	got.opcode = SN_READ;			/* the requester's staged fallback */
 	inject_header(b, &got);
+	assert(!b->errors && b->qp->response_fallback);
+	/* Nothing had been queued. The requester's landing zone is still armed, so
+	 * the zero-copy reply is posted in full first; only once it has drained is
+	 * the same operation served staged. */
+	sn_engine_progress(b);
+	assert(!b->errors && b->qp->response_sent && b->zc_tx_bursts == 1);
+	assert(b->qp->read_request.opcode == SN_ZC_READ && !b->zc_read_fallback_served);
 	sn_engine_progress(b);
 	assert(!b->errors);
-	/* Nothing had been queued, so the responder serves it staged at once. */
 	assert(b->qp->response_active && b->qp->read_request.opcode == SN_READ);
 	assert(b->zc_read_fallback_served == 1);
 	release(a); release(b);
 	puts("ok 28 - a staged SN_READ under a committed SN_ZC_READ sequence is the same operation");
 }
-/* The zero-copy reply never lands at all -- lost on the wire every time. Re-bursting
- * on the data ring cannot recover; the staged path must. */
+/* The zero-copy reply never lands at all -- lost on the wire every time, which E2E
+ * hardware cannot do. Re-bursting cannot recover, and completing through the
+ * staged reply would leave the posted landing zone to a one-sided RX ring restart,
+ * which starves the peer's TX (hardware round nine). The READ fails loudly. */
 static void test_zc_read_never_lands(void)
 {
 	struct sn_device *b, *a = zc_pair(&b);
@@ -1298,17 +1318,19 @@ static void test_zc_read_never_lands(void)
 	b->zc_drop = true;
 	post(a, SN_READ, SN_MESSAGE);
 	for (i = 0; i < 400 && !a->sends && !a->errors; i++) step(a, b, NULL, NULL);
-	assert(a->sends == 1 && !a->errors && !b->errors);
-	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
-	assert(a->zc_read_fallback == 1);
+	assert(!a->sends && a->errors == 1 && a->last_error == IB_WC_RETRY_EXC_ERR);
+	assert(!b->errors && !a->rx_restarts && !a->read_bytes);
+	assert(a->zc_read_fallback == 1 && b->zc_read_fallback_served == 1);
 	release(a); release(b);
-	puts("ok 29 - a zero-copy READ reply that never lands completes through the staged fallback");
+	puts("ok 29 - a zero-copy READ reply that never lands fails loudly: no completion, no ring restart");
 }
-/* A fallback that arrives while the zero-copy reply is still being POSTED must
- * stop the burst there, not wait for it to finish: finishing waits on the very
- * consumption that stalled (hardware: zc_fb_wait_midpost, then RETRY_EXC). Only
- * the chunk already queued drains, then the staged reply completes the READ. */
-static void test_zc_read_fallback_truncates_midpost(void)
+/* A fallback that arrives while the zero-copy reply is still being POSTED. 7977ae2
+ * truncated the reply there, which left posted landing-zone buffers that only a
+ * one-sided RX ring restart could reclaim -- the restart that starves the peer's TX
+ * (hardware round nine; the mid-post stalls of round six were that starvation,
+ * not the finishing itself). The reply is posted and drained in full, the zone
+ * fills exactly, and the staged reply then completes the READ once. */
+static void test_zc_read_fallback_midpost_finishes(void)
 {
 	struct sn_device *b, *a = zc_pair(&b);
 	unsigned int i;
@@ -1325,16 +1347,19 @@ static void test_zc_read_fallback_truncates_midpost(void)
 	assert(a->zc_read_fallback == 1);
 	deliver(a, b, NULL);			/* the staged SN_READ meets a mid-post reply */
 	sn_engine_progress(b);
-	assert(b->qp->response_sent && b->qp->response_offset == SN_MESSAGE / 16);
-	flush_inflight(b);			/* only the chunk already queued drains */
-	sn_engine_progress(b);
-	assert(!b->inflight_count && b->zc_read_fallback_served == 1);
-	for (i = 0; i < 400 && !a->sends && !a->errors; i++) step(a, b, NULL, NULL);
+	/* Not truncated, and not served staged while the reply is incomplete. */
+	assert(!b->qp->response_sent && b->qp->response_fallback);
+	assert(!b->zc_read_fallback_served && b->zc_fb_wait_midpost);
+	for (i = 0; i < 400 && !a->sends && !a->errors; i++) {
+		flush_inflight(b);
+		step(a, b, NULL, NULL);
+	}
 	assert(a->sends == 1 && !a->errors && !b->errors);
 	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
-	assert(b->zc_tx_bursts == 1);
+	assert(a->zc_land_landed == SN_MESSAGE && b->zc_read_fallback_served == 1);
+	assert(!a->rx_restarts && !a->qp->zc_read_armed && !a->qp->zc_expect);
 	release(a); release(b);
-	puts("ok 30 - a fallback arriving mid-post truncates the zero-copy reply and is served staged");
+	puts("ok 30 - a fallback arriving mid-post finishes the zero-copy reply, the zone fills, then it is served staged");
 }
 /* zc_read_fault (diagnostic) forces every Nth zero-copy READ to time out with the
  * tail of its reply still live -- the precondition of every hardware stall. Only
@@ -1348,6 +1373,8 @@ static void read_until(struct sn_device *a, struct sn_device *b, unsigned int se
 		flush_inflight(b);
 		step(a, b, NULL, NULL);
 	}
+	if (a->sends != sends || a->errors || b->errors)
+		fprintf(stderr, "read_until(%u): sends=%u a.err=%u(last %d) b.err=%u fb=%llu served=%llu wait_drain=%llu stranded=%d\n", sends, a->sends, a->errors, a->last_error, b->errors, (unsigned long long)a->zc_read_fallback, (unsigned long long)b->zc_read_fallback_served, (unsigned long long)b->zc_fb_wait_drain, b->zc_tx_stranded);
 	assert(a->sends == sends && !a->errors && !b->errors);
 }
 static void test_zc_read_fault_injection(void)
@@ -1371,9 +1398,36 @@ static void test_zc_read_fault_injection(void)
 	release(a); release(b);
 	puts("ok 31 - zc_read_fault forces a READ timeout with its tail live; the staged fallback completes it once");
 }
+/* Round nine on hardware: after a served fallback the requester's staged completion
+ * restarted its data RX ring alone, and the responder's next burst then sat in its
+ * TX ring -- 63 frames posted against 63 posted RX buffers, never sent -- until
+ * both ends were restarted. Under e2e_model that restart starves the peer the same
+ * way. The requester must never need it: the zero-copy READ after a fallback
+ * completes, and no data RX ring is ever restarted. */
+static void test_zc_read_fallback_keeps_ring_usable(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	a->e2e_model = b->e2e_model = true;
+	sn_zc_read_fault = 2;
+	b->zc_defer = SN_MESSAGE / 16;
+	for (i = 1; i <= 3; i++) {
+		memset(b->mr[1].data, 0x20 + i, SN_MESSAGE);
+		post(a, SN_READ, SN_MESSAGE);
+		read_until(a, b, i);	/* READ 2 is faulted near its tail */
+		assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+		if (i == 2) sn_zc_read_fault = 0;
+	}
+	assert(a->zc_read_fault_injected == 1 && a->zc_read_fallback == 1);
+	assert(b->zc_read_fallback_served == 1);
+	assert(!a->rx_restarts && !b->rx_restarts && !b->zc_tx_starved);
+	release(a); release(b);
+	puts("ok 32 - after a served fallback the next zero-copy READ completes: no data RX ring restart");
+}
 int main(void)
 {
-	puts("1..31");
+	puts("1..32");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1390,8 +1444,9 @@ int main(void)
 	test_zc_read_timeout_staged_fallback();
 	test_zc_read_cross_path_identity();
 	test_zc_read_never_lands();
-	test_zc_read_fallback_truncates_midpost();
+	test_zc_read_fallback_midpost_finishes();
 	test_zc_read_fault_injection();
+	test_zc_read_fallback_keeps_ring_usable();
 	assert(!warnings);
 	return 0;
 }
