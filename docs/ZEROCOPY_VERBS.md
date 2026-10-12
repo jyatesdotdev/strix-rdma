@@ -476,3 +476,57 @@ Incidental: bulk SEND measured 1230/1213 MiB/s in this session, back inside the
 post-reboot runs. Post-reboot throughput on this stack varies run to run by more
 than the ~4% that separates those two bands, so a single post-reboot measurement
 is not evidence of regression in either direction.
+
+### Second hardware round: one mechanism fixed, one still open
+
+The in-flight harness model (commit `e0ba936`) immediately paid for itself: it
+reproduced offline a mechanism that hardware had only shown as a failure at
+iteration 390. `sn_read_response_rearm()` restarted the response whenever
+`response_sent` was true, but that flag covers two different states — reply
+posted with frames still queued in this host's data TX ring, or reply delivered
+with the `READ_ACK` lost. Only the second owes a fresh burst. In the first, the
+requester had already timed out, retransmitted and zeroed its own landing zone,
+so the queued frames would complete the message by themselves; restarting as well
+put two full messages into one zone. Fixed in `f2c7679` by re-bursting only when
+`sn_data_tx_drained()`, and pinned by ok 27 (differentially verified).
+
+The requester cannot guard against this itself, which is why the WRITE drain
+barrier did not cover it: for WRITE the burst sender is the side that
+retransmits, so its own barrier applies. For READ the roles are reversed — the
+responder holds the in-flight frames while the requester retransmits, and the
+requester has no visibility into the responder's ring.
+
+Re-validated after a clean reboot with `zc_read=1`, three `read 2000` runs
+(16,777,216,000 B per direction each):
+
+| attempt | result | `zc_retries` |
+|---|---|---|
+| 1 | PASS, 416.36 MiB/s, byte-for-byte | 0 |
+| 2 | **FAIL, payload verification** | **0** |
+| 3 | PASS, 417.14 MiB/s, byte-for-byte | 0 |
+
+**So a second, distinct mechanism remains open.** The failing run had
+`zc_retries` 0 — no descriptor was ever retransmitted — so it cannot be the
+rearm path just fixed. `bad_frames` stayed 0 throughout and `zc_aborts` rose by
+one per run. `zc_read` therefore remains **off by default** and the staged READ
+path stays the correct one.
+
+Where to look next, given that it happens with zero retries: the window-4
+re-arming of the requester's landing zone across four sequential READs per
+iteration; the `dma_sync_sg_for_cpu()` timing across back-to-back completions
+into the same MR at different offsets; or bidirectional interleaving, where each
+host is simultaneously requesting (RX armed) and responding (TX bursting) on the
+same pair of data rings. The harness can now represent in-flight frames, but it
+still does not separate "posted, not yet consumed by the NHI" from "consumed, not
+yet landed at the peer" — that distinction is the prerequisite for modelling
+chunked response posting, and it is noted in ok 27's comment.
+
+Regression check in the same session, default paths: `write 200` PASS at
+457.14 MiB/s byte-for-byte, SEND smoke PASS, bulk SEND 1070.95 / 1082.06 MiB/s.
+That bulk figure is well below the 1230 / 1213 MiB/s measured earlier the same
+day on the same build, immediately after three 16.8 GB READ runs. Combined with
+the 1127–1191 and 1182–1238 bands recorded before it, this stack's bulk
+throughput swings by more than 13% between runs for reasons not yet understood —
+so no single bulk measurement on it is evidence of a regression *or* of an
+improvement. Any future throughput claim needs a run count and a spread, not one
+number.
