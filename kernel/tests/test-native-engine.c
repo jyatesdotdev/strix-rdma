@@ -83,6 +83,7 @@ struct sn_device {
 	u64 zc_read_retx, zc_read_dup_inflight, zc_read_rearm, zc_seq_ahead, zc_seq_stale;
 	u64 zc_read_dup_posting, zc_read_dup_undrained;
 	u64 zc_read_fallback, zc_read_fallback_served;
+	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
 	/* Set when this side's queued burst was stranded by the peer stopping and
 	 * restarting its data RX ring underneath it. Observed on hardware: the ring
 	 * then never drains and its frames never land, for the rest of the boot. */
@@ -1298,9 +1299,41 @@ static void test_zc_read_never_lands(void)
 	release(a); release(b);
 	puts("ok 29 - a zero-copy READ reply that never lands completes through the staged fallback");
 }
+/* A fallback that arrives while the zero-copy reply is still being POSTED must
+ * stop the burst there, not wait for it to finish: finishing waits on the very
+ * consumption that stalled (hardware: zc_fb_wait_midpost, then RETRY_EXC). Only
+ * the chunk already queued drains, then the staged reply completes the READ. */
+static void test_zc_read_fallback_truncates_midpost(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(b->mr[1].data, 0x5c, SN_MESSAGE);
+	post(a, SN_READ, SN_MESSAGE);
+	b->zc_defer = SN_MESSAGE / 16;
+	sn_engine_progress(a);
+	deliver(a, b, NULL);
+	sn_engine_progress(b);			/* one chunk queued, then gated on drain */
+	assert(b->qp->response_offset == SN_MESSAGE / 16 && !b->qp->response_sent);
+	now += 100000000ULL;
+	sn_engine_progress(a);			/* a times out and falls back */
+	assert(a->zc_read_fallback == 1);
+	deliver(a, b, NULL);			/* the staged SN_READ meets a mid-post reply */
+	sn_engine_progress(b);
+	assert(b->qp->response_sent && b->qp->response_offset == SN_MESSAGE / 16);
+	flush_inflight(b);			/* only the chunk already queued drains */
+	sn_engine_progress(b);
+	assert(!b->inflight_count && b->zc_read_fallback_served == 1);
+	for (i = 0; i < 400 && !a->sends && !a->errors; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(b->zc_tx_bursts == 1);
+	release(a); release(b);
+	puts("ok 30 - a fallback arriving mid-post truncates the zero-copy reply and is served staged");
+}
 int main(void)
 {
-	puts("1..29");
+	puts("1..30");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1317,6 +1350,7 @@ int main(void)
 	test_zc_read_timeout_staged_fallback();
 	test_zc_read_cross_path_identity();
 	test_zc_read_never_lands();
+	test_zc_read_fallback_truncates_midpost();
 	assert(!warnings);
 	return 0;
 }

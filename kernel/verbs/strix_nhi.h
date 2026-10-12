@@ -191,6 +191,8 @@ struct sn_device {
 	/* zc_read_dup_inflight = posting + undrained. */
 	u64 zc_read_dup_posting, zc_read_dup_undrained;
 	u64 zc_read_fallback, zc_read_fallback_served;
+	/* Responder-side exits of the zero-copy READ fallback path (diagnostic). */
+	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
 	struct list_head mrs;
 	struct sn_qp *qp;
 	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */

@@ -586,6 +586,9 @@ void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 static void sn_receive_request(struct sn_qp *q, const struct sn_header *h, const u8 *payload)
 {
 	enum sn_fragment_result result = sn_fragment(&q->receive, h);
+
+	if (h->opcode == SN_READ && result == SN_FRAGMENT_DROP)
+		sn_dev(q->ib.device)->zc_read_req_drop++;
 	struct sn_wqe *w;
 	int ret;
 
@@ -598,6 +601,7 @@ static void sn_receive_request(struct sn_qp *q, const struct sn_header *h, const
 				q->response_fallback = true; q->response_active = true;
 				return;
 			}
+			sn_dev(q->ib.device)->zc_fb_reserve++;
 			/* Never resample a live MR for a duplicate READ. */
 			if (!q->response_active || q->response_sent) {
 				q->response_active = true; q->response_sent = false;
@@ -786,8 +790,20 @@ void sn_engine_progress(struct sn_device *d)
 			 * reply. Until then the zero-copy deadline below keeps running. */
 			bool mid_post = q->response_offset && !q->response_sent;
 
-			if (!mid_post && (!q->response_offset || sn_data_tx_drained(d)) &&
-			    sn_response_to_staged(d, q)) {
+			if (mid_post) {
+				/* The zero-copy reply is superseded the moment the requester falls
+				 * back, so stop posting the rest of it. Finishing it would only wait
+				 * on the consumption that already failed: hardware showed an
+				 * unanswered fallback parked here (zc_fb_wait_midpost) while the
+				 * requester exhausted its retries. Frames already queued still drain
+				 * before the staged reply, so the requester never sees a zero-copy
+				 * frame after it. */
+				d->zc_fb_wait_midpost++;
+				q->response_sent = true;
+			}
+			else if (q->response_offset && !sn_data_tx_drained(d))
+				d->zc_fb_wait_drain++;
+			else if (sn_response_to_staged(d, q)) {
 				sn_qp_error(q, IB_WC_GENERAL_ERR); return;
 			}
 		}
@@ -806,6 +822,7 @@ void sn_engine_progress(struct sn_device *d)
 			bool defer = sn_response_zc(q);
 
 			if (!sn_retry_take(&q->response_retries, q->attr.retry_cnt)) {
+				d->zc_resp_retry_exc++;
 				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 			}
 			if (defer) {
@@ -820,6 +837,7 @@ void sn_engine_progress(struct sn_device *d)
 				/* A response that cannot even start within its budget fails the
 				 * QP rather than deferring forever. */
 				if (now >= q->response_deadline) {
+					d->zc_resp_start_exc++;
 					sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 				}
 			} else {
