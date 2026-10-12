@@ -1054,3 +1054,52 @@ Per-run counter deltas:
   at 416.67 MiB/s, all byte-for-byte.
 
 This meets the bar set for enabling zero-copy READ by default.
+
+## Outcome (2026-10-12): zero-copy READ is on by default
+
+`zc_read` now defaults to **on**. Every eligible READ (above the zero-copy
+threshold, frame-aligned at both ends, and with a peer that advertises ZDATA)
+takes the data ring at about 410 MiB/s, against 62.6 MiB/s staged. `zc_read=0`
+is the kill-switch that returns every READ to the staged path. This is the same
+bar zero-copy WRITE cleared: 20 consecutive `read 2000` runs byte-for-byte on a
+fresh boot, with the timeout recovery forced and firing in every run (round ten).
+
+How it behaves now:
+
+- **No timeout (the normal case):** the responder bursts straight from the live
+  source MR into the landing zone the requester armed, and the READ completes
+  when the last byte lands. There is no staging copy on either side.
+- **Timeout:** the requester keeps its landing zone armed and asks again with a
+  staged `SN_READ` for the same operation. The responder finishes posting its
+  zero-copy reply, waits for its data TX ring to drain, then serves the staged
+  reply from a snapshot. The requester completes once *both* the staged reply
+  and the abandoned burst have fully landed. The staged bytes are what the
+  application sees, and the READ completes exactly once.
+- **Never:** a data RX ring restarted one-sided. That was the root cause of the
+  residual: it starves the peer's data TX of E2E credits (round nine). A
+  zero-copy reply that never fully lands, which the lossless E2E data hop cannot
+  produce, fails the READ with RETRY_EXC instead of being reclaimed.
+- **Consistency:** like a real RNIC, a zero-copy READ gives per-operation
+  consistency, not a snapshot held across retransmits. If a READ times out, the
+  result is the snapshot taken when the fallback was served. Small or unaligned
+  READs stay staged and keep the staged path's snapshot guarantee.
+
+**Verified after the flip:** the default-on build was installed, the test
+override removed, and both hosts rebooted. Both report `zc_read=Y` from the
+compiled default, with no `zc_read` reference in any modprobe.d directory or on
+the kernel command line. On that boot, with `zc_read_fault=0`:
+
+- SEND smoke: 18,878,353 bytes, PASS.
+- `write 200`: PASS at 374.80 MiB/s, byte-for-byte.
+- `read 2000`: PASS at 411.12 MiB/s, 16,777,216,000 B per direction verified on
+  both sides, 8,000 zero-copy READs per side. It also hit one *natural* timeout
+  per side, with no injection: one fallback each way, both served, no QP error.
+
+Diagnostics kept for the next time something stalls: the ring and QP fields in
+`native_stats`, the frozen `drain_*`/`err_*` snapshots in `stall_snap`, and the
+`zc_read_fault=N` injection parameter (0644, default 0).
+
+Not covered by this work: a retried zero-copy SEND or WRITE descriptor still
+restarts the receiver's data RX ring (`sn_receive_zc`). If the same E2E
+starvation applies there, it has not shown up in the WRITE or SEND validation
+runs so far.

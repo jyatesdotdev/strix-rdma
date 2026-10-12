@@ -38,6 +38,10 @@ Running log of noteworthy work; newest first.
   29 and 30 were rewritten to the new contract. In isolation the engine suite
   passes 32/32 with the fix; with the fix reverted, exactly those five fail.
   `make check-native-verbs` is 54/54.
+- **After the flip:** both hosts rebooted on the default-on build with no
+  override and report `zc_read=Y`. The SEND smoke, `write 200` (374.80 MiB/s)
+  and `read 2000` (411.12 MiB/s) all passed byte-for-byte. The `read 2000`
+  rode out one natural timeout per side through the fallback, uninjected.
 - **Open:** a retried zero-copy SEND/WRITE descriptor still restarts the
   receiver's data RX ring (`sn_receive_zc`). It has not misbehaved in
   validation, but it is the same pattern.
