@@ -93,6 +93,21 @@ struct sn_device {
 	 * message while only part of it lands, which is what makes a receiver's
 	 * restart-on-retransmit observable. 0 lands everything. */
 	u32 zc_stall_after;
+	/* In-flight model. With zc_defer set to a chunk size, sn_data_burst() queues
+	 * that many bytes here instead of landing them, so a test can interleave a
+	 * descriptor retransmit between posting and arrival. That overlap is the one
+	 * thing the atomic model cannot represent, and it is what corrupted zero-copy
+	 * WRITE on hardware: a real 2 MiB burst is 512 frames against a 64-slot ring,
+	 * so posting is partial and delivery is asynchronous. Payload is copied at
+	 * flush time, as the NHI DMAs from the MR when it transmits. 0 = atomic. */
+	u32 zc_defer;
+	struct {
+		struct sn_device *dst;
+		struct sn_mr *src;
+		u64 src_addr;
+		u32 len;
+	} inflight[64];
+	unsigned inflight_count;
 	struct sn_device *zc_peer;
 	struct sn_mr *zc_land_mr;
 	u64 zc_land_addr;
@@ -172,6 +187,21 @@ static int sn_data_burst(struct sn_device *d, struct sn_mr *mr, u64 address,
 	if (d->zc_drop) { *offset = total; return 0; }
 	if (d->zc_stall_after && n > d->zc_stall_after) n = d->zc_stall_after;
 	if (!p->qp->zc_expect) { *offset = total; return 0; }
+	if (d->zc_defer) {
+		unsigned idx = d->inflight_count;
+
+		if (n > d->zc_defer) n = d->zc_defer;
+		assert(idx < 64);
+		d->inflight[idx].dst = p;
+		d->inflight[idx].src = mr;
+		d->inflight[idx].src_addr = address + *offset;
+		d->inflight[idx].len = n;
+		d->inflight_count = idx + 1;
+		*offset += n;
+		/* Mirrors ring.c: a partial post returns -EAGAIN and the engine stays in
+		 * SN_ZC_SENDING to resume from zc_offset on a later pass. */
+		return *offset >= total ? 0 : -EAGAIN;
+	}
 	assert(p->zc_land_mr && n <= p->zc_land_len - p->zc_land_landed);
 	memcpy(p->zc_land_mr->data + (p->zc_land_addr - p->zc_land_mr->base) + p->zc_land_landed,
 	       mr->data + (address - mr->base) + *offset, n);
@@ -205,7 +235,29 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 	return 0;
 }
 void sn_data_abort(struct sn_device *d) { (void)d; }
-bool sn_data_tx_drained(struct sn_device *d) { return !d->zc_tx_stuck; }
+/* Deliver everything a device has queued, in order, into each frame's destination
+ * landing zone. A frame whose destination no longer expects a burst is dropped,
+ * exactly as a data RX ring with nothing posted drops it. The landing-zone assert
+ * is the overshoot the real ring.c harvest loop guards against: if it fires, a
+ * superseded attempt's frames were counted into the new one. */
+static void flush_inflight(struct sn_device *d)
+{
+	unsigned i;
+
+	for (i = 0; i < d->inflight_count; i++) {
+		struct sn_device *p = d->inflight[i].dst;
+		u32 n = d->inflight[i].len;
+
+		if (!p->qp->zc_expect) continue;
+		assert(p->zc_land_mr && n <= p->zc_land_len - p->zc_land_landed);
+		memcpy(p->zc_land_mr->data + (p->zc_land_addr - p->zc_land_mr->base) + p->zc_land_landed,
+		       d->inflight[i].src->data + (d->inflight[i].src_addr - d->inflight[i].src->base), n);
+		p->zc_land_landed += n;
+		sn_engine_zc_bytes(p->qp, n);
+	}
+	d->inflight_count = 0;
+}
+bool sn_data_tx_drained(struct sn_device *d) { return !d->zc_tx_stuck && !d->inflight_count; }
 static void sn_qp_error(struct sn_qp *q, enum ib_wc_status status)
 {
 	struct sn_device *d = q->ib.device;
@@ -1098,9 +1150,58 @@ static void test_zc_read_bidirectional(void)
 	release(a); release(b);
 	puts("ok 25 - simultaneous bidirectional zero-copy READ: neither side holds the other's request");
 }
+/* The overlap the atomic model could not represent, and that corrupted zero-copy
+ * WRITE on hardware. A burst is posted in bounded chunks, so frames are still
+ * queued in the data TX ring when the ACK deadline passes. Retransmitting the
+ * descriptor at that moment makes the receiver zero zc_received for the duplicate
+ * and then count the superseded attempt's frames into the new one, overshooting
+ * the landing zone. The drain barrier must defer the restart instead. */
+static void test_zc_burst_inflight_overlap(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(a->mr[0].data, 0xc3, SN_MESSAGE);
+	post(a, SN_WRITE, SN_MESSAGE);
+	/* 128 KiB per pass, so a 2 MiB burst queues as 16 chunks -- more than the
+	 * 64-slot ring holds at once on real hardware, and none of it has landed. */
+	a->zc_defer = SN_MESSAGE / 16;
+
+	sn_engine_progress(a);			/* descriptor */
+	deliver(a, b, NULL);
+	sn_engine_progress(b);			/* flush ZC_READY into packets */
+	deliver(b, a, NULL);
+	for (i = 0; i < 100 && a->qp->zc_state != SN_ZC_SENT; i++) sn_engine_progress(a);
+	/* Fully queued, nothing delivered: the exact state a real ring is in mid-burst,
+	 * and the state the atomic model jumped straight over. */
+	assert(a->qp->zc_state == SN_ZC_SENT && a->inflight_count == 16);
+	assert(!b->zc_land_landed && !b->write_bytes);
+	assert(!sn_data_tx_drained(a));
+
+	/* No READ_ACK/ACK can exist yet because nothing has landed, so the deadline
+	 * passes with frames still outstanding. retry_cnt is 3, so defer twice: the
+	 * restart must be held off, not taken, and nothing may land or error. */
+	for (i = 0; i < 2; i++) { now += 1000000000ULL; sn_engine_progress(a); }
+	assert(a->qp->zc_state == SN_ZC_SENT && !a->errors && !b->errors);
+	assert(!b->zc_land_landed && a->inflight_count == 16);
+
+	/* Now the queued frames arrive. They must land exactly once into the still-armed
+	 * zone and complete the message; the flush assert is the overshoot check. */
+	flush_inflight(a);
+	assert(sn_data_tx_drained(a));
+	assert(b->zc_land_landed == SN_MESSAGE && b->write_bytes == SN_MESSAGE);
+	sn_engine_progress(b);
+	deliver(b, a, NULL);
+	sn_engine_progress(a);
+	assert(a->sends == 1 && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(!b->mr[1].users && !a->mr[0].users);
+	release(a); release(b);
+	puts("ok 26 - in-flight burst frames survive an ACK timeout: the restart defers until the ring drains");
+}
 int main(void)
 {
-	puts("1..25");
+	puts("1..26");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1113,6 +1214,7 @@ int main(void)
 	test_zc_read_serializes_inbound_bursts();
 	test_zc_read_lost_ack_is_fatal();
 	test_zc_read_bidirectional();
+	test_zc_burst_inflight_overlap();
 	assert(!warnings);
 	return 0;
 }
