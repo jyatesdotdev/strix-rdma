@@ -458,7 +458,7 @@ static ssize_t native_stats_show(struct device *dev, struct device_attribute *at
 	ssize_t n;
 
 	mutex_lock(&d->lock);
-	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\nzc_send_ops %llu\nzc_send_fault_injected %llu\nzc_desc_dup %llu\nzc_ack_probe %llu\n",
+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\nzc_send_ops %llu\nzc_send_fault_injected %llu\nzc_desc_dup %llu\nzc_ack_probe %llu\nmax_pass_gap_us %llu\n",
 		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_retries, d->zc_aborts,
 		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
@@ -470,7 +470,7 @@ static ssize_t native_stats_show(struct device *dev, struct device_attribute *at
 		d->zc_read_req_drop, d->zc_resp_retry_exc, d->zc_resp_start_exc,
 		d->zc_read_ops, d->zc_read_fault_injected,
 		d->zc_send_ops, d->zc_send_fault_injected, d->zc_desc_dup,
-		d->zc_ack_probe);
+		d->zc_ack_probe, div_u64(d->max_pass_gap_ns, NSEC_PER_USEC));
 	n += sysfs_emit_at(buf, n,
 		"zdata %d\ndata_tx_head %u\ndata_tx_tail %u\ndata_rx_head %u\n"
 		"data_rx_tail %u\nzdata_posted %u\n",
@@ -499,28 +499,32 @@ static ssize_t sn_snap_emit(char *buf, ssize_t n, const char *p,
 
 	n += sysfs_emit_at(buf, n,
 		"%s_count %llu\n%s_age_ms %llu\n%s_status %d\n"
+		"%s_since_land_us %llu\n%s_max_pass_gap_us %llu\n"
 		"%s_data_tx_head %u\n%s_data_tx_tail %u\n%s_data_rx_head %u\n"
 		"%s_data_rx_tail %u\n%s_zdata_posted %u\n%s_qp %d\n"
 		"%s_zc_received %u\n%s_zc_total %u\n%s_zc_expect %d\n%s_zc_state %u\n"
 		"%s_zc_read_staged %d\n%s_zc_read_armed %d\n%s_response %d/%d/%d/%u\n",
 		p, s->count, p, s->count ? div_u64(now - s->at_ns, NSEC_PER_MSEC) : 0,
-		p, s->status, p, s->data_tx_head, p, s->data_tx_tail,
+		p, s->status, p, div_u64(s->since_land_ns, NSEC_PER_USEC),
+		p, div_u64(s->max_pass_gap_ns, NSEC_PER_USEC), p, s->data_tx_head, p, s->data_tx_tail,
 		p, s->data_rx_head, p, s->data_rx_tail, p, s->zdata_posted, p, s->qp,
 		p, s->zc_received, p, s->zc_total, p, s->zc_expect, p, s->zc_state,
 		p, s->zc_read_staged, p, s->zc_read_armed, p, s->response_active,
 		s->response_sent, s->response_fallback, s->response_offset);
 	for (i = 0; i < 2; i++)
 		n += sysfs_emit_at(buf, n,
-			"%s_hw_%s ret=%d head=%u tail=%u hw_posted=%u hw_completed=%u queued=%u in_flight=%u posted=%llu completed=%llu running=%d irq_en=%d hw_valid=%d tail_flags=%#x\n",
+			"%s_hw_%s ret=%d head=%u tail=%u hw_posted=%u hw_completed=%u queued=%u in_flight=%u posted=%llu completed=%llu running=%d irq_en=%d hw_valid=%d tail_flags=%#x irqs=%llu work=%llu\n",
 			p, i ? "rx" : "tx", i ? s->rx_ret : s->tx_ret, r[i]->head, r[i]->tail,
 			r[i]->hw_posted, r[i]->hw_completed, r[i]->queued, r[i]->in_flight,
 			r[i]->descriptors_posted, r[i]->descriptors_completed, r[i]->running,
-			r[i]->interrupt_enabled, r[i]->hw_valid, r[i]->tail_flags);
+			r[i]->interrupt_enabled, r[i]->hw_valid, r[i]->tail_flags,
+			r[i]->interrupts, r[i]->work_runs);
 	return n;
 }
 /* Frozen stall snapshots (see struct sn_stall_snap): "drain" is the
  * responder's latest wait for its data TX ring under a READ fallback, "err" the
- * latest QP error other than a flush. response is active/sent/fallback/offset. */
+ * latest QP error other than a flush, "tmo" the latest zero-copy ACK or
+ * retransmit timeout. response is active/sent/fallback/offset. */
 static ssize_t stall_snap_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct sn_device *d = sn_dev(container_of(dev, struct ib_device, dev));
@@ -530,6 +534,7 @@ static ssize_t stall_snap_show(struct device *dev, struct device_attribute *attr
 	mutex_lock(&d->lock);
 	n = sn_snap_emit(buf, 0, "drain", &d->snap_drain, now);
 	n = sn_snap_emit(buf, n, "err", &d->snap_err, now);
+	n = sn_snap_emit(buf, n, "tmo", &d->snap_tmo, now);
 	mutex_unlock(&d->lock);
 	return n;
 }

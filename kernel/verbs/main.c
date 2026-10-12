@@ -209,6 +209,14 @@ static bool sn_pass(struct sn_device *d)
 
 	mutex_lock(&d->lock);
 	if (d->dead) { mutex_unlock(&d->lock); return false; }
+	{
+		/* Stall diagnosis: how long a pass can be late while work waits. */
+		u64 now = ktime_get_ns();
+
+		if (d->pass_busy && now - d->last_pass_ns > d->max_pass_gap_ns)
+			d->max_pass_gap_ns = now - d->last_pass_ns;
+		d->last_pass_ns = now;
+	}
 	was_active = sn_ready(&d->ready);
 	/* TB-IP is optional: without it the wire handshake alone proves link and
 	 * peer liveness (the XDomain's existence means the link enumerated). */
@@ -251,6 +259,8 @@ static bool sn_pass(struct sn_device *d)
 		sn_engine_progress(d);
 		progress = d->rx_frames != rx0 || d->tx_frames != tx0;
 	} while (progress && --budget);
+	d->pass_busy = d->qp && (d->qp->sq_count || d->qp->zc_expect ||
+				 d->qp->response_active);
 	mutex_unlock(&d->lock);
 	if (was_active != active && d->registered) {
 		struct ib_event event = {.device = &d->ib,

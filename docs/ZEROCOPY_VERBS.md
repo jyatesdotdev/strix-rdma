@@ -1168,3 +1168,77 @@ timeouts themselves, 80 per run.
 3/3 at 416–418 MiB/s, every fallback served. With all faults at 0: the SEND
 smoke passed, `send 2000` at 460.87 MiB/s, `write 2000` at 459.06 MiB/s and
 `read 2000` at 418.03 MiB/s, all byte-for-byte.
+
+## Round twelve (2026-10-12): what the natural timeouts are
+
+Every mode shows occasional natural ACK or retransmit timeouts. On the
+post-flip boot, `read 2000` had one natural fallback per side in 8,000 READs.
+Round eight had none in 120,000. Each timeout costs at least one 67 ms window,
+and they vary by boot. To see where the time goes, `stall_snap` gained a
+third frozen snapshot, `tmo_*`, taken at every zero-copy READ retransmit, ACK
+probe and descriptor retransmit. Every snapshot now also records
+`since_land_us` (age of the newest harvested data frame) and
+`max_pass_gap_us`, the worst gap between poller passes while work was
+outstanding. The latter is also exported live in `native_stats`. The hardware
+lines add the core ring's `irqs` and `work` counts.
+
+**Capture.** On a fresh boot with all faults at 0: `read 2000` 10/10 PASS, six
+runs with one natural fallback each. `write 2000` 5/5 and `send 2000` 5/5 PASS
+with none. The `tmo_*` and `drain_*` snapshots from two runs, on both hosts,
+all show the same thing:
+
+- **The requester, at its timeout**, has received the whole burst except
+  exactly one 4 KiB frame (`zc_received` = 2093056 of 2097152), the burst's
+  last. Its NHI holds one posted RX buffer for it (`in_flight=1`, driver
+  `data_rx_head - data_rx_tail = 1`). The core has processed every completion
+  the hardware made (`hw_completed=63` equals the core `tail=63`), and 67 ms
+  have passed since the previous frame landed.
+- **The responder, waiting to drain**, holds that frame in its data TX ring,
+  posted and not transmitted (`in_flight=1`, tail descriptor flags `0xc`,
+  POSTED|INTERRUPT with no DONE bit). Its hardware consumer index has not
+  moved past it.
+- **Neither poller is behind.** Nothing is waiting to be harvested on either
+  side, and the core ring work is current. The frame isn't lost: every run
+  passed byte-for-byte, so it is transmitted within the retry budget, after
+  more than one 67 ms window (each fallback came with 2–3 retransmits and the
+  responder spent dozens of passes in its drain wait).
+
+So the NHI withholds transmission of a burst's final frame for more than 67 ms
+while the peer has a buffer posted for it, then sends it. With E2E on the
+ring, the only thing a transmitter waits for is an E2E credit. This looks like
+a credit grant for a lone, last-posted receive buffer being held back.
+Upstream has two reports of credit-return trouble on this class of hardware:
+
+- The 2026-07 revert of TX-side E2E in thunderbolt-net (netdev
+  `1881f2efbf7f`): an ASMedia ASM4242 never returns TX credits.
+- The out-of-tree thunderbolt-ibverbs project disables native E2E on AMD NHIs
+  by default, because "Strix Halo has reproduced TX completion wedges with
+  multiple native E2E rings active".
+
+This driver runs two E2E ring pairs per host, control and data.
+
+What it is not: a driver bug in either poller, or the one-sided restart
+starvation of rounds nine and eleven. Here the stall clears by itself and both
+sides' rings are consistent.
+
+**Impact.** On a bad boot, roughly one stall of 100–200 ms per 8,000
+operations, and the recovery paths handle it: the READ fallback, or the
+SEND/WRITE drain deferral followed by an ACK probe. Throughput cost is under 1%.
+WRITE and SEND are probably hit as well, but invisibly: their drained-timeout
+deferral is not counted.
+
+**Separate finding.** `max_pass_gap_us` reached 29,988 on one host and 14,641
+on the other. The poller sometimes doesn't run for up to 30 ms while work is
+outstanding, which points to scheduling of the poll thread against the
+busy-polling application. It isn't the cause of these timeouts, but it does
+add tail latency.
+
+**Not done, and why.** The cheap test of the multiple-E2E-rings hypothesis is
+to run the control rings without E2E, leaving one E2E pair per host. That
+makes the control ring lossy whenever a receiver's poller stalls (see the 30 ms
+gaps above), so staged traffic would then depend on whole-message
+retransmission. The boot-to-boot variance (6 of 10 runs here, 0 of 15 in round
+eight) also means a conclusive A/B needs several reboot cycles per arm.
+Dropping hardware E2E altogether, as thunderbolt-ibverbs does, needs a
+software credit scheme on the data ring, because the zero-copy recovery design
+rests on E2E being lossless. Both are design decisions, not fixes.

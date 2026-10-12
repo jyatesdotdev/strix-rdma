@@ -473,7 +473,8 @@ void sn_data_abort(struct sn_device *d)
 }
 void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status)
 {
-	struct sn_stall_snap *s = status ? &d->snap_err : &d->snap_drain;
+	struct sn_stall_snap *s = status < 0 ? &d->snap_tmo :
+				  status ? &d->snap_err : &d->snap_drain;
 	u64 now = ktime_get_ns(), count = s->count + 1;
 	bool rings;
 
@@ -482,6 +483,8 @@ void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status)
 		return;
 	memset(s, 0, sizeof(*s));
 	s->count = count; s->at_ns = now; s->status = status;
+	s->since_land_ns = d->last_land_ns ? now - d->last_land_ns : 0;
+	s->max_pass_gap_ns = d->max_pass_gap_ns;
 	s->data_tx_head = d->data_tx_head; s->data_tx_tail = d->data_tx_tail;
 	s->data_rx_head = d->data_rx_head; s->data_rx_tail = d->data_rx_tail;
 	s->zdata_posted = d->zdata_posted;
@@ -523,6 +526,7 @@ void sn_data_receive(struct sn_device *d)
 			continue;
 		}
 		d->rx_frames++;
+		d->last_land_ns = ktime_get_ns();
 		if (d->qp && d->qp->zc_expect) {
 			if (d->qp->zc_received + size > d->qp->zc_total) {
 				/* Overshoot: more bytes than the burst holds. A sender bursts

@@ -4,6 +4,8 @@
 /* zc_send_fault modes (sn_qp.zc_send_fault); 0 is no fault. */
 #define SN_FAULT_READY_LOST	1
 #define SN_FAULT_READY_LATE	2
+/* sn_stall_snapshot() status for a zero-copy ACK/retransmit timeout. */
+#define SN_SNAP_TIMEOUT		(-1)
 
 /* Session handshake is wire-carried over the native rings. Static discovery
  * uses only immediate service properties (rxhop); epochs/generations in the
@@ -970,6 +972,7 @@ void sn_engine_progress(struct sn_device *d)
 			 * into a landing zone that would need a ring restart. */
 			struct sn_header p = sn_zc_descriptor(q, w);
 
+			sn_stall_snapshot(d, q, SN_SNAP_TIMEOUT);
 			if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
 				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 			}
@@ -995,6 +998,7 @@ void sn_engine_progress(struct sn_device *d)
 			/* Counted here because zc_retries above cannot see it: a zero-copy READ
 			 * requester queues no payload, so its zc_state stays SN_ZC_NONE. */
 			d->zc_read_retx++;
+			sn_stall_snapshot(d, q, SN_SNAP_TIMEOUT);
 			/* Never stop/start the data RX ring here. Hardware showed that doing so
 			 * under a live peer burst strands that burst in the responder's TX ring
 			 * for the rest of the boot, and then zero-copy SEND fails too. Keep the
@@ -1009,6 +1013,7 @@ void sn_engine_progress(struct sn_device *d)
 	}
 	if (q->zc_state == SN_ZC_WAIT) {
 		if (now < q->deadline) return;
+		sn_stall_snapshot(d, q, SN_SNAP_TIMEOUT);
 		if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
 			sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 		}

@@ -1,6 +1,23 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — natural timeouts traced to a withheld last frame at the NHI
+- **What:** a new `stall_snap` `tmo_*` snapshot, taken at every zero-copy
+  timeout, plus `since_land_us` and `max_pass_gap_us`. On a fresh boot, 6 of
+  10 `read 2000` runs each had one natural fallback.
+- **Finding:** the requester is always missing exactly the burst's last 4 KiB
+  frame and has a buffer posted for it. The responder's NHI holds that frame
+  posted but untransmitted for more than 67 ms, and then sends it. Both pollers
+  are current, and core and hardware ring indices agree. This is consistent with
+  a withheld E2E credit grant, and matches upstream reports of E2E credit-return
+  trouble on ASMedia and on Strix Halo with multiple E2E rings.
+- **Impact:** about one 100–200 ms stall per 8,000 operations on a bad boot,
+  handled correctly by recovery, under 1% of throughput. Poller gaps of up to
+  30 ms were also measured; they are not the cause.
+- **Open (a design decision):** running the control rings without E2E, or a
+  software credit scheme on the data ring. Recorded in
+  `docs/ZEROCOPY_VERBS.md`, round twelve.
+
 ## 2026-10-12 — zero-copy SEND/WRITE: the same E2E starvation, reproduced and removed
 - **What:** zero-copy SEND and WRITE (both on by default) still restarted the
   receiver's data RX ring on a duplicate burst descriptor, the one-sided restart

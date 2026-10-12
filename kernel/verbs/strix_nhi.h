@@ -146,6 +146,9 @@ struct sn_qp {
  * Diagnostics only; read through the stall_snap attribute. */
 struct sn_stall_snap {
 	u64 count, at_ns;
+	/* Age of the newest harvested data frame, and the worst gap between poller
+	 * passes while work was outstanding (since boot), at snapshot time. */
+	u64 since_land_ns, max_pass_gap_ns;
 	int status, tx_ret, rx_ret;
 	u32 data_tx_head, data_tx_tail, data_rx_head, data_rx_tail, zdata_posted;
 	u32 zc_received, zc_total, response_offset;
@@ -227,7 +230,12 @@ struct sn_device {
 	u64 zc_send_ops, zc_send_fault_injected, zc_desc_dup;
 	/* Descriptor re-sends as ACK probes after a drained burst timed out. */
 	u64 zc_ack_probe;
-	struct sn_stall_snap snap_drain, snap_err;
+	struct sn_stall_snap snap_drain, snap_err, snap_tmo;
+	/* Poller timing for stall diagnosis: when a data frame was last harvested,
+	 * when the last pass started and whether it left work outstanding, and the
+	 * worst gap between passes that started with work outstanding. */
+	u64 last_land_ns, last_pass_ns, max_pass_gap_ns;
+	bool pass_busy;
 	struct list_head mrs;
 	struct sn_qp *qp;
 	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
@@ -297,7 +305,8 @@ int sn_data_recv_start(struct sn_device *d, struct sn_qp *q);
  * sn_engine_reset so an aborted burst cannot poison the rings). */
 void sn_data_abort(struct sn_device *d);
 /* Freeze the ring and QP state for diagnosis: status 0 records a drain wait
- * (at most once per millisecond), anything else a QP error with that status. */
+ * (at most once per millisecond), a negative status an ACK/retransmit timeout,
+ * anything else a QP error with that status. */
 void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status);
 /* True once every burst frame this host posted has been consumed by the NHI.
  * The zero-copy retry path must not restart a burst while frames are still
