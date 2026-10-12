@@ -29,10 +29,10 @@
  * on hardware without a rebuild. Defined in main.c, consumed in ring.c. */
 extern unsigned int sn_data_throttle_ns;
 
-/* Opt-in zero-copy RDMA WRITE, defined in main.c and latched into
- * sn_device::zc_write by ring.c when the data plane comes up. */
+/* Zero-copy RDMA WRITE kill-switch (default on), defined in main.c and latched
+ * into sn_device::zc_write by ring.c when the data plane comes up. */
 extern bool sn_zc_write;
-/* Opt-in zero-copy RDMA READ, same shape and latched the same way. */
+/* Zero-copy RDMA READ kill-switch (default on), latched the same way. */
 extern bool sn_zc_read;
 extern unsigned int sn_zc_read_fault;
 #define SN_SERVICE "strixv1"
@@ -189,7 +189,7 @@ struct sn_device {
 	 * engine suite (which compiles protocol.c against stubs and never links
 	 * main.c) needs no new symbol. */
 	bool zc_write;
-	/* Latched from the zc_read module parameter the same way; default off. */
+	/* Latched from the zc_read module parameter the same way; default on. */
 	bool zc_read;
 	int in_hop, out_hop;
 	/* Zero-copy data-plane HopIDs (second path tuple); -1 when unavailable. */

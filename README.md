@@ -108,6 +108,12 @@ Done and measured on the lab host pair:
   `zc_write=0` as a kill-switch. Hardware uncovered a burst-replay race that
   silently corrupted payload; the diagnosis, the drain barrier that fixes it and
   the offline test that now models it are in `kernel/verbs/README.md`.
+- Zero-copy RDMA READ on by default (2026-10-12), with `zc_read=0` as a
+  kill-switch: ~6.6× the staged path (408–418 vs 62.6 MiB/s), 20 consecutive
+  `read 2000` runs (15.6 GiB per direction each) byte-for-byte with the timeout
+  recovery forced and firing in every run. The last stall was E2E credit
+  starvation caused by a one-sided data RX ring restart. How it was found and
+  removed is in `docs/ZEROCOPY_VERBS.md`.
 
 Open:
 

@@ -579,12 +579,12 @@ static struct sn_device *zc_pair(struct sn_device **b)
 	*b = endpoint(20, 10, 200, 100);
 	a->peer_zc = (*b)->peer_zc = true;
 	a->zdata = (*b)->zdata = true;
-	/* Zero-copy WRITE is opt-in in the driver (module param zc_write, latched
-	 * into sn_device::zc_write when the data plane comes up). The suite exercises
-	 * the enabled path; the gated-off default is asserted separately. */
+	/* Zero-copy WRITE has a kill-switch in the driver (module param zc_write,
+	 * latched into sn_device::zc_write when the data plane comes up). The suite
+	 * exercises the enabled path; the switched-off case is asserted separately. */
 	a->zc_write = (*b)->zc_write = true;
-	/* Zero-copy READ is opt-in the same way (module param zc_read) and off until
-	 * it has been validated on hardware; the gated-off default is asserted too. */
+	/* Zero-copy READ has the same kill-switch (module param zc_read); the
+	 * switched-off case is asserted too. */
 	a->zc_read = (*b)->zc_read = true;
 	a->caps = (*b)->caps = SN_CAPS_V2;
 	a->zc_peer = *b; (*b)->zc_peer = a;
@@ -945,7 +945,7 @@ static void test_zc_read_fallback(void)
 		assert(a->mr[0].data[i] == b->mr[1].data[SN_HEADER + i]);
 	release(a); release(b);
 
-	/* Opt-in gate off, which is the shipped default: a READ that is otherwise
+	/* Kill-switch off (zc_read=0): a READ that is otherwise
 	 * fully eligible -- above the threshold, frame-aligned locally and remotely,
 	 * peer advertising ZDATA -- still stays staged and never reaches the data
 	 * ring. */

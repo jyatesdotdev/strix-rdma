@@ -1,6 +1,49 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — zero-copy RDMA READ on by default
+- **What:** `SN_ZC_READ = 15` (added 2026-10-11) is now the default for eligible
+  READs. It runs at 408–418 MiB/s against 62.6 MiB/s staged, ~6.6×.
+  `zc_read=0` is the kill-switch. The bar it cleared on a fresh boot of both
+  hosts: 20 consecutive `read 2000` runs (16,777,216,000 B per direction each)
+  passing byte-for-byte with the timeout recovery forced and firing in every
+  run. In those 20 runs, 92 fallbacks fired and all 92 were served, with no
+  QP error. A 3-run stress addendum at 10× the fault rate also passed.
+- **The path there:** the first hardware runs failed once retries started. The
+  original recovery re-burst on a duplicate request and restarted the
+  requester's data RX ring under a live burst, and both turned out to be
+  unsound. Recovery was rebuilt as a requester-driven staged-`SN_READ` fallback
+  for the same operation. That fallback worked, but a residual remained: the
+  zero-copy READ *after* a served fallback sometimes stalled. The best streak
+  was 5 runs.
+- **Root cause, found by instrumentation:** `native_stats` now exports ring
+  and QP state, and a new `stall_snap` attribute freezes the driver's ring
+  indices, the QP state and `tb_ring_get_stats()` for both data rings at the
+  moment a stall is detected. 15 natural runs produced no timeout, so a
+  `zc_read_fault=N` parameter forces one. Two induced stalls out of two showed
+  the same thing: the requester's NHI held 63 posted RX descriptors, the
+  responder's held 63 posted TX descriptors it never sent, and TX completed
+  equalled RX completed exactly. This was E2E credit starvation, beginning at
+  the fallback completion's one-sided `tb_ring_stop`/`tb_ring_start` of the
+  requester's data RX ring. Restarting both ends cleared it.
+- **Fix (in this driver; the thunderbolt core is untouched):** a data RX ring
+  is never restarted one-sided on this path. The responder always posts and
+  drains its zero-copy reply in full before serving the staged one, reverting
+  7977ae2's truncation. The requester completes only after both the staged
+  reply and the abandoned burst have landed, so every posted buffer is consumed
+  and nothing needs reclaiming. A reply that never lands, which lossless E2E
+  cannot produce, now fails loudly instead.
+- **Tests:** the harness models E2E starvation (`e2e_model`). ok 31
+  (`zc_read_fault`) and ok 32 (round nine replayed) failed first. ok 19, 28,
+  29 and 30 were rewritten to the new contract. In isolation the engine suite
+  passes 32/32 with the fix; with the fix reverted, exactly those five fail.
+  `make check-native-verbs` is 54/54.
+- **Open:** a retried zero-copy SEND/WRITE descriptor still restarts the
+  receiver's data RX ring (`sn_receive_zc`). It has not misbehaved in
+  validation, but it is the same pattern.
+- **Evidence:** `docs/ZEROCOPY_VERBS.md`, rounds one to ten and "Outcome";
+  commits 2ea27f0, ebec8f0, 1ab0a0b, 65bab6b and this one.
+
 ## 2026-10-10 — repository generalised; RDMA READ/WRITE hardware-validated
 - **What:** The repository stopped being a single-workload tensor transport and
   became general RDMA support between two Strix Halo hosts. Every artifact of

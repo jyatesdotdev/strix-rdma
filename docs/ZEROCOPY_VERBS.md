@@ -329,6 +329,11 @@ during zero-copy runs is survivable — to be confirmed on hardware.
 
 ## Next: zero-copy READ (`SN_ZC_READ`) — design
 
+> **Status (2026-10-12): shipped, on by default, with `zc_read=0` as the
+> kill-switch.** See "Outcome" at the end of this document. The sections from
+> here to there are a dated record of how it got there. Statements in them that
+> `zc_read` is off, gated or unsafe describe the state on that date.
+
 Measured 2026-10-10 on the lab host pair after the WRITE work landed:
 
 | op | path | throughput |

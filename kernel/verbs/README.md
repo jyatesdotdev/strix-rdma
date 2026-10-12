@@ -369,7 +369,7 @@ CRC32C Castagnoli uses initial/final complement and treats bytes96..99 as zero,
 covering the complete header and payload. It detects corruption, not an
 unauthorized peer. Opcodes: SEND1, WRITE2, READ3, READ_REPLY4, ACK5, READ_ACK6,
 CREDIT7, HELLO8, HELLO_ACK9, BIND10, BIND_ACK11, ZC_SEND12, ZC_READY13,
-ZC_WRITE14. Status: OK0, RNR1, ACCESS2, LENGTH3, PROTOCOL4. Unused fields must be zero.
+ZC_WRITE14, ZC_READ15. Status: OK0, RNR1, ACCESS2, LENGTH3, PROTOCOL4. Unused fields must be zero.
 CREDIT total is available application RQ WQEs, serial its revision; it is only a
 hint. Actual SEND admission checks RQ ownership and returns RNR without consuming
 an absent WQE. Preposted transport RX slots are never application credits.
@@ -385,12 +385,20 @@ responder places the payload in the requester's named MR. A `ZC_WRITE` therefore
 consumes no receive WQE, produces no receive CQE and can never be RNR; a WRITE
 whose length is at or below the zero-copy threshold, or whose local source or
 remote destination is not frame aligned, stays on the staged path instead.
+`ZC_READ` names the responder's source MR. The requester arms its own MR as the
+landing zone before sending it, so it needs no `ZC_READY`, and the responder
+bursts the reply from the source MR, retaining it until `READ_ACK`. The same
+threshold and alignment rules (local landing zone, remote source) keep a READ
+staged. On timeout the requester re-asks with a staged `READ` for the same
+serial; see "Outcome" in `docs/ZEROCOPY_VERBS.md`.
 
 A single ordered assembly accepts only the expected serial; reordered fragments
 are dropped, already assembled duplicates do not advance it. Complete SEND/WRITE
 is placed once before completion/ACK. A replay record retains the outcome; ACK
-loss never consumes another receive or rewrites memory. READ captures one stable
-snapshot and replays that snapshot until acknowledged/advanced. Requester READ
+loss never consumes another receive or rewrites memory. A staged READ captures one
+stable snapshot and replays that snapshot until acknowledged/advanced. A zero-copy
+READ (the default for eligible READs) bursts from the live source MR instead and,
+on timeout, falls back to that staged snapshot path for the same operation. Requester READ
 uses its retained local SGE, copies once, completes once and re-ACKs duplicates.
 FIFO TX slot ownership is reclaimed only on local ring callback, independently
 of WR success. Eight of 63 usable TX slots are reserved from outgoing request
@@ -544,16 +552,20 @@ bounded chunks across engine passes, with a descriptor retransmit interleaved
 between chunks. That harness change is the prerequisite for fixing the race
 without burning a reboot per hypothesis.
 
-**Zero-copy READ exists but is gated off.** `SN_ZC_READ` is implemented and
-offline-covered, and `zc_read=1` measured **410.68 MiB/s against the staged
-path's 62.61 MiB/s** with 1,677,721,600 bytes verified byte-for-byte — but
-`read 2000` fails at iteration 390 with `IBV_WC_RETRY_EXC_ERR` once retries
-start, the same class of failure as the WRITE replay race. `zc_read` therefore
-defaults **off** and the staged READ path above is the correct one; it also keeps
-the snapshot guarantee that zero-copy READ gives up. Full results, the two
-hardware-only bugs found on the way (a bidirectional deadlock, and a smoke tool
-that hid the completion status) and the next diagnostic step are in
-`docs/ZEROCOPY_VERBS.md`, "Hardware result: implemented, gated OFF".
+**Zero-copy READ is on by default (2026-10-12).** `SN_ZC_READ` bursts the reply
+header-less from the responder's source MR straight into the requester's MR:
+about 410 MiB/s against the staged path's 62.61 MiB/s. `zc_read=0` is the
+kill-switch that returns every READ to the staged path above, which also keeps
+the cross-retransmit snapshot guarantee that zero-copy READ does not give. The
+first hardware runs failed once retries started (`read 2000`, RETRY_EXC at
+iteration 390). Recovery was then rebuilt as a requester-driven staged-`SN_READ`
+fallback. The last residual, E2E credit starvation caused by a one-sided restart
+of the requester's data RX ring, was found with in-driver stall snapshots and
+forced timeouts (`zc_read_fault`), and removed. The bar for enabling: 20
+consecutive `read 2000` runs byte-for-byte on a fresh boot, with the fallback
+forced and firing in every run. The full record, from the bidirectional deadlock
+through rounds one to ten, is in `docs/ZEROCOPY_VERBS.md`; its "Outcome" section
+states the current behaviour.
 
 Also not yet run:
 hot-unplug/malformed-peer injection; sustained multi-hour endurance; an

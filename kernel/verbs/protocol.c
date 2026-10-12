@@ -134,7 +134,7 @@ static bool sn_zc_eligible(struct sn_device *d, struct sn_wqe *w)
 	if (w->opcode == SN_SEND)
 		return true;
 	/* READ honours the zc_read kill-switch, latched into d->zc_read when the data
-	 * plane comes up and off until validated on hardware. The local address checked
+	 * plane comes up (default on). The local address checked
 	 * above is the landing zone the requester arms itself; the remote address is the
 	 * source the responder bursts from, so it must be frame aligned for the same
 	 * reason a WRITE's destination must be. */

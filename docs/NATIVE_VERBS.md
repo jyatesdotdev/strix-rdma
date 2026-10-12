@@ -7,7 +7,8 @@ inference workload runs over the provider (377 MB placed through SEND/RECV,
 ~140k frames per direction, zero bad frames, working inference), and **RDMA
 WRITE and READ pass end to end verified byte-for-byte** — including zero-copy
 WRITE at 356–456 MiB/s with 15.6 GiB (16,000 MiB) per direction checked in a single run,
-and READ over 1,677,721,600 bytes, `bad_frames` 0 throughout. Not yet:
+and zero-copy READ at 408–418 MiB/s over 20 consecutive 15.6 GiB-per-direction
+runs with its timeout recovery forced in every run, `bad_frames` 0 throughout. Not yet:
 hot-unplug and malformed-peer injection.** Still not complete RC conformance, production-ready, or a
 performance claim. Existing series20
 USB4STREAM production behavior/configuration is unchanged. This separate service
@@ -46,8 +47,10 @@ and [provider interface/build](../providers/strix_nhi/README.md).
 
 Unsupported operations are rejected; they are not reported as successes. Local
 NHI TX completion returns only staging ownership. Successful verbs SEND/WRITE
-completion requires peer-placement ACK; READ uses a retained stable response
-snapshot and ACK protocol. Preposted NHI buffers are **not** receive-WQE credits.
+completion requires peer-placement ACK. A staged READ uses a retained stable response
+snapshot and ACK protocol. A zero-copy READ (the default for eligible READs; `zc_read=0`
+is the kill-switch) bursts from the live source MR and, on timeout, falls back to that
+staged snapshot path for the same operation. Preposted NHI buffers are **not** receive-WQE credits.
 There are finite RNR/retry/progress budgets, fresh link/QP generations, replay
 records, key/PD/access/range checks, CQ error/flush handling and synchronous local
 ownership teardown. Kernel/runtime/hardware validation of those semantics is

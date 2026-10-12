@@ -292,8 +292,9 @@ is not a small buffer swap: it needs lazy path activation, transactional
 bounded import, exact SG tests, no-traffic hardware mapping, and a stale-cache
 ownership gate. On the verbs side the throughput A/B against the stream path
 is done; hardware READ/WRITE are now validated end to end (zero-copy WRITE at
-356–456 MiB/s with 15.6 GiB (16,000 MiB) per direction verified byte-for-byte, READ over
-1,677,721,600 bytes, `bad_frames` 0); the open work is conformance breadth
+356–456 MiB/s with 15.6 GiB (16,000 MiB) per direction verified byte-for-byte, and
+zero-copy READ, on by default since 2026-10-12, at 408–418 MiB/s over 20 consecutive
+15.6 GiB-per-direction runs with its timeout recovery forced, `bad_frames` 0); the open work is conformance breadth
 (hot-unplug, malformed peers,
 packet loss) and GPU-direct registration instead of CPU
 staging. Production

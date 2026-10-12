@@ -56,27 +56,30 @@ module_param_named(zc_write, sn_zc_write, bool, 0444);
 MODULE_PARM_DESC(zc_write,
 	"Let eligible RDMA WRITEs take the zero-copy data ring (default on; 0 forces the staged WRITE path)");
 
-/* Zero-copy RDMA READ, opt-in and off by default until it has been validated on
- * hardware the way zc_write was.
+/* Zero-copy RDMA READ, on by default since it passed the same hardware bar as
+ * zc_write: 20 consecutive read 2000 runs byte-for-byte with the timeout
+ * recovery forced in every run (docs/ZEROCOPY_VERBS.md, round ten).
  *
- * READ is the last verb on the staged control-ring path, where a 2 MiB reply is
- * pushed through as ~512 individually headered fragments and reassembled into
- * read_incoming: measured 62.6 MiB/s against 456 MiB/s for a zero-copy WRITE.
+ * The staged control-ring path pushes a 2 MiB reply through as ~512
+ * individually headered fragments reassembled into read_incoming: 62.6 MiB/s.
  * The zero-copy path bursts the reply header-less straight from the source MR
  * into the landing zone the requester armed before sending the request, so it
- * needs no SN_ZC_READY round trip.
+ * needs no SN_ZC_READY round trip: about 410 MiB/s.
  *
- * It carries the two guards that made zero-copy WRITE safe: the responder --
- * which is the burst sender here, so its response retry is the exposed path --
- * waits for the data TX ring to drain before re-bursting, bounded by the retry
- * budget, and an overshooting byte count fails the QP. One deliberate difference
- * from the staged path: a retried READ re-reads the live source MR instead of
- * replaying read_snapshot, so it may observe newer data. See
+ * Recovery is requester-driven. A zero-copy READ that times out falls back to a
+ * staged SN_READ for the same operation; the responder finishes posting and
+ * drains its burst, then serves the staged reply from a snapshot, and the
+ * requester completes once both the staged reply and the abandoned burst have
+ * landed. No data RX ring is ever restarted one-sided, which starves the peer's
+ * TX of E2E credits. Without a timeout the READ reads the live source MR, so,
+ * unlike the staged path, it gives no snapshot guarantee across retransmits.
+ *
+ * zc_read=0 is the kill-switch: every READ takes the staged path. See
  * kernel/verbs/README.md. */
-bool sn_zc_read = false;
+bool sn_zc_read = true;
 module_param_named(zc_read, sn_zc_read, bool, 0444);
 MODULE_PARM_DESC(zc_read,
-	"Let eligible RDMA READs take the zero-copy data ring (default off; 1 opts in, 0 keeps the staged READ path)");
+	"Let eligible RDMA READs take the zero-copy data ring (default on; 0 is the kill-switch that forces the staged READ path)");
 /* Fault injection for diagnosing zero-copy READ recovery: every Nth zero-copy
  * READ this host requests has its retransmit window expired the moment its reply
  * is within 32 frames of landing, so the requester falls back to a staged
