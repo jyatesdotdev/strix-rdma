@@ -179,6 +179,11 @@ struct sn_device {
 	/* Poller diagnostics: written only by the poller thread. */
 	u64 poll_passes, poll_sleeps, poll_wake_kick, poll_wake_tick;
 	u64 sched_calls, rnr_sent;
+	/* Zero-copy READ observability. zc_retries cannot see READ retransmits: a
+	 * READ requester queues no payload, so its zc_state stays SN_ZC_NONE and the
+	 * zc_retries increment in the retry path never fires. These count what it
+	 * misses, plus the two silent-drop outcomes of an unexpected sequence. */
+	u64 zc_read_retx, zc_read_dup_inflight, zc_read_rearm, zc_seq_ahead, zc_seq_stale;
 	struct list_head mrs;
 	struct sn_qp *qp;
 	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */

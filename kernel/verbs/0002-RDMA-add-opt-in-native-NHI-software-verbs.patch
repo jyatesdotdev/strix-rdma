@@ -453,7 +453,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,267 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -635,6 +635,11 @@ new file mode 100644
 +	/* Poller diagnostics: written only by the poller thread. */
 +	u64 poll_passes, poll_sleeps, poll_wake_kick, poll_wake_tick;
 +	u64 sched_calls, rnr_sent;
++	/* Zero-copy READ observability. zc_retries cannot see READ retransmits: a
++	 * READ requester queues no payload, so its zc_state stays SN_ZC_NONE and the
++	 * zc_retries increment in the retry path never fires. These count what it
++	 * misses, plus the two silent-drop outcomes of an unexpected sequence. */
++	u64 zc_read_retx, zc_read_dup_inflight, zc_read_rearm, zc_seq_ahead, zc_seq_stale;
 +	struct list_head mrs;
 +	struct sn_qp *qp;
 +	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
@@ -1819,7 +1824,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/str
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/verbs.c
-@@ -0,0 +1,498 @@
+@@ -0,0 +1,499 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/random.h>
 +#include <linux/vmalloc.h>
@@ -2277,11 +2282,12 @@ new file mode 100644
 +	ssize_t n;
 +
 +	mutex_lock(&d->lock);
-+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\n",
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\n",
 +		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 +		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_retries, d->zc_aborts,
 +		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
-+		d->sched_calls, d->rnr_sent);
++		d->sched_calls, d->rnr_sent, d->zc_read_retx, d->zc_read_dup_inflight,
++		d->zc_read_rearm, d->zc_seq_ahead, d->zc_seq_stale);
 +	if (d->qp) {
 +		struct sn_qp *q = d->qp;
 +
@@ -2497,7 +2503,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,897 @@
+@@ -0,0 +1,912 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -2828,9 +2834,12 @@ new file mode 100644
 +	 *    requester is waiting for data that will never arrive. Re-burst from zero.
 +	 */
 +	if (!q->response_active || (q->response_sent && sn_data_tx_drained(d))) {
++		d->zc_read_rearm++;
 +		q->response_active = true; q->response_sent = false;
 +		q->response_offset = 0;
 +		q->response_deadline = ktime_get_ns() + 30000000000ULL;
++	} else {
++		d->zc_read_dup_inflight++;
 +	}
 +}
 +/* Receiver: a zero-copy burst descriptor arrived on the control ring. The
@@ -2857,7 +2866,15 @@ new file mode 100644
 +		sn_ack(q, SN_ACK, h->sequence, q->receive.replay_status);
 +		return;
 +	}
-+	if (h->sequence != q->receive.expected) return;
++	if (h->sequence != q->receive.expected) {
++		/* A silent drop: no ACK, no error. Stale sequences are benign late
++		 * retransmits; an AHEAD sequence means this side lost track of a commit
++		 * and will ignore every retransmit of that descriptor until the requester
++		 * exhausts its retries. Count both so the two are distinguishable. */
++		if (h->sequence > q->receive.expected) d->zc_seq_ahead++;
++		else d->zc_seq_stale++;
++		return;
++	}
 +	if (q->receive.active) {
 +		/* Duplicate descriptor: the sender is retrying. Restart the burst
 +		 * from offset zero; partially landed bytes are rewritten identically. */
@@ -3302,6 +3319,10 @@ new file mode 100644
 +		if (q->zc_state != SN_ZC_NONE) d->zc_retries++;
 +		q->zc_state = SN_ZC_NONE;
 +		if (q->zc_read_armed) {
++			/* Counted here because zc_retries above cannot see it: a zero-copy
++			 * READ requester queues no payload, so its zc_state is always
++			 * SN_ZC_NONE and that increment never fires for READ. */
++			d->zc_read_retx++;
 +			/* Retransmitting a zero-copy READ descriptor must find the landing
 +			 * zone reset: flush the frames the previous attempt landed and repost
 +			 * from offset zero, so the responder's re-burst from zero is counted

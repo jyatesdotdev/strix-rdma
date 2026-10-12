@@ -328,9 +328,12 @@ static void sn_read_response_rearm(struct sn_device *d, struct sn_qp *q,
 	 *    requester is waiting for data that will never arrive. Re-burst from zero.
 	 */
 	if (!q->response_active || (q->response_sent && sn_data_tx_drained(d))) {
+		d->zc_read_rearm++;
 		q->response_active = true; q->response_sent = false;
 		q->response_offset = 0;
 		q->response_deadline = ktime_get_ns() + 30000000000ULL;
+	} else {
+		d->zc_read_dup_inflight++;
 	}
 }
 /* Receiver: a zero-copy burst descriptor arrived on the control ring. The
@@ -357,7 +360,15 @@ static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 		sn_ack(q, SN_ACK, h->sequence, q->receive.replay_status);
 		return;
 	}
-	if (h->sequence != q->receive.expected) return;
+	if (h->sequence != q->receive.expected) {
+		/* A silent drop: no ACK, no error. Stale sequences are benign late
+		 * retransmits; an AHEAD sequence means this side lost track of a commit
+		 * and will ignore every retransmit of that descriptor until the requester
+		 * exhausts its retries. Count both so the two are distinguishable. */
+		if (h->sequence > q->receive.expected) d->zc_seq_ahead++;
+		else d->zc_seq_stale++;
+		return;
+	}
 	if (q->receive.active) {
 		/* Duplicate descriptor: the sender is retrying. Restart the burst
 		 * from offset zero; partially landed bytes are rewritten identically. */
@@ -802,6 +813,10 @@ void sn_engine_progress(struct sn_device *d)
 		if (q->zc_state != SN_ZC_NONE) d->zc_retries++;
 		q->zc_state = SN_ZC_NONE;
 		if (q->zc_read_armed) {
+			/* Counted here because zc_retries above cannot see it: a zero-copy
+			 * READ requester queues no payload, so its zc_state is always
+			 * SN_ZC_NONE and that increment never fires for READ. */
+			d->zc_read_retx++;
 			/* Retransmitting a zero-copy READ descriptor must find the landing
 			 * zone reset: flush the frames the previous attempt landed and repost
 			 * from offset zero, so the responder's re-burst from zero is counted

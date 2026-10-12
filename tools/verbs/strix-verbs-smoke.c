@@ -155,6 +155,51 @@ static unsigned char pattern(uint64_t nonce, unsigned window, unsigned slot, uns
 	return (unsigned char)((nonce >> ((byte % 8) * 8)) ^ (byte * 131u) ^
 		(byte >> 11) ^ (window * 29u) ^ (slot * 53u));
 }
+/* On a payload mismatch, say what the bad bytes ARE, not only that they are
+ * wrong. Each failure hypothesis predicts a different signature: zeros mean the
+ * bytes never landed or the for-CPU sync was missed; the previous iteration's
+ * pattern means a stale transmit or a late frame from the last iteration; another
+ * slot's pattern means a frame landed at the wrong offset. Classification uses a
+ * run of up to 64 bytes so a 1-in-256 coincidence cannot mislabel it. */
+static int pattern_run(const unsigned char *p, unsigned n, uint64_t nonce,
+		       unsigned window, unsigned slot, unsigned byte)
+{
+	for (unsigned k = 0; k < n; k++)
+		if (p[k] != pattern(nonce, window, slot, byte + k)) return 0;
+	return 1;
+}
+static void report_mismatch(const unsigned char *landed, uint64_t nonce, unsigned it,
+			    unsigned slot, unsigned chunk, unsigned slots)
+{
+	const unsigned char *s = landed + (size_t)slot * chunk;
+	unsigned first = chunk, last = 0, bad = 0, n, k;
+	const char *kind = "unexplained";
+	char other[96];
+
+	for (k = 0; k < chunk; k++)
+		if (s[k] != pattern(nonce, it, slot, k)) {
+			if (first == chunk) first = k;
+			last = k; bad++;
+		}
+	n = chunk - first < 64 ? chunk - first : 64;
+	for (k = 0; k < n && !s[first + k]; k++)
+		;
+	if (k == n)
+		kind = "zeros: never landed, or the for-CPU sync was missed";
+	else if (it > 1 && pattern_run(s + first, n, nonce, it - 1, slot, first))
+		kind = "previous iteration's bytes: stale transmit or a late frame";
+	else
+		for (unsigned o = 0; o < slots; o++)
+			if (o != slot && pattern_run(s + first, n, nonce, it, o, first)) {
+				snprintf(other, sizeof(other), "slot %u's bytes: landed at the wrong offset", o);
+				kind = other;
+				break;
+			}
+	fprintf(stderr, "PAYLOAD MISMATCH iter=%u slot=%u first_bad=%u (frame %u +%u) "
+		"last_bad=%u bad_bytes=%u/%u got=0x%02x want=0x%02x -> %s\n",
+		it, slot, first, first / 4096, first % 4096, last, bad, chunk,
+		s[first], pattern(nonce, it, slot, first), kind);
+}
 static struct counters stats(const char *device)
 {
 	char path[256]; struct counters c = {}; FILE *f; int n;
@@ -402,8 +447,23 @@ int main(int argc, char **argv)
 			 * WRITE into it is ordered by this barrier instead. */
 			barrier(fd, 1000 + it);
 			atomic_thread_fence(memory_order_acquire);
-			for (unsigned i = 0; i < WINDOW; i++) for (unsigned j = 0; j < CHUNK; j++)
-				require(landed[i*CHUNK+j] == pattern(peer.nonce, it, i, j), "RDMA payload verification");
+			{
+				unsigned bad_slots = 0;
+
+				for (unsigned i = 0; i < WINDOW; i++) {
+					unsigned j;
+
+					for (j = 0; j < CHUNK; j++)
+						if (landed[i*CHUNK+j] != pattern(peer.nonce, it, i, j))
+							break;
+					if (j < CHUNK) {
+						report_mismatch(landed, peer.nonce, it, i, CHUNK, WINDOW);
+						bad_slots++;
+					}
+				}
+				if (bad_slots)
+					fail("RDMA payload verification");
+			}
 			verified += (unsigned long long)WINDOW * CHUNK;
 		}
 		int64_t elapsed = milliseconds() - t0;

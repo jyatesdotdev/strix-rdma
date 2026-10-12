@@ -80,6 +80,7 @@ struct sn_device {
 	enum ib_wc_status last_error;
 	u64 bad_frames, send_bytes, write_bytes, read_bytes;
 	u64 zc_bursts, zc_retries, zc_aborts, zc_tx_bursts;
+	u64 zc_read_retx, zc_read_dup_inflight, zc_read_rearm, zc_seq_ahead, zc_seq_stale;
 	u64 sched_calls, rnr_sent;
 	bool check_ids;
 	u32 caps;

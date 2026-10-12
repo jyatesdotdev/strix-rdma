@@ -505,9 +505,13 @@ Re-validated after a clean reboot with `zc_read=1`, three `read 2000` runs
 | 2 | **FAIL, payload verification** | **0** |
 | 3 | PASS, 417.14 MiB/s, byte-for-byte | 0 |
 
-**So a second, distinct mechanism remains open.** The failing run had
-`zc_retries` 0 — no descriptor was ever retransmitted — so it cannot be the
-rearm path just fixed. `bad_frames` stayed 0 throughout and `zc_aborts` rose by
+**So a second mechanism remains open.** *(Correction, made after the third
+round below: the inference originally drawn here — that `zc_retries` 0 meant no
+descriptor was retransmitted, so the rearm path could not be involved — was
+wrong. `zc_retries` is incremented only when `zc_state != SN_ZC_NONE`, and a
+zero-copy READ requester always sits in `SN_ZC_NONE` because it queues no
+payload. The counter cannot see READ retransmits at all; the `zc_retries` column
+in this table is blind, not zero.)* `bad_frames` stayed 0 throughout and `zc_aborts` rose by
 one per run. `zc_read` therefore remains **off by default** and the staged READ
 path stays the correct one.
 
@@ -530,3 +534,65 @@ throughput swings by more than 13% between runs for reasons not yet understood �
 so no single bulk measurement on it is evidence of a regression *or* of an
 improvement. Any future throughput claim needs a run count and a spread, not one
 number.
+
+### Third hardware round: instrumented, recovery path diagnosed
+
+The blind counter is now fixed. `native_stats` exports five new counters, appended
+after the existing fields so the smoke tool's fixed-order `fscanf` of the first six
+is unaffected: `zc_read_retx` (READ requester retransmits — what `zc_retries`
+could not see), `zc_read_dup_inflight` and `zc_read_rearm` (the two outcomes of a
+duplicate READ descriptor at the responder), and `zc_seq_ahead` / `zc_seq_stale`
+(the previously silent `h->sequence != q->receive.expected` drop in
+`sn_receive_zc()`, split so a desync — *ahead* — is distinguishable from a benign
+late retransmit — *stale*). The smoke tool also now classifies a payload mismatch
+by what the bad bytes are (zeros, the previous iteration's pattern, or another
+slot's pattern) instead of only reporting that one occurred.
+
+Also ruled out this round: **bounce buffering.** The hosts log "Using software
+bounce buffering for IO (SWIOTLB)", but the NHI (`c4:00.5`/`c4:00.6`) sits in a
+`DMA-FQ` IOMMU domain as a trusted internal device, and
+`/sys/kernel/debug/swiotlb/io_tlb_used` read 0 mid-burst across four `read 2000`
+runs. DMA is translated, not bounced, so sync placement is not the culprit.
+
+Captured failure, `read 2000` attempt 2 after a clean reboot,
+`IBV_WC_RETRY_EXC_ERR` at iteration 161 slot 3 on max2:
+
+| counter | max (responder) | max2 (requester, failed) |
+|---|---|---|
+| `zc_read_retx` | 0 | **3** |
+| `zc_read_dup_inflight` | **3** | 0 |
+| `zc_read_rearm` | **0** | 0 |
+| `zc_seq_ahead` / `zc_seq_stale` | 0 / 0 | 0 / 0 |
+| `bad_frames` | 0 | 0 |
+
+No sequence drops, so the silent-drop path is not it. max2 timed out and
+retransmitted three times; max received all three duplicates and ignored every
+one through the "response still in flight" branch added in `f2c7679`. Its
+response never drained, so it never re-armed, and max2 ran out of retries.
+
+**Diagnosis: the zero-copy READ recovery path is unsound in both versions.** On a
+retransmit the requester stops and restarts its own data RX ring
+(`sn_data_recv_restart()`) while the responder may still have frames in flight.
+Restarting a ring under a live peer burst cancels posted buffers and can drop
+frames or strand E2E credits, so the "in flight" frames do not reliably complete
+the reset zone. The original rule — re-burst on any duplicate — double-bursts into
+that zone (fixed offline by `f2c7679`, ok 27). The `f2c7679` rule — ignore while
+in flight — deadlocks whenever those frames cannot land, which is this failure.
+Neither rule can be correct while the requester resets its RX ring underneath a
+live peer burst. `f2c7679` remains a net improvement in one respect only: it
+turns a silent double-burst into a loud `RETRY_EXC_ERR`.
+
+**Proposed fix: zero-copy for the fast path, staged for recovery.** On a READ
+response timeout the requester disarms the zero-copy landing zone and retransmits
+as a staged `SN_READ`, whose header'd, offset-addressed control-ring fragments are
+immune to stale data-ring frames and already carry snapshot/replay semantics. At
+the observed rate (~1 failure per 56,000 READs) the staged fallback costs nothing
+at steady state. Two questions must be settled before writing it: the responder's
+replay-identity check (`sn_same_operation`) will see an `SN_READ` reusing the
+sequence of an `SN_ZC_READ`, and an RX ring left unposted after disarming may
+stall the peer's TX ring under E2E flow control — which would in turn block that
+peer's later zero-copy responses through `sn_response_may_burst()`.
+
+Next measurement worth taking first: split `zc_read_dup_inflight` into
+"response not yet fully posted" vs "posted but TX ring not drained", to confirm
+which side of the stall the responder is stuck on.
