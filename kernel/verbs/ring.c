@@ -488,6 +488,35 @@ void sn_data_abort(struct sn_device *d)
 	d->data_rx_head = d->data_rx_tail;
 	d->zdata_posted = 0;
 }
+void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status)
+{
+	struct sn_stall_snap *s = status ? &d->snap_err : &d->snap_drain;
+	u64 now = ktime_get_ns(), count = s->count + 1;
+	bool rings;
+
+	lockdep_assert_held(&d->lock);
+	if (!status && s->count && now - s->at_ns < NSEC_PER_MSEC)
+		return;
+	memset(s, 0, sizeof(*s));
+	s->count = count; s->at_ns = now; s->status = status;
+	s->data_tx_head = d->data_tx_head; s->data_tx_tail = d->data_tx_tail;
+	s->data_rx_head = d->data_rx_head; s->data_rx_tail = d->data_rx_tail;
+	s->zdata_posted = d->zdata_posted;
+	if (q) {
+		s->qp = true;
+		s->zc_received = q->zc_received; s->zc_total = q->zc_total;
+		s->zc_expect = q->zc_expect; s->zc_state = q->zc_state;
+		s->zc_read_staged = q->zc_read_staged;
+		s->zc_read_armed = q->zc_read_armed;
+		s->response_active = q->response_active;
+		s->response_sent = q->response_sent;
+		s->response_fallback = q->response_fallback;
+		s->response_offset = q->response_offset;
+	}
+	rings = d->zdata && !d->dead && d->data_tx_ring && d->data_rx_ring;
+	s->tx_ret = rings ? tb_ring_get_stats(d->data_tx_ring, &s->tx) : -ENODEV;
+	s->rx_ret = rings ? tb_ring_get_stats(d->data_rx_ring, &s->rx) : -ENODEV;
+}
 void sn_data_receive(struct sn_device *d)
 {
 	int i;

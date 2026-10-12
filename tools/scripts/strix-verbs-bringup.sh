@@ -164,9 +164,12 @@ report_zdata() {
         *"zdata 1"*)
             log "ok: zero-copy data plane live (zdata=1)"
             ;;
+        *"zdata 0"*)
+            log "warning: staged-only (zdata=0); the zero-copy data rings are not live"
+            ;;
         *)
-            # native_stats only prints zdata while a QP is bound, so an absent
-            # line here is normal at bring-up and does not mean staged-only.
+            # Older modules print zdata only while a QP is bound, so an absent
+            # line there is normal at bring-up and does not mean staged-only.
             if [ -n "$stats" ]; then
                 log "note: no QP bound yet, so zdata is not reported (normal at"
                 log "      bring-up). After a verbs client connects, confirm the"

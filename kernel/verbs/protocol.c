@@ -801,8 +801,10 @@ void sn_engine_progress(struct sn_device *d)
 				d->zc_fb_wait_midpost++;
 				q->response_sent = true;
 			}
-			else if (q->response_offset && !sn_data_tx_drained(d))
+			else if (q->response_offset && !sn_data_tx_drained(d)) {
 				d->zc_fb_wait_drain++;
+				sn_stall_snapshot(d, q, 0);
+			}
 			else if (sn_response_to_staged(d, q)) {
 				sn_qp_error(q, IB_WC_GENERAL_ERR); return;
 			}

@@ -176,6 +176,7 @@ int sn_data_response_burst(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_start(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 void sn_data_abort(struct sn_device *d);
+void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status);
 bool sn_data_tx_drained(struct sn_device *d);
 #include "../verbs/protocol.c"
 /* Modeled zero-copy data plane: one burst copies payload from an explicit source
@@ -245,6 +246,7 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 	return 0;
 }
 void sn_data_abort(struct sn_device *d) { (void)d; }
+void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status) { (void)d; (void)q; (void)status; }
 /* Deliver everything a device has queued, in order, into each frame's destination
  * landing zone. A frame whose destination no longer expects a burst is dropped,
  * exactly as a data RX ring with nothing posted drops it. The landing-zone assert

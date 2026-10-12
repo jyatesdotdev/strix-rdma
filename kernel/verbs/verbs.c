@@ -86,6 +86,9 @@ static void sn_flush_qp(struct sn_qp *q, enum ib_wc_status status, bool notify)
 }
 void sn_qp_error(struct sn_qp *q, enum ib_wc_status status)
 {
+	/* Freeze the state that caused the first failure before the flush resets it. */
+	if (status != IB_WC_WR_FLUSH_ERR && q->attr.qp_state != IB_QPS_ERR)
+		sn_stall_snapshot(sn_dev(q->ib.device), q, status);
 	sn_flush_qp(q, status, true);
 }
 static int sn_query_device(struct ib_device *ib, struct ib_device_attr *a,
@@ -465,23 +468,70 @@ static ssize_t native_stats_show(struct device *dev, struct device_attribute *at
 		d->zc_read_fallback, d->zc_read_fallback_served,
 		d->zc_fb_wait_midpost, d->zc_fb_wait_drain, d->zc_fb_reserve,
 		d->zc_read_req_drop, d->zc_resp_retry_exc, d->zc_resp_start_exc);
+	n += sysfs_emit_at(buf, n,
+		"zdata %d\ndata_tx_head %u\ndata_tx_tail %u\ndata_rx_head %u\n"
+		"data_rx_tail %u\nzdata_posted %u\n",
+		d->zdata, d->data_tx_head, d->data_tx_tail,
+		d->data_rx_head, d->data_rx_tail, d->zdata_posted);
 	if (d->qp) {
 		struct sn_qp *q = d->qp;
 
 		n += sysfs_emit_at(buf, n,
-			"zdata %d\ndata_tx %u/%u\ndata_rx %u/%u\nzdata_posted %u\n"
 			"qp_sq %u\nqp_rq %u\nqp_zc_state %u\nqp_zc_offset %u\n"
-			"qp_zc_expect %d\nqp_zc_received %u/%u\nqp_next_seq %llu\n",
-			d->zdata, d->data_tx_head, d->data_tx_tail,
-			d->data_rx_head, d->data_rx_tail, d->zdata_posted,
+			"qp_zc_expect %d\nqp_zc_received %u\nqp_zc_total %u\n"
+			"qp_zc_read_staged %d\nqp_zc_read_armed %d\nqp_next_seq %llu\n",
 			q->sq_count, q->rq_count, q->zc_state, q->zc_offset,
-			q->zc_expect, q->zc_received, q->zc_total, q->next_sequence);
+			q->zc_expect, q->zc_received, q->zc_total,
+			q->zc_read_staged, q->zc_read_armed, q->next_sequence);
 	}
 	mutex_unlock(&d->lock);
 	return n;
 }
 static DEVICE_ATTR_RO(native_stats);
-static struct attribute *sn_attributes[] = { &dev_attr_native_stats.attr, NULL };
+static ssize_t sn_snap_emit(char *buf, ssize_t n, const char *p,
+			    const struct sn_stall_snap *s, u64 now)
+{
+	const struct tb_ring_stats *r[2] = { &s->tx, &s->rx };
+	int i;
+
+	n += sysfs_emit_at(buf, n,
+		"%s_count %llu\n%s_age_ms %llu\n%s_status %d\n"
+		"%s_data_tx_head %u\n%s_data_tx_tail %u\n%s_data_rx_head %u\n"
+		"%s_data_rx_tail %u\n%s_zdata_posted %u\n%s_qp %d\n"
+		"%s_zc_received %u\n%s_zc_total %u\n%s_zc_expect %d\n%s_zc_state %u\n"
+		"%s_zc_read_staged %d\n%s_zc_read_armed %d\n%s_response %d/%d/%d/%u\n",
+		p, s->count, p, s->count ? div_u64(now - s->at_ns, NSEC_PER_MSEC) : 0,
+		p, s->status, p, s->data_tx_head, p, s->data_tx_tail,
+		p, s->data_rx_head, p, s->data_rx_tail, p, s->zdata_posted, p, s->qp,
+		p, s->zc_received, p, s->zc_total, p, s->zc_expect, p, s->zc_state,
+		p, s->zc_read_staged, p, s->zc_read_armed, p, s->response_active,
+		s->response_sent, s->response_fallback, s->response_offset);
+	for (i = 0; i < 2; i++)
+		n += sysfs_emit_at(buf, n,
+			"%s_hw_%s ret=%d head=%u tail=%u hw_posted=%u hw_completed=%u queued=%u in_flight=%u posted=%llu completed=%llu running=%d irq_en=%d hw_valid=%d tail_flags=%#x\n",
+			p, i ? "rx" : "tx", i ? s->rx_ret : s->tx_ret, r[i]->head, r[i]->tail,
+			r[i]->hw_posted, r[i]->hw_completed, r[i]->queued, r[i]->in_flight,
+			r[i]->descriptors_posted, r[i]->descriptors_completed, r[i]->running,
+			r[i]->interrupt_enabled, r[i]->hw_valid, r[i]->tail_flags);
+	return n;
+}
+/* Frozen stall snapshots (see struct sn_stall_snap): "drain" is the
+ * responder's latest wait for its data TX ring under a READ fallback, "err" the
+ * latest QP error other than a flush. response is active/sent/fallback/offset. */
+static ssize_t stall_snap_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct sn_device *d = sn_dev(container_of(dev, struct ib_device, dev));
+	u64 now = ktime_get_ns();
+	ssize_t n;
+
+	mutex_lock(&d->lock);
+	n = sn_snap_emit(buf, 0, "drain", &d->snap_drain, now);
+	n = sn_snap_emit(buf, n, "err", &d->snap_err, now);
+	mutex_unlock(&d->lock);
+	return n;
+}
+static DEVICE_ATTR_RO(stall_snap);
+static struct attribute *sn_attributes[] = { &dev_attr_native_stats.attr, &dev_attr_stall_snap.attr, NULL };
 static const struct attribute_group sn_device_group = { .attrs = sn_attributes };
 const struct ib_device_ops sn_verbs_ops = {
 	.owner = THIS_MODULE, .driver_id = RDMA_DRIVER_UNKNOWN,

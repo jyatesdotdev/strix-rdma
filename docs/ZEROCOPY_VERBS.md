@@ -790,3 +790,40 @@ the NHI's E2E credit state and needs a different reclaim than `tb_ring_stop` /
 `zc_read` stays **off by default**. Per this goal's contract it is not flipped:
 the 20-run streak has not been achieved (best: 5 consecutive passes, two of them
 with the recovery path firing and completing byte-for-byte).
+
+### Round eight: ring state instrumented — and no natural timeout in 15 runs
+
+The ring and QP state the previous round asked for is now visible, both live and
+frozen at the moment a stall is detected:
+
+- `native_stats` appends, after every existing counter (the smoke tool's
+  fixed-order read of the first six is unaffected), `zdata`, `data_tx_head`,
+  `data_tx_tail`, `data_rx_head`, `data_rx_tail` and `zdata_posted`, plus, while
+  a QP exists, `qp_zc_received`, `qp_zc_total`, `qp_zc_expect`,
+  `qp_zc_read_staged` and `qp_zc_read_armed`. The old combined `data_tx a/b`,
+  `data_rx a/b` and `qp_zc_received a/b` lines are now separate named fields,
+  and `zdata` prints at bring-up, not only while a QP is bound.
+- A new `stall_snap` attribute holds two frozen snapshots. `drain_*` is taken
+  when the responder waits for its data TX ring to drain under a READ fallback
+  (the latest wait, at most one per millisecond). `err_*` is taken at a QP's
+  first error other than a flush, before the flush clears the state. Each holds
+  the driver's ring indices, the QP's zero-copy and response state, and the
+  NHI's own view of both data rings from `tb_ring_get_stats()`:
+  `hw_posted`/`hw_completed`, `queued`, `in_flight`. That last part answers the
+  open question directly: whether the hardware still owns posted RX descriptors
+  when frames stop arriving.
+
+**Hardware: fresh reboot with `zc_read=1` on the instrumented build, 15
+consecutive `read 2000` runs, all PASS byte-for-byte** (16,777,216,000 B per
+direction, both sides, 410–415 MiB/s). Every READ counter delta is zero on both
+hosts in every run: no `zc_read_retx`, no fallback, no drain wait, and
+`drain_count = err_count = 0`. That is 30,000 zero-copy READs without one
+timeout. Rounds 5–7 each saw their first timeout within the first 2–6 runs of
+the boot.
+
+What it shows: zero-copy READ is solid when nothing times out. The residual
+lives entirely in the recovery path, and that path's trigger, a natural READ
+timeout, is rare and varies from boot to boot. No stall was captured, so the
+branch question is still open. Capturing one reliably needs the timeout to be
+*induced*: make the requester time out a zero-copy READ while the responder's
+burst is still live. That is the precondition of every failure captured so far.

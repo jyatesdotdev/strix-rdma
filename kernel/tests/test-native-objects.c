@@ -89,6 +89,7 @@ static unsigned unpins, completions, events, scheduled;
 static void ib_umem_release(struct fake_umem *p) { assert(p); unpins++; }
 static void sn_schedule(struct sn_device *d) { assert(!d->lock); scheduled++; }
 static void sn_engine_reset(struct sn_qp *q) { (void)q; }
+static void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status) { (void)d; (void)q; (void)status; }
 static u64 ktime_get_ns(void) { return 100; }
 #include "native-objects.inc"
 static void on_completion(struct ib_cq *cq, void *context) { (void)cq; (void)context; completions++; }

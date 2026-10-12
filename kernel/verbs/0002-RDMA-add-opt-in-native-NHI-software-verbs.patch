@@ -459,7 +459,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,296 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -589,6 +589,22 @@ new file mode 100644
 +	bool zc_held;
 +	struct sn_header zc_held_header;
 +};
++/* Ring and QP state frozen where a zero-copy stall is detected, before the QP
++ * error flushes it: the responder's latest wait for its data TX ring to drain
++ * under a READ fallback, and the latest QP error other than a flush on either
++ * side. tx/rx are the NHI's own view of the data rings (tb_ring_get_stats):
++ * hw_posted/hw_completed say whether the hardware still owns descriptors.
++ * Diagnostics only; read through the stall_snap attribute. */
++struct sn_stall_snap {
++	u64 count, at_ns;
++	int status, tx_ret, rx_ret;
++	u32 data_tx_head, data_tx_tail, data_rx_head, data_rx_tail, zdata_posted;
++	u32 zc_received, zc_total, response_offset;
++	int zc_expect;
++	unsigned int zc_state;
++	bool qp, zc_read_staged, zc_read_armed, response_active, response_sent, response_fallback;
++	struct tb_ring_stats tx, rx;
++};
 +struct sn_slot {
 +	struct ring_frame frame;
 +	struct sn_device *device;
@@ -655,6 +671,7 @@ new file mode 100644
 +	u64 zc_read_fallback, zc_read_fallback_served;
 +	/* Responder-side exits of the zero-copy READ fallback path (diagnostic). */
 +	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
++	struct sn_stall_snap snap_drain, snap_err;
 +	struct list_head mrs;
 +	struct sn_qp *qp;
 +	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
@@ -722,6 +739,9 @@ new file mode 100644
 +/* Abort an in-progress burst and reclaim both data rings (called from
 + * sn_engine_reset so an aborted burst cannot poison the rings). */
 +void sn_data_abort(struct sn_device *d);
++/* Freeze the ring and QP state for diagnosis: status 0 records a drain wait
++ * (at most once per millisecond), anything else a QP error with that status. */
++void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status);
 +/* True once every burst frame this host posted has been consumed by the NHI.
 + * The zero-copy retry path must not restart a burst while frames are still
 + * queued: they cannot be recalled, and the peer counts them into the new attempt
@@ -1289,7 +1309,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,545 @@
+@@ -0,0 +1,574 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1780,6 +1800,35 @@ new file mode 100644
 +	d->data_rx_head = d->data_rx_tail;
 +	d->zdata_posted = 0;
 +}
++void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status)
++{
++	struct sn_stall_snap *s = status ? &d->snap_err : &d->snap_drain;
++	u64 now = ktime_get_ns(), count = s->count + 1;
++	bool rings;
++
++	lockdep_assert_held(&d->lock);
++	if (!status && s->count && now - s->at_ns < NSEC_PER_MSEC)
++		return;
++	memset(s, 0, sizeof(*s));
++	s->count = count; s->at_ns = now; s->status = status;
++	s->data_tx_head = d->data_tx_head; s->data_tx_tail = d->data_tx_tail;
++	s->data_rx_head = d->data_rx_head; s->data_rx_tail = d->data_rx_tail;
++	s->zdata_posted = d->zdata_posted;
++	if (q) {
++		s->qp = true;
++		s->zc_received = q->zc_received; s->zc_total = q->zc_total;
++		s->zc_expect = q->zc_expect; s->zc_state = q->zc_state;
++		s->zc_read_staged = q->zc_read_staged;
++		s->zc_read_armed = q->zc_read_armed;
++		s->response_active = q->response_active;
++		s->response_sent = q->response_sent;
++		s->response_fallback = q->response_fallback;
++		s->response_offset = q->response_offset;
++	}
++	rings = d->zdata && !d->dead && d->data_tx_ring && d->data_rx_ring;
++	s->tx_ret = rings ? tb_ring_get_stats(d->data_tx_ring, &s->tx) : -ENODEV;
++	s->rx_ret = rings ? tb_ring_get_stats(d->data_rx_ring, &s->rx) : -ENODEV;
++}
 +void sn_data_receive(struct sn_device *d)
 +{
 +	int i;
@@ -1839,7 +1888,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/str
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/verbs.c
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,553 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/random.h>
 +#include <linux/vmalloc.h>
@@ -1928,6 +1977,9 @@ new file mode 100644
 +}
 +void sn_qp_error(struct sn_qp *q, enum ib_wc_status status)
 +{
++	/* Freeze the state that caused the first failure before the flush resets it. */
++	if (status != IB_WC_WR_FLUSH_ERR && q->attr.qp_state != IB_QPS_ERR)
++		sn_stall_snapshot(sn_dev(q->ib.device), q, status);
 +	sn_flush_qp(q, status, true);
 +}
 +static int sn_query_device(struct ib_device *ib, struct ib_device_attr *a,
@@ -2307,23 +2359,70 @@ new file mode 100644
 +		d->zc_read_fallback, d->zc_read_fallback_served,
 +		d->zc_fb_wait_midpost, d->zc_fb_wait_drain, d->zc_fb_reserve,
 +		d->zc_read_req_drop, d->zc_resp_retry_exc, d->zc_resp_start_exc);
++	n += sysfs_emit_at(buf, n,
++		"zdata %d\ndata_tx_head %u\ndata_tx_tail %u\ndata_rx_head %u\n"
++		"data_rx_tail %u\nzdata_posted %u\n",
++		d->zdata, d->data_tx_head, d->data_tx_tail,
++		d->data_rx_head, d->data_rx_tail, d->zdata_posted);
 +	if (d->qp) {
 +		struct sn_qp *q = d->qp;
 +
 +		n += sysfs_emit_at(buf, n,
-+			"zdata %d\ndata_tx %u/%u\ndata_rx %u/%u\nzdata_posted %u\n"
 +			"qp_sq %u\nqp_rq %u\nqp_zc_state %u\nqp_zc_offset %u\n"
-+			"qp_zc_expect %d\nqp_zc_received %u/%u\nqp_next_seq %llu\n",
-+			d->zdata, d->data_tx_head, d->data_tx_tail,
-+			d->data_rx_head, d->data_rx_tail, d->zdata_posted,
++			"qp_zc_expect %d\nqp_zc_received %u\nqp_zc_total %u\n"
++			"qp_zc_read_staged %d\nqp_zc_read_armed %d\nqp_next_seq %llu\n",
 +			q->sq_count, q->rq_count, q->zc_state, q->zc_offset,
-+			q->zc_expect, q->zc_received, q->zc_total, q->next_sequence);
++			q->zc_expect, q->zc_received, q->zc_total,
++			q->zc_read_staged, q->zc_read_armed, q->next_sequence);
 +	}
 +	mutex_unlock(&d->lock);
 +	return n;
 +}
 +static DEVICE_ATTR_RO(native_stats);
-+static struct attribute *sn_attributes[] = { &dev_attr_native_stats.attr, NULL };
++static ssize_t sn_snap_emit(char *buf, ssize_t n, const char *p,
++			    const struct sn_stall_snap *s, u64 now)
++{
++	const struct tb_ring_stats *r[2] = { &s->tx, &s->rx };
++	int i;
++
++	n += sysfs_emit_at(buf, n,
++		"%s_count %llu\n%s_age_ms %llu\n%s_status %d\n"
++		"%s_data_tx_head %u\n%s_data_tx_tail %u\n%s_data_rx_head %u\n"
++		"%s_data_rx_tail %u\n%s_zdata_posted %u\n%s_qp %d\n"
++		"%s_zc_received %u\n%s_zc_total %u\n%s_zc_expect %d\n%s_zc_state %u\n"
++		"%s_zc_read_staged %d\n%s_zc_read_armed %d\n%s_response %d/%d/%d/%u\n",
++		p, s->count, p, s->count ? div_u64(now - s->at_ns, NSEC_PER_MSEC) : 0,
++		p, s->status, p, s->data_tx_head, p, s->data_tx_tail,
++		p, s->data_rx_head, p, s->data_rx_tail, p, s->zdata_posted, p, s->qp,
++		p, s->zc_received, p, s->zc_total, p, s->zc_expect, p, s->zc_state,
++		p, s->zc_read_staged, p, s->zc_read_armed, p, s->response_active,
++		s->response_sent, s->response_fallback, s->response_offset);
++	for (i = 0; i < 2; i++)
++		n += sysfs_emit_at(buf, n,
++			"%s_hw_%s ret=%d head=%u tail=%u hw_posted=%u hw_completed=%u queued=%u in_flight=%u posted=%llu completed=%llu running=%d irq_en=%d hw_valid=%d tail_flags=%#x\n",
++			p, i ? "rx" : "tx", i ? s->rx_ret : s->tx_ret, r[i]->head, r[i]->tail,
++			r[i]->hw_posted, r[i]->hw_completed, r[i]->queued, r[i]->in_flight,
++			r[i]->descriptors_posted, r[i]->descriptors_completed, r[i]->running,
++			r[i]->interrupt_enabled, r[i]->hw_valid, r[i]->tail_flags);
++	return n;
++}
++/* Frozen stall snapshots (see struct sn_stall_snap): "drain" is the
++ * responder's latest wait for its data TX ring under a READ fallback, "err" the
++ * latest QP error other than a flush. response is active/sent/fallback/offset. */
++static ssize_t stall_snap_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct sn_device *d = sn_dev(container_of(dev, struct ib_device, dev));
++	u64 now = ktime_get_ns();
++	ssize_t n;
++
++	mutex_lock(&d->lock);
++	n = sn_snap_emit(buf, 0, "drain", &d->snap_drain, now);
++	n = sn_snap_emit(buf, n, "err", &d->snap_err, now);
++	mutex_unlock(&d->lock);
++	return n;
++}
++static DEVICE_ATTR_RO(stall_snap);
++static struct attribute *sn_attributes[] = { &dev_attr_native_stats.attr, &dev_attr_stall_snap.attr, NULL };
 +static const struct attribute_group sn_device_group = { .attrs = sn_attributes };
 +const struct ib_device_ops sn_verbs_ops = {
 +	.owner = THIS_MODULE, .driver_id = RDMA_DRIVER_UNKNOWN,
@@ -2522,7 +2621,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,1002 @@
+@@ -0,0 +1,1004 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -3326,8 +3425,10 @@ new file mode 100644
 +				d->zc_fb_wait_midpost++;
 +				q->response_sent = true;
 +			}
-+			else if (q->response_offset && !sn_data_tx_drained(d))
++			else if (q->response_offset && !sn_data_tx_drained(d)) {
 +				d->zc_fb_wait_drain++;
++				sn_stall_snapshot(d, q, 0);
++			}
 +			else if (sn_response_to_staged(d, q)) {
 +				sn_qp_error(q, IB_WC_GENERAL_ERR); return;
 +			}

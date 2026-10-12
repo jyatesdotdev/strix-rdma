@@ -127,6 +127,22 @@ struct sn_qp {
 	bool zc_held;
 	struct sn_header zc_held_header;
 };
+/* Ring and QP state frozen where a zero-copy stall is detected, before the QP
+ * error flushes it: the responder's latest wait for its data TX ring to drain
+ * under a READ fallback, and the latest QP error other than a flush on either
+ * side. tx/rx are the NHI's own view of the data rings (tb_ring_get_stats):
+ * hw_posted/hw_completed say whether the hardware still owns descriptors.
+ * Diagnostics only; read through the stall_snap attribute. */
+struct sn_stall_snap {
+	u64 count, at_ns;
+	int status, tx_ret, rx_ret;
+	u32 data_tx_head, data_tx_tail, data_rx_head, data_rx_tail, zdata_posted;
+	u32 zc_received, zc_total, response_offset;
+	int zc_expect;
+	unsigned int zc_state;
+	bool qp, zc_read_staged, zc_read_armed, response_active, response_sent, response_fallback;
+	struct tb_ring_stats tx, rx;
+};
 struct sn_slot {
 	struct ring_frame frame;
 	struct sn_device *device;
@@ -193,6 +209,7 @@ struct sn_device {
 	u64 zc_read_fallback, zc_read_fallback_served;
 	/* Responder-side exits of the zero-copy READ fallback path (diagnostic). */
 	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
+	struct sn_stall_snap snap_drain, snap_err;
 	struct list_head mrs;
 	struct sn_qp *qp;
 	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
@@ -260,6 +277,9 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 /* Abort an in-progress burst and reclaim both data rings (called from
  * sn_engine_reset so an aborted burst cannot poison the rings). */
 void sn_data_abort(struct sn_device *d);
+/* Freeze the ring and QP state for diagnosis: status 0 records a drain wait
+ * (at most once per millisecond), anything else a QP error with that status. */
+void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status);
 /* True once every burst frame this host posted has been consumed by the NHI.
  * The zero-copy retry path must not restart a burst while frames are still
  * queued: they cannot be recalled, and the peer counts them into the new attempt
