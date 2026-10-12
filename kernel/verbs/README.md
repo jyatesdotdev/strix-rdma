@@ -579,10 +579,14 @@ forced and firing in every run. The full record, from the bidirectional deadlock
 through rounds one to ten, is in `docs/ZEROCOPY_VERBS.md`; its "Outcome" section
 states the current behaviour.
 
-Also not yet run:
-hot-unplug/malformed-peer injection; sustained multi-hour endurance; an
-end-to-end inference re-run over the zero-copy data plane (the earlier proven run
-predates it). Do not describe this bounded experimental implementation as
+Endurance (2026-10-12): 120 consecutive verified runs, 40 rounds of `write
+2000`, `send 2000` and `read 2000`, passed byte-for-byte over 90 minutes on one
+boot. That is about 1.83 TiB per direction, with `bad_frames 0` and no QP error.
+See `docs/ZEROCOPY_VERBS.md`, round fourteen.
+
+Also not yet run: hot-unplug/malformed-peer injection, and an end-to-end
+inference re-run over the zero-copy data plane (the earlier proven run predates
+it). Do not describe this bounded experimental implementation as
 complete RC or production-ready.
 
 **Mixed-version pairs fail rather than degrade.** `SN_ZC_WRITE` is opcode 14 and

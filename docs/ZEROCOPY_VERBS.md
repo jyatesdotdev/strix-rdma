@@ -1265,3 +1265,26 @@ which is followed by no further request from that requester, eventually fails
 the responder's QP. The responder never re-bursts, and the requester only
 re-sends a READ_ACK when it sees a duplicate reply. A connection that goes
 idle right after a READ whose ACK was lost would hit it.
+
+## Round fourteen (2026-10-12): 90-minute endurance
+
+This ran on the round-thirteen build with every fault parameter at 0, on the
+same boot, right after the ACK-loss runs. It was 40 rounds of `write 2000`,
+`send 2000` and `read 2000`, each run verified byte-for-byte on both sides
+(16,777,216,000 B per direction per run), stopping at the first failure.
+
+**120/120 PASS in 5,445 s.** In total that is 2,013,265,920,000 B (about 1.83
+TiB) per direction verified. Both hosts' `placed_send_bytes`,
+`placed_write_bytes` and `placed_read_bytes` match the expected totals for the
+boot exactly, `bad_frames` stayed 0, and no QP errored (`err_count` 0).
+
+| mode | runs | MiB/s min / median / max | runs with a natural timeout |
+|---|---|---|---|
+| `write 2000` | 40 | 427.48 / 438.70 / 453.50 | 4 (5 ACK probes) |
+| `send 2000` | 40 | 445.76 / 452.78 / 457.25 | 0 |
+| `read 2000` | 40 | 406.32 / 412.23 / 415.02 | 18 (25 fallbacks, all 25 served) |
+
+The natural timeouts are round twelve's withheld last frame. This boot was a
+prone one for READ. WRITE is now visibly hit too: 5 ACK probes after drained
+timeouts, each recovered. `max_pass_gap_us` reached 14,967 and 28,829 over the
+boot.

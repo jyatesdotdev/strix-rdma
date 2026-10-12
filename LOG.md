@@ -1,6 +1,15 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — 90-minute endurance: 120/120
+- 40 rounds of verified `write 2000`, `send 2000` and `read 2000` on one boot,
+  all fault injection off. All 120 runs passed byte-for-byte in 5,445 s, about
+  1.83 TiB per direction, with `bad_frames 0` and no QP error.
+- Medians: write 438.70, send 452.78 and read 412.23 MiB/s.
+- Natural timeouts, all recovered: 18 READ runs (25 fallbacks, all served) and
+  4 WRITE runs (5 ACK probes).
+- `docs/ZEROCOPY_VERBS.md`, round fourteen.
+
 ## 2026-10-12 — ACK loss injected at volume
 - `ack_drop=N` drops every Nth ACK or READ_ACK. With `ack_drop=100`, 3 runs
   each of `write 2000`, `send 2000` and `read 2000` passed byte-for-byte, about
