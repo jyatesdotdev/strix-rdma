@@ -712,3 +712,35 @@ timeout with frames still queued must not double-burst or overshoot; a staged
 `SN_READ` must be accepted as the same operation as the `SN_ZC_READ` it replaces;
 and the landed bytes must equal the source byte-for-byte. Hardware: `zc_read_fallback`
 must be non-zero in at least one passing `read 2000` run of the 20-run streak.
+
+### Fifth hardware round: staged fallback validated in part — streak broken at run 5
+
+Fresh reboot with `zc_read=1` on the `18de548` build, `read 2000` streak
+(evidence per run: byte counts on both sides plus counter deltas on both hosts):
+
+| run | result | max (deltas) | max2 (deltas) |
+|---|---|---|---|
+| 1–3 | PASS, 411–413 MiB/s, 16,777,216,000 B/direction both sides | — | — |
+| **4** | **PASS**, 411.80 MiB/s, byte-for-byte | `zc_read_retx` 1, `zc_read_fallback` 1 | `zc_read_fallback_served` 1 |
+| **5** | **FAIL**, RETRY_EXC at iter 832 slot 3 on max | `zc_read_retx` 7, `zc_read_fallback` 4, `served` 1 | `zc_read_retx` 2, `zc_read_fallback` 1, `served` 3 |
+
+What it proves:
+
+- **The recovery path fires on hardware and works when it does** (run 4): a
+  zero-copy READ timed out, fell back to a staged `SN_READ`, was served from a
+  snapshot, and the run completed byte-for-byte.
+- **The catastrophic mode is gone.** After run 5 failed, the default SEND smoke
+  *passed on the same boot*. In round 4 the same kind of failure stranded the data
+  TX ring and broke zero-copy SEND until reboot. Removing the requester's RX
+  restart on timeout fixed that.
+- **A residual remains:** max initiated 4 fallbacks, max2 served 3, and max then
+  exhausted its retries on one. Some staged `SN_READ` was not answered by the
+  responder — no corruption, no wedge, one QP failed loudly.
+
+Candidate mechanisms, none yet confirmed: the responder holding `response_fallback`
+while waiting for `sn_data_tx_drained()` and burning its own `response_retries`
+under the zero-copy deadline; the fallback replay meeting a `read_request` already
+released by a subsequent operation; or a benign counter gap where the original
+`SN_ZC_READ` never committed, so the fallback was served as a fresh staged READ
+that `zc_read_fallback_served` does not count. Distinguishing them needs counters on
+each exit of the responder's staged-`SN_READ` replay branch. `zc_read` stays **off**.
