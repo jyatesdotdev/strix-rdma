@@ -646,3 +646,69 @@ Together these rule out every recovery that keeps using the data ring after a
 timeout. That is the case for the staged fallback: once a READ times out, the
 requester stops expecting the data ring for that operation entirely and fetches
 the bytes through header'd, offset-addressed control-ring fragments.
+
+## Design: staged-SN_READ recovery for zero-copy READ
+
+Zero-copy is the fast path; recovery is staged. Driven by the fourth round above:
+the requester must never stop/start its data RX ring under a live peer burst, and
+every recovery that keeps using the data ring after a timeout is ruled out.
+
+**Requester, on a zero-copy READ response timeout** (the `zc_read_armed` branch
+of the SQ retry path, which today zeroes `zc_received` and calls
+`sn_data_recv_restart()`):
+
+1. Do **not** restart the RX ring and do not zero `zc_received`. The landing zone
+   stays armed and its buffers stay posted, so any frames the responder already
+   queued land and the responder's TX ring can drain. This is the answer to the
+   E2E stall question: buffers are never withdrawn under a live burst.
+2. Set `zc_read_fallback` and retransmit the same operation as a **staged
+   `SN_READ`** — same sequence, `total`, `address`, `rkey`; only the opcode
+   differs. Count `zc_read_fallback`.
+3. While falling back, the data-RX harvest keeps accounting (the overshoot guard
+   stays live), but reaching `zc_total` no longer completes the WQE: completion is
+   owned by the staged path. Late zero-copy frames carry the same source bytes the
+   staged reply will.
+4. When the staged `SN_READ_REPLY` is fully assembled, the responder has
+   guaranteed (below) that its data TX ring drained before sending it, and E2E
+   neither loses nor reorders frames, so nothing from the zero-copy attempt can
+   still arrive. Only now is the landing zone disarmed and the RX ring reclaimed
+   with `sn_data_recv_restart()` — safe because no peer burst is live. Then place,
+   complete and send `SN_READ_ACK` exactly as the staged path does today.
+5. Further timeouts retransmit the staged `SN_READ` through the existing staged
+   retry machinery, bounded by `retry_cnt`.
+
+**Cross-path replay identity.** `sn_same_operation()` compares `opcode`, so a
+staged `SN_READ` reusing the sequence of a committed `SN_ZC_READ` currently yields
+`SN_FRAGMENT_INVALID` and an `IB_WC_REM_INV_REQ_ERR` on the responder. The
+comparison treats `SN_ZC_READ` and `SN_READ` as one operation class when sequence,
+`total`, `address` and `rkey` all match. No wire field changes meaning; this is
+local identity logic only. Every other opcode still compares exactly.
+
+**Responder, on that staged `SN_READ` replay of a zero-copy response**:
+
+1. A burst that has started queueing always finishes (the existing invariant), so
+   if the zero-copy reply is mid-post it keeps posting until `response_sent`.
+2. Once fully posted, it waits for `sn_data_tx_drained()` — the same barrier the
+   response-retry path uses, bounded by the same retry budget.
+3. Then it snapshots the retained source MR into `read_snapshot`, switches
+   `read_request.opcode` to `SN_READ`, and serves the staged reply through
+   `sn_fragments_send()`. The staged reply therefore regains the snapshot guarantee
+   for retries. Count `zc_read_fallback_served`. `remote_mr` is still released on
+   `SN_READ_ACK`.
+4. If the zero-copy reply never started (offset 0, nothing queued), it switches to
+   staged immediately.
+
+The previous rearm logic for a duplicate `SN_ZC_READ` (re-burst only when drained)
+is removed from the recovery path: a requester that times out no longer sends a
+duplicate `SN_ZC_READ` at all, it sends `SN_READ`.
+
+**Interactions.** While falling back the requester keeps `zc_expect`, so a
+crossing inbound SEND/WRITE descriptor is still held (`zc_held`) until the landing
+zone is disarmed, with the peer's retransmit as backstop, exactly as today.
+
+**Proof obligations** (task 3 writes these failing first): a READ timeout whose
+frames never land must complete via the staged path instead of deadlocking; a
+timeout with frames still queued must not double-burst or overshoot; a staged
+`SN_READ` must be accepted as the same operation as the `SN_ZC_READ` it replaces;
+and the landed bytes must equal the source byte-for-byte. Hardware: `zc_read_fallback`
+must be non-zero in at least one passing `read 2000` run of the 20-run streak.
