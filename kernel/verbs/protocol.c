@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "strix_nhi.h"
 
+/* zc_send_fault modes (sn_qp.zc_send_fault); 0 is no fault. */
+#define SN_FAULT_READY_LOST	1
+#define SN_FAULT_READY_LATE	2
+
 /* Session handshake is wire-carried over the native rings. Static discovery
  * uses only immediate service properties (rxhop); epochs/generations in the
  * frames themselves reject stale sessions. HELLO/HELLO_ACK establish the
@@ -183,6 +187,7 @@ void sn_engine_reset(struct sn_qp *q)
 	q->zc_read_armed = false; q->zc_held = false;
 	q->zc_read_staged = false; q->response_fallback = false;
 	q->zc_read_reply_ready = false;
+	q->zc_send_fault = 0; q->zc_ready_held = false;
 	memset(&q->receive, 0, sizeof(q->receive));
 	memset(&q->read_receive, 0, sizeof(q->read_receive));
 	/* Reclaim the data rings so this aborted burst cannot leave posted RX
@@ -431,14 +436,21 @@ static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 		return;
 	}
 	if (q->receive.active) {
-		/* Duplicate descriptor: the sender is retrying. Restart the burst
-		 * from offset zero; partially landed bytes are rewritten identically. */
+		/* Duplicate descriptor for the receive in progress: the sender's
+		 * ZC_READY was lost or late, or it is probing for an ACK. Never restart
+		 * the data RX ring here -- a one-sided restart starves the sender's data
+		 * TX of E2E credits, so its burst is never sent (hardware round eleven).
+		 * Nothing needs restarting: a sender bursts each operation exactly once,
+		 * and only after a ZC_READY that found it waiting. With nothing landed
+		 * the posted landing zone is still exactly right for that burst, so
+		 * answer ZC_READY again; once bytes are landing the burst is live and
+		 * completes on its own, and the ACK goes out when it does. */
 		if (!sn_same_operation(&q->receive.operation, h) || !q->zc_expect) {
 			sn_ack(q, SN_ACK, h->sequence, SN_PROTOCOL);
 			sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
 		}
-		q->zc_received = 0;
-		if (!sn_data_recv_restart(d, q))
+		d->zc_desc_dup++;
+		if (!q->zc_received)
 			sn_ack(q, SN_ZC_READY, h->sequence, 0);
 		return;
 	}
@@ -533,6 +545,14 @@ static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 static void sn_receive_zc_ready(struct sn_qp *q, const struct sn_header *h)
 {
 	if (q->zc_state != SN_ZC_WAIT || h->ack_sequence != q->next_sequence) return;
+	if (q->zc_send_fault) {
+		/* zc_send_fault: this READY is lost, or held and applied right after
+		 * the descriptor retransmit (the late case). */
+		sn_dev(q->ib.device)->zc_send_fault_injected++;
+		q->zc_ready_held = q->zc_send_fault == SN_FAULT_READY_LATE;
+		q->zc_send_fault = 0;
+		return;
+	}
 	q->zc_state = SN_ZC_SENDING;
 }
 /* Data-ring drain hook: header-less payload bytes landed for the expected
@@ -753,6 +773,17 @@ static int sn_fragments_send(struct sn_device *d, struct sn_header *h, const u8 
 	} while (*offset < h->total);
 	return 0;
 }
+/* The zero-copy burst descriptor for an SQ SEND or WRITE. A ZC SEND lands in a
+ * buffer the peer posted, so it names no remote MR; a ZC WRITE keeps address and
+ * rkey so the responder places the header-less payload in the requester's MR. */
+static struct sn_header sn_zc_descriptor(struct sn_qp *q, const struct sn_wqe *w)
+{
+	struct sn_header h = sn_out_header(q, w->opcode == SN_WRITE ? SN_ZC_WRITE : SN_ZC_SEND);
+
+	h.sequence = q->next_sequence; h.total = w->length;
+	if (h.opcode == SN_ZC_WRITE) { h.address = w->remote_address; h.rkey = w->rkey; }
+	return h;
+}
 void sn_engine_progress(struct sn_device *d)
 {
 	struct sn_qp *q = d->qp;
@@ -896,6 +927,16 @@ void sn_engine_progress(struct sn_device *d)
 		}
 		q->active = true; q->outgoing_sent = false;
 		q->outgoing_offset = q->retries = q->rnr_retries = 0;
+		q->zc_send_fault = 0; q->zc_ready_held = false;
+		if (w->opcode != SN_READ && sn_zc_eligible(d, w)) {
+			/* One read: the parameter is writable at runtime. */
+			unsigned int every = READ_ONCE(sn_zc_send_fault);
+
+			d->zc_send_ops++;
+			if (every && !(d->zc_send_ops % every))
+				q->zc_send_fault = (d->zc_send_ops / every) % 2 ?
+					SN_FAULT_READY_LOST : SN_FAULT_READY_LATE;
+		}
 		memset(&q->read_receive, 0, sizeof(q->read_receive));
 		q->read_receive.expected = q->next_sequence;
 	}
@@ -915,6 +956,26 @@ void sn_engine_progress(struct sn_device *d)
 			if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
 				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 			}
+			q->deadline = now + sn_ack_timeout_ns(q->attr.timeout);
+			return;
+		}
+		if (q->zc_state == SN_ZC_SENT) {
+			/* The burst has drained, and E2E only transmits into posted
+			 * receive buffers, so every frame of it reached the peer: it is
+			 * never sent again. Only the ACK is missing, so re-send the
+			 * descriptor as a probe and stay SENT, where a ZC_READY is ignored.
+			 * The peer answers with the retained ACK once the burst has been
+			 * counted, or ignores the probe while it is still counting. A burst
+			 * the peer never counts fails with RETRY_EXC rather than re-bursting
+			 * into a landing zone that would need a ring restart. */
+			struct sn_header p = sn_zc_descriptor(q, w);
+
+			if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
+				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
+			}
+			ret = sn_ring_send(d, &p, NULL, false);
+			if (ret && ret != -EAGAIN) { sn_qp_error(q, IB_WC_GENERAL_ERR); return; }
+			d->zc_retries++; d->zc_ack_probe++;
 			q->deadline = now + sn_ack_timeout_ns(q->attr.timeout);
 			return;
 		}
@@ -994,15 +1055,17 @@ void sn_engine_progress(struct sn_device *d)
 				}
 				break;
 			}
-			/* A ZC SEND lands in a buffer the peer posted, so it names no
-			 * remote MR; a ZC WRITE must keep address/rkey so the responder
-			 * places the header-less payload in the requester's MR. */
-			h.opcode = w->opcode == SN_WRITE ? SN_ZC_WRITE : SN_ZC_SEND;
-			if (h.opcode == SN_ZC_SEND) { h.address = 0; h.rkey = 0; }
+			h = sn_zc_descriptor(q, w);
 			ret = sn_ring_send(d, &h, NULL, false);
 			if (!ret) {
 				q->zc_state = SN_ZC_WAIT; q->zc_offset = 0;
 				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
+				if (q->zc_ready_held) {
+					/* zc_send_fault: the first ZC_READY arrives only now,
+					 * after the retransmit is on the wire. */
+					q->zc_ready_held = false;
+					q->zc_state = SN_ZC_SENDING;
+				}
 			}
 			break;
 		case SN_ZC_SENDING:

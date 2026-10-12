@@ -35,6 +35,7 @@ extern bool sn_zc_write;
 /* Zero-copy RDMA READ kill-switch (default on), latched the same way. */
 extern bool sn_zc_read;
 extern unsigned int sn_zc_read_fault;
+extern unsigned int sn_zc_send_fault;
 #define SN_SERVICE "strixv1"
 #define SN_CONTROL_BYTES 112
 /* Handshake retransmission intervals; loss is expected, peers retransmit. */
@@ -126,6 +127,10 @@ struct sn_qp {
 	/* The staged reply of a fallen-back zero-copy READ is assembled and waits for
 	 * the abandoned burst to finish landing before the READ completes. */
 	bool zc_read_reply_ready;
+	/* zc_send_fault selection for this SEND/WRITE (SN_FAULT_*), and a ZC_READY
+	 * held back to be applied right after the descriptor retransmit. */
+	u8 zc_send_fault;
+	bool zc_ready_held;
 	/* Inbound burst descriptor held because the landing zone was busy with our
 	 * own zero-copy READ response; re-driven by sn_engine_progress as soon as it
 	 * frees. Header-less frames from two bursts could not be told apart, so one
@@ -217,6 +222,11 @@ struct sn_device {
 	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
 	/* Zero-copy READs requested, and timeouts forced on them by zc_read_fault. */
 	u64 zc_read_ops, zc_read_fault_injected;
+	/* Zero-copy SEND/WRITEs sent, zc_send_fault injections, and duplicate burst
+	 * descriptors that met a receive still in progress. */
+	u64 zc_send_ops, zc_send_fault_injected, zc_desc_dup;
+	/* Descriptor re-sends as ACK probes after a drained burst timed out. */
+	u64 zc_ack_probe;
 	struct sn_stall_snap snap_drain, snap_err;
 	struct list_head mrs;
 	struct sn_qp *qp;
@@ -276,12 +286,13 @@ dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len);
  * the data ring is full. sn_data_response_burst does the same for a zero-copy
  * READ response, which has no SQ WQE and bursts from the source MR the request
  * named. sn_data_recv_start posts the q->zc_mr pages at q->zc_address for the
- * expected burst; sn_data_recv_restart re-posts them from offset zero for a
- * retried burst. */
+ * expected burst. There is deliberately no way to restart a data RX ring on its
+ * own: hardware showed a one-sided restart starves the peer's data TX of E2E
+ * credits, so its next burst is never sent (docs/ZEROCOPY_VERBS.md, rounds nine
+ * and eleven). */
 int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
 int sn_data_response_burst(struct sn_device *d, struct sn_qp *q);
 int sn_data_recv_start(struct sn_device *d, struct sn_qp *q);
-int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 /* Abort an in-progress burst and reclaim both data rings (called from
  * sn_engine_reset so an aborted burst cannot poison the rings). */
 void sn_data_abort(struct sn_device *d);

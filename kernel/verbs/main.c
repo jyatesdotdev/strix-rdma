@@ -88,6 +88,16 @@ MODULE_PARM_DESC(zc_read,
  * a capture needs no reload; 0 (the default) never faults. */
 unsigned int sn_zc_read_fault;
 module_param_named(zc_read_fault, sn_zc_read_fault, uint, 0644);
+/* Fault injection for zero-copy SEND/WRITE recovery: every Nth zero-copy SEND
+ * or WRITE this host sends has its first ZC_READY lost (odd selections) or
+ * delivered late, right after the descriptor retransmit (even selections). Either
+ * way the receiver meets a duplicate descriptor for a receive in progress: with
+ * nothing landed yet, or with the burst landing. Writable at runtime; 0 (the
+ * default) never faults. */
+unsigned int sn_zc_send_fault;
+module_param_named(zc_send_fault, sn_zc_send_fault, uint, 0644);
+MODULE_PARM_DESC(zc_send_fault,
+	"Diagnostic: lose or delay the ZC_READY of every Nth zero-copy SEND/WRITE (default 0 = off)");
 MODULE_PARM_DESC(zc_read_fault,
 	"Diagnostic: force every Nth zero-copy READ to time out near its tail (default 0 = off)");
 

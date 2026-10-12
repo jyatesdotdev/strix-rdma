@@ -459,7 +459,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,315 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -497,6 +497,7 @@ new file mode 100644
 +/* Zero-copy RDMA READ kill-switch (default on), latched the same way. */
 +extern bool sn_zc_read;
 +extern unsigned int sn_zc_read_fault;
++extern unsigned int sn_zc_send_fault;
 +#define SN_SERVICE "strixv1"
 +#define SN_CONTROL_BYTES 112
 +/* Handshake retransmission intervals; loss is expected, peers retransmit. */
@@ -588,6 +589,10 @@ new file mode 100644
 +	/* The staged reply of a fallen-back zero-copy READ is assembled and waits for
 +	 * the abandoned burst to finish landing before the READ completes. */
 +	bool zc_read_reply_ready;
++	/* zc_send_fault selection for this SEND/WRITE (SN_FAULT_*), and a ZC_READY
++	 * held back to be applied right after the descriptor retransmit. */
++	u8 zc_send_fault;
++	bool zc_ready_held;
 +	/* Inbound burst descriptor held because the landing zone was busy with our
 +	 * own zero-copy READ response; re-driven by sn_engine_progress as soon as it
 +	 * frees. Header-less frames from two bursts could not be told apart, so one
@@ -679,6 +684,11 @@ new file mode 100644
 +	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
 +	/* Zero-copy READs requested, and timeouts forced on them by zc_read_fault. */
 +	u64 zc_read_ops, zc_read_fault_injected;
++	/* Zero-copy SEND/WRITEs sent, zc_send_fault injections, and duplicate burst
++	 * descriptors that met a receive still in progress. */
++	u64 zc_send_ops, zc_send_fault_injected, zc_desc_dup;
++	/* Descriptor re-sends as ACK probes after a drained burst timed out. */
++	u64 zc_ack_probe;
 +	struct sn_stall_snap snap_drain, snap_err;
 +	struct list_head mrs;
 +	struct sn_qp *qp;
@@ -738,12 +748,13 @@ new file mode 100644
 + * the data ring is full. sn_data_response_burst does the same for a zero-copy
 + * READ response, which has no SQ WQE and bursts from the source MR the request
 + * named. sn_data_recv_start posts the q->zc_mr pages at q->zc_address for the
-+ * expected burst; sn_data_recv_restart re-posts them from offset zero for a
-+ * retried burst. */
++ * expected burst. There is deliberately no way to restart a data RX ring on its
++ * own: hardware showed a one-sided restart starves the peer's data TX of E2E
++ * credits, so its next burst is never sent (docs/ZEROCOPY_VERBS.md, rounds nine
++ * and eleven). */
 +int sn_data_send_burst(struct sn_device *d, struct sn_qp *q);
 +int sn_data_response_burst(struct sn_device *d, struct sn_qp *q);
 +int sn_data_recv_start(struct sn_device *d, struct sn_qp *q);
-+int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 +/* Abort an in-progress burst and reclaim both data rings (called from
 + * sn_engine_reset so an aborted burst cannot poison the rings). */
 +void sn_data_abort(struct sn_device *d);
@@ -768,7 +779,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,557 @@
+@@ -0,0 +1,567 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -859,6 +870,16 @@ new file mode 100644
 + * a capture needs no reload; 0 (the default) never faults. */
 +unsigned int sn_zc_read_fault;
 +module_param_named(zc_read_fault, sn_zc_read_fault, uint, 0644);
++/* Fault injection for zero-copy SEND/WRITE recovery: every Nth zero-copy SEND
++ * or WRITE this host sends has its first ZC_READY lost (odd selections) or
++ * delivered late, right after the descriptor retransmit (even selections). Either
++ * way the receiver meets a duplicate descriptor for a receive in progress: with
++ * nothing landed yet, or with the burst landing. Writable at runtime; 0 (the
++ * default) never faults. */
++unsigned int sn_zc_send_fault;
++module_param_named(zc_send_fault, sn_zc_send_fault, uint, 0644);
++MODULE_PARM_DESC(zc_send_fault,
++	"Diagnostic: lose or delay the ZC_READY of every Nth zero-copy SEND/WRITE (default 0 = off)");
 +MODULE_PARM_DESC(zc_read_fault,
 +	"Diagnostic: force every Nth zero-copy READ to time out near its tail (default 0 = off)");
 +
@@ -1330,7 +1351,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,574 @@
+@@ -0,0 +1,557 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1778,23 +1799,6 @@ new file mode 100644
 +	d->zdata_posted = 0;
 +	return sn_zdata_repost(d, q);
 +}
-+/* A retried burst restarts from offset zero: flush the data RX ring (partial
-+ * postings from the previous attempt) and repost from the beginning. */
-+int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
-+{
-+	lockdep_assert_held(&d->lock);
-+	tb_ring_stop(d->data_rx_ring);
-+	tb_ring_start(d->data_rx_ring);
-+	/* tb_ring_stop joined the cancellation callbacks synchronously; drain
-+	 * them without reposting so head/tail stay consistent. */
-+	while (d->data_rx_tail != d->data_rx_head) {
-+		struct sn_slot *s = &d->data_rx[d->data_rx_tail % SN_RING_SIZE];
-+		if (!sn_slot_done(d, s)) break;
-+		d->data_rx_tail++;
-+	}
-+	d->zdata_posted = 0;
-+	return sn_zdata_repost(d, q);
-+}
 +/* Abort any in-progress zero-copy burst: stop+start both data rings (stop
 + * synchronously joins the cancellation callbacks), drain every completed /
 + * canceled slot so head/tail resync, and drop any slot that was queued but
@@ -1875,13 +1879,13 @@ new file mode 100644
 +		d->rx_frames++;
 +		if (d->qp && d->qp->zc_expect) {
 +			if (d->qp->zc_received + size > d->qp->zc_total) {
-+				/* Overshoot: frames from a superseded burst attempt are still
-+				 * arriving after a descriptor retransmit reset zc_received to
-+				 * zero. sn_data_recv_restart() flushes the frames this host
-+				 * already received, but it cannot recall frames still queued in
-+				 * the peer's data TX ring or on the wire, so the byte stream now
-+				 * describes parts of two attempts. Completing would hand the
-+				 * caller a buffer assembled from both -- and because the sync
++				/* Overshoot: more bytes than the burst holds. A sender bursts
++				 * each operation once and a receiver never restarts its ring, so
++				 * this needs a peer that broke the protocol -- for example one
++				 * running an older module that still re-bursts on retry -- and
++				 * the byte stream then describes parts of two attempts.
++				 * Completing would hand the caller a buffer assembled from
++				 * both -- and because the sync
 +				 * below keys on exact equality, it would also hand back pages
 +				 * never synced for the CPU. Fail the QP loudly instead of
 +				 * corrupting silently. */
@@ -1909,7 +1913,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/str
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/verbs.c
-@@ -0,0 +1,554 @@
+@@ -0,0 +1,556 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/random.h>
 +#include <linux/vmalloc.h>
@@ -2370,7 +2374,7 @@ new file mode 100644
 +	ssize_t n;
 +
 +	mutex_lock(&d->lock);
-+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\n",
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\nzc_send_ops %llu\nzc_send_fault_injected %llu\nzc_desc_dup %llu\nzc_ack_probe %llu\n",
 +		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 +		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_retries, d->zc_aborts,
 +		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
@@ -2380,7 +2384,9 @@ new file mode 100644
 +		d->zc_read_fallback, d->zc_read_fallback_served,
 +		d->zc_fb_wait_midpost, d->zc_fb_wait_drain, d->zc_fb_reserve,
 +		d->zc_read_req_drop, d->zc_resp_retry_exc, d->zc_resp_start_exc,
-+		d->zc_read_ops, d->zc_read_fault_injected);
++		d->zc_read_ops, d->zc_read_fault_injected,
++		d->zc_send_ops, d->zc_send_fault_injected, d->zc_desc_dup,
++		d->zc_ack_probe);
 +	n += sysfs_emit_at(buf, n,
 +		"zdata %d\ndata_tx_head %u\ndata_tx_tail %u\ndata_rx_head %u\n"
 +		"data_rx_tail %u\nzdata_posted %u\n",
@@ -2643,9 +2649,13 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,1036 @@
+@@ -0,0 +1,1099 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
++
++/* zc_send_fault modes (sn_qp.zc_send_fault); 0 is no fault. */
++#define SN_FAULT_READY_LOST	1
++#define SN_FAULT_READY_LATE	2
 +
 +/* Session handshake is wire-carried over the native rings. Static discovery
 + * uses only immediate service properties (rxhop); epochs/generations in the
@@ -2829,6 +2839,7 @@ new file mode 100644
 +	q->zc_read_armed = false; q->zc_held = false;
 +	q->zc_read_staged = false; q->response_fallback = false;
 +	q->zc_read_reply_ready = false;
++	q->zc_send_fault = 0; q->zc_ready_held = false;
 +	memset(&q->receive, 0, sizeof(q->receive));
 +	memset(&q->read_receive, 0, sizeof(q->read_receive));
 +	/* Reclaim the data rings so this aborted burst cannot leave posted RX
@@ -3077,14 +3088,21 @@ new file mode 100644
 +		return;
 +	}
 +	if (q->receive.active) {
-+		/* Duplicate descriptor: the sender is retrying. Restart the burst
-+		 * from offset zero; partially landed bytes are rewritten identically. */
++		/* Duplicate descriptor for the receive in progress: the sender's
++		 * ZC_READY was lost or late, or it is probing for an ACK. Never restart
++		 * the data RX ring here -- a one-sided restart starves the sender's data
++		 * TX of E2E credits, so its burst is never sent (hardware round eleven).
++		 * Nothing needs restarting: a sender bursts each operation exactly once,
++		 * and only after a ZC_READY that found it waiting. With nothing landed
++		 * the posted landing zone is still exactly right for that burst, so
++		 * answer ZC_READY again; once bytes are landing the burst is live and
++		 * completes on its own, and the ACK goes out when it does. */
 +		if (!sn_same_operation(&q->receive.operation, h) || !q->zc_expect) {
 +			sn_ack(q, SN_ACK, h->sequence, SN_PROTOCOL);
 +			sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
 +		}
-+		q->zc_received = 0;
-+		if (!sn_data_recv_restart(d, q))
++		d->zc_desc_dup++;
++		if (!q->zc_received)
 +			sn_ack(q, SN_ZC_READY, h->sequence, 0);
 +		return;
 +	}
@@ -3179,6 +3197,14 @@ new file mode 100644
 +static void sn_receive_zc_ready(struct sn_qp *q, const struct sn_header *h)
 +{
 +	if (q->zc_state != SN_ZC_WAIT || h->ack_sequence != q->next_sequence) return;
++	if (q->zc_send_fault) {
++		/* zc_send_fault: this READY is lost, or held and applied right after
++		 * the descriptor retransmit (the late case). */
++		sn_dev(q->ib.device)->zc_send_fault_injected++;
++		q->zc_ready_held = q->zc_send_fault == SN_FAULT_READY_LATE;
++		q->zc_send_fault = 0;
++		return;
++	}
 +	q->zc_state = SN_ZC_SENDING;
 +}
 +/* Data-ring drain hook: header-less payload bytes landed for the expected
@@ -3399,6 +3425,17 @@ new file mode 100644
 +	} while (*offset < h->total);
 +	return 0;
 +}
++/* The zero-copy burst descriptor for an SQ SEND or WRITE. A ZC SEND lands in a
++ * buffer the peer posted, so it names no remote MR; a ZC WRITE keeps address and
++ * rkey so the responder places the header-less payload in the requester's MR. */
++static struct sn_header sn_zc_descriptor(struct sn_qp *q, const struct sn_wqe *w)
++{
++	struct sn_header h = sn_out_header(q, w->opcode == SN_WRITE ? SN_ZC_WRITE : SN_ZC_SEND);
++
++	h.sequence = q->next_sequence; h.total = w->length;
++	if (h.opcode == SN_ZC_WRITE) { h.address = w->remote_address; h.rkey = w->rkey; }
++	return h;
++}
 +void sn_engine_progress(struct sn_device *d)
 +{
 +	struct sn_qp *q = d->qp;
@@ -3542,6 +3579,16 @@ new file mode 100644
 +		}
 +		q->active = true; q->outgoing_sent = false;
 +		q->outgoing_offset = q->retries = q->rnr_retries = 0;
++		q->zc_send_fault = 0; q->zc_ready_held = false;
++		if (w->opcode != SN_READ && sn_zc_eligible(d, w)) {
++			/* One read: the parameter is writable at runtime. */
++			unsigned int every = READ_ONCE(sn_zc_send_fault);
++
++			d->zc_send_ops++;
++			if (every && !(d->zc_send_ops % every))
++				q->zc_send_fault = (d->zc_send_ops / every) % 2 ?
++					SN_FAULT_READY_LOST : SN_FAULT_READY_LATE;
++		}
 +		memset(&q->read_receive, 0, sizeof(q->read_receive));
 +		q->read_receive.expected = q->next_sequence;
 +	}
@@ -3561,6 +3608,26 @@ new file mode 100644
 +			if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
 +				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 +			}
++			q->deadline = now + sn_ack_timeout_ns(q->attr.timeout);
++			return;
++		}
++		if (q->zc_state == SN_ZC_SENT) {
++			/* The burst has drained, and E2E only transmits into posted
++			 * receive buffers, so every frame of it reached the peer: it is
++			 * never sent again. Only the ACK is missing, so re-send the
++			 * descriptor as a probe and stay SENT, where a ZC_READY is ignored.
++			 * The peer answers with the retained ACK once the burst has been
++			 * counted, or ignores the probe while it is still counting. A burst
++			 * the peer never counts fails with RETRY_EXC rather than re-bursting
++			 * into a landing zone that would need a ring restart. */
++			struct sn_header p = sn_zc_descriptor(q, w);
++
++			if (!sn_retry_take(&q->retries, q->attr.retry_cnt)) {
++				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
++			}
++			ret = sn_ring_send(d, &p, NULL, false);
++			if (ret && ret != -EAGAIN) { sn_qp_error(q, IB_WC_GENERAL_ERR); return; }
++			d->zc_retries++; d->zc_ack_probe++;
 +			q->deadline = now + sn_ack_timeout_ns(q->attr.timeout);
 +			return;
 +		}
@@ -3640,15 +3707,17 @@ new file mode 100644
 +				}
 +				break;
 +			}
-+			/* A ZC SEND lands in a buffer the peer posted, so it names no
-+			 * remote MR; a ZC WRITE must keep address/rkey so the responder
-+			 * places the header-less payload in the requester's MR. */
-+			h.opcode = w->opcode == SN_WRITE ? SN_ZC_WRITE : SN_ZC_SEND;
-+			if (h.opcode == SN_ZC_SEND) { h.address = 0; h.rkey = 0; }
++			h = sn_zc_descriptor(q, w);
 +			ret = sn_ring_send(d, &h, NULL, false);
 +			if (!ret) {
 +				q->zc_state = SN_ZC_WAIT; q->zc_offset = 0;
 +				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
++				if (q->zc_ready_held) {
++					/* zc_send_fault: the first ZC_READY arrives only now,
++					 * after the retransmit is on the wire. */
++					q->zc_ready_held = false;
++					q->zc_state = SN_ZC_SENDING;
++				}
 +			}
 +			break;
 +		case SN_ZC_SENDING:

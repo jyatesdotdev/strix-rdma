@@ -63,6 +63,8 @@ struct sn_qp {
 	u64 zc_address;
 	bool zc_read_armed, zc_held, zc_read_staged, response_fallback, zc_read_fault;
 	bool zc_read_reply_ready;
+	u8 zc_send_fault;
+	bool zc_ready_held;
 	struct sn_header zc_held_header;
 };
 struct packet { u8 data[SN_FRAME]; size_t bytes; };
@@ -86,6 +88,7 @@ struct sn_device {
 	u64 zc_read_fallback, zc_read_fallback_served;
 	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
 	u64 zc_read_ops, zc_read_fault_injected;
+	u64 zc_send_ops, zc_send_fault_injected, zc_desc_dup, zc_ack_probe;
 	/* Set when this side's queued burst was stranded by the peer stopping and
 	 * restarting its data RX ring underneath it. Observed on hardware: the ring
 	 * then never drains and its frames never land, for the rest of the boot. */
@@ -186,6 +189,7 @@ void sn_data_abort(struct sn_device *d);
 void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status);
 bool sn_data_tx_drained(struct sn_device *d);
 unsigned int sn_zc_read_fault;
+unsigned int sn_zc_send_fault;
 #define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
 #include "../verbs/protocol.c"
 /* Modeled zero-copy data plane: one burst copies payload from an explicit source
@@ -634,27 +638,43 @@ static void test_zc_retry_ready(void)
 	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, &drop_ready);
 	assert(a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
 	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	assert(b->zc_desc_dup == 1 && !b->rx_restarts && a->zc_tx_bursts == 1);
 	release(a); release(b);
-	puts("ok 9 - lost ZC_READY: descriptor retransmit, duplicate restart, completes");
+	puts("ok 9 - lost ZC_READY: descriptor retransmit answered again, no ring restart, completes");
 }
-static void test_zc_retry_burst(void)
+/* Lose the zero-copy burst of one SEND or WRITE outright: the sender reaches
+ * SENT with every frame gone. E2E hardware cannot do this -- it transmits only into
+ * posted receive buffers -- and recovering would need the receiver's landing zone
+ * re-posted, i.e. the one-sided ring restart that starves the peer. So the sender
+ * never re-bursts: it probes for the ACK, the receiver never counts the burst, and
+ * the operation fails loudly instead of completing. */
+static void zc_lost_burst(u32 opcode)
 {
 	struct sn_device *b, *a = zc_pair(&b);
 	unsigned int i;
 
 	memset(a->mr[0].data, 0x8d, SN_MESSAGE);
-	receive(b, SN_MESSAGE); post(a, SN_SEND, SN_MESSAGE);
-	sn_engine_progress(a);
-	deliver(a, b, NULL); deliver(b, a, NULL);
+	if (opcode == SN_SEND) receive(b, SN_MESSAGE);
+	post(a, opcode, SN_MESSAGE);
+	sn_engine_progress(a);			/* descriptor */
+	deliver(a, b, NULL);
+	sn_engine_progress(b);			/* ZC_READY */
+	deliver(b, a, NULL);
+	assert(a->qp->zc_state == SN_ZC_SENDING);
 	a->zc_drop = true;
-	sn_engine_progress(a);
+	sn_engine_progress(a);			/* the burst, lost */
 	a->zc_drop = false;
-	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, NULL);
-	assert(a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
-	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
-	assert(b->send_bytes == SN_MESSAGE);
+	assert(a->qp->zc_state == SN_ZC_SENT && a->zc_tx_bursts == 1 && !b->qp->zc_received);
+	for (i = 0; i < 2000 && !a->sends && !a->errors; i++) step(a, b, NULL, NULL);
+	assert(!a->sends && a->errors == 1 && a->last_error == IB_WC_RETRY_EXC_ERR);
+	assert(a->zc_tx_bursts == 1 && a->zc_ack_probe && !b->rx_restarts);
+	assert(!b->errors && !b->recvs && !b->send_bytes && !b->write_bytes);
 	release(a); release(b);
-	puts("ok 10 - lost burst: whole-message retry reposts from offset zero");
+}
+static void test_zc_retry_burst(void)
+{
+	zc_lost_burst(SN_SEND);
+	puts("ok 10 - lost SEND burst: ACK probes, no second burst, no ring restart, fails loudly");
 }
 static void test_zc_fallback(void)
 {
@@ -712,27 +732,14 @@ static void test_zc_write_retry_ready(void)
 	assert(a->sends == 1 && !b->recvs && !a->errors && !b->errors);
 	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
 	assert(b->zc_bursts == 1 && b->write_bytes == SN_MESSAGE && !b->mr[1].users);
+	assert(b->zc_desc_dup == 1 && !b->rx_restarts && a->zc_tx_bursts == 1);
 	release(a); release(b);
-	puts("ok 13 - lost ZC_WRITE READY: descriptor retransmit, duplicate restart, completes");
+	puts("ok 13 - lost ZC_WRITE READY: descriptor retransmit answered again, no ring restart, completes");
 }
 static void test_zc_write_retry_burst(void)
 {
-	struct sn_device *b, *a = zc_pair(&b);
-	unsigned int i;
-
-	memset(a->mr[0].data, 0x8d, SN_MESSAGE);
-	post(a, SN_WRITE, SN_MESSAGE);
-	sn_engine_progress(a);
-	deliver(a, b, NULL); deliver(b, a, NULL);
-	a->zc_drop = true;
-	sn_engine_progress(a);
-	a->zc_drop = false;
-	for (i = 0; i < 2000 && !a->sends; i++) step(a, b, NULL, NULL);
-	assert(a->sends == 1 && !b->recvs && !a->errors && !b->errors);
-	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
-	assert(b->zc_bursts == 1 && b->write_bytes == SN_MESSAGE && !b->mr[1].users);
-	release(a); release(b);
-	puts("ok 14 - lost ZC_WRITE burst: whole-message retry reposts the remote MR from offset zero");
+	zc_lost_burst(SN_WRITE);
+	puts("ok 14 - lost WRITE burst: ACK probes, no second burst, no ring restart, fails loudly");
 }
 /* The retry that restarts a burst must not fire while burst frames are still
  * queued on the data TX ring. The peer zeroes zc_received when the retransmitted
@@ -774,7 +781,7 @@ static void test_zc_retry_waits_for_drain(void)
 	assert(a->errors == 1 && a->last_error == IB_WC_RETRY_EXC_ERR);
 	assert(!a->sends && a->zc_retries == 0);
 	release(a); release(b);
-	puts("ok 17 - burst restart waits for the data TX ring to drain; a ring that never drains fails the QP");
+	puts("ok 17 - a timed-out burst waits for the data TX ring to drain; a ring that never drains fails the QP");
 }
 static void test_zc_read(void)
 {
@@ -1231,7 +1238,7 @@ static void test_zc_burst_inflight_overlap(void)
 	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
 	assert(!b->mr[1].users && !a->mr[0].users);
 	release(a); release(b);
-	puts("ok 26 - in-flight burst frames survive an ACK timeout: the restart defers until the ring drains");
+	puts("ok 26 - in-flight burst frames survive an ACK timeout: the probe defers until the ring drains, no second burst");
 }
 static void inject_header(struct sn_device *to, const struct sn_header *h)
 {
@@ -1425,9 +1432,113 @@ static void test_zc_read_fallback_keeps_ring_usable(void)
 	release(a); release(b);
 	puts("ok 32 - after a served fallback the next zero-copy READ completes: no data RX ring restart");
 }
+/* Post one zero-copy SEND or WRITE from a to b and step until it completes. */
+static void zc_op(struct sn_device *a, struct sn_device *b, u32 opcode, u8 fill, unsigned int sends)
+{
+	unsigned int i;
+
+	memset(a->mr[0].data, fill, SN_MESSAGE);
+	if (opcode == SN_SEND) receive(b, SN_MESSAGE);
+	post(a, opcode, SN_MESSAGE);
+	for (i = 0; i < 2000 && a->sends < sends && !a->errors; i++) {
+		flush_inflight(a);
+		step(a, b, NULL, NULL);
+	}
+	assert(a->sends == sends && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+}
+/* A lost ZC_READY makes the sender retransmit its descriptor, and the receiver
+ * meets that duplicate with its landing zone posted and nothing landed. Restarting
+ * its data RX ring there is the one-sided restart hardware round nine showed
+ * starves the peer's data TX. The posted zone is still exactly right for a burst
+ * from offset zero, so the receiver must answer ZC_READY again without touching
+ * the ring, and the next burst must still flow. */
+static void test_zc_lost_ready_keeps_ring_usable(void)
+{
+	static const u32 ops[] = { SN_SEND, SN_WRITE };
+	unsigned int k;
+
+	for (k = 0; k < 2; k++) {
+		struct sn_device *b, *a = zc_pair(&b);
+		int drop_ready = SN_ZC_READY;
+		unsigned int i;
+
+		a->e2e_model = b->e2e_model = true;
+		memset(a->mr[0].data, 0x61 + k, SN_MESSAGE);
+		if (ops[k] == SN_SEND) receive(b, SN_MESSAGE);
+		post(a, ops[k], SN_MESSAGE);
+		for (i = 0; i < 2000 && !a->sends && !a->errors; i++) step(a, b, NULL, &drop_ready);
+		assert(!drop_ready && a->sends == 1 && !a->errors && !b->errors);
+		assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+		zc_op(a, b, ops[k], 0x71 + k, 2);	/* the next burst still flows */
+		assert(!b->rx_restarts && !a->zc_tx_starved);
+		release(a); release(b);
+	}
+	puts("ok 33 - a lost ZC_READY is answered again without a data RX ring restart; the next burst flows");
+}
+/* A late ZC_READY: it reaches the sender only after the descriptor retransmit, so
+ * the sender bursts and the duplicate descriptor reaches the receiver while that
+ * burst is landing. Restarting there zeroes the count under a live burst. The
+ * receiver must ignore the duplicate; the burst completes exactly once. */
+static void test_zc_late_ready_mid_burst(void)
+{
+	static const u32 ops[] = { SN_SEND, SN_WRITE };
+	unsigned int k;
+
+	for (k = 0; k < 2; k++) {
+		struct sn_device *b, *a = zc_pair(&b);
+		unsigned int i;
+
+		a->e2e_model = b->e2e_model = true;
+		a->zc_defer = SN_MESSAGE / 16;
+		memset(a->mr[0].data, 0x41 + k, SN_MESSAGE);
+		if (ops[k] == SN_SEND) receive(b, SN_MESSAGE);
+		post(a, ops[k], SN_MESSAGE);
+		sn_engine_progress(a);			/* descriptor */
+		deliver(a, b, NULL);
+		sn_engine_progress(b);			/* ZC_READY queued, held back */
+		now += 1000000000ULL;
+		sn_engine_progress(a);			/* WAIT times out: descriptor again */
+		deliver(b, a, NULL);			/* the late READY: a starts bursting */
+		sn_engine_progress(a);
+		assert(a->qp->zc_state == SN_ZC_SENDING || a->qp->zc_state == SN_ZC_SENT);
+		flush_inflight(a);			/* part of the burst has landed */
+		assert(b->qp->zc_received && b->qp->zc_received < SN_MESSAGE);
+		deliver(a, b, NULL);			/* the duplicate meets a live burst */
+		for (i = 0; i < 2000 && !a->sends && !a->errors; i++) {
+			flush_inflight(a);
+			step(a, b, NULL, NULL);
+		}
+		assert(a->sends == 1 && !a->errors && !b->errors);
+		assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+		zc_op(a, b, ops[k], 0x51 + k, 2);
+		assert(!b->rx_restarts && !a->zc_tx_starved);
+		release(a); release(b);
+	}
+	puts("ok 34 - a late ZC_READY: the duplicate descriptor meets a live burst and is ignored, no restart");
+}
+/* zc_send_fault (diagnostic) loses the first ZC_READY of every Nth zero-copy
+ * SEND/WRITE on odd selections and delivers it late, right after the descriptor
+ * retransmit, on even ones. Every selected operation must still complete exactly
+ * once, byte-for-byte. */
+static void test_zc_send_fault_injection(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	sn_zc_send_fault = 2;
+	a->zc_defer = SN_MESSAGE / 16;
+	for (i = 1; i <= 4; i++)
+		zc_op(a, b, i % 2 ? SN_SEND : SN_WRITE, 0x10 + i, i);
+	sn_zc_send_fault = 0;
+	assert(a->zc_send_ops == 4 && a->zc_send_fault_injected == 2);
+	assert(b->zc_desc_dup == 2);
+	release(a); release(b);
+	puts("ok 35 - zc_send_fault loses or delays a ZC_READY; every selected SEND/WRITE completes once");
+}
 int main(void)
 {
-	puts("1..32");
+	puts("1..35");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1447,6 +1558,9 @@ int main(void)
 	test_zc_read_fallback_midpost_finishes();
 	test_zc_read_fault_injection();
 	test_zc_read_fallback_keeps_ring_usable();
+	test_zc_lost_ready_keeps_ring_usable();
+	test_zc_late_ready_mid_burst();
+	test_zc_send_fault_injection();
 	assert(!warnings);
 	return 0;
 }

@@ -445,23 +445,6 @@ int sn_data_recv_start(struct sn_device *d, struct sn_qp *q)
 	d->zdata_posted = 0;
 	return sn_zdata_repost(d, q);
 }
-/* A retried burst restarts from offset zero: flush the data RX ring (partial
- * postings from the previous attempt) and repost from the beginning. */
-int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
-{
-	lockdep_assert_held(&d->lock);
-	tb_ring_stop(d->data_rx_ring);
-	tb_ring_start(d->data_rx_ring);
-	/* tb_ring_stop joined the cancellation callbacks synchronously; drain
-	 * them without reposting so head/tail stay consistent. */
-	while (d->data_rx_tail != d->data_rx_head) {
-		struct sn_slot *s = &d->data_rx[d->data_rx_tail % SN_RING_SIZE];
-		if (!sn_slot_done(d, s)) break;
-		d->data_rx_tail++;
-	}
-	d->zdata_posted = 0;
-	return sn_zdata_repost(d, q);
-}
 /* Abort any in-progress zero-copy burst: stop+start both data rings (stop
  * synchronously joins the cancellation callbacks), drain every completed /
  * canceled slot so head/tail resync, and drop any slot that was queued but
@@ -542,13 +525,13 @@ void sn_data_receive(struct sn_device *d)
 		d->rx_frames++;
 		if (d->qp && d->qp->zc_expect) {
 			if (d->qp->zc_received + size > d->qp->zc_total) {
-				/* Overshoot: frames from a superseded burst attempt are still
-				 * arriving after a descriptor retransmit reset zc_received to
-				 * zero. sn_data_recv_restart() flushes the frames this host
-				 * already received, but it cannot recall frames still queued in
-				 * the peer's data TX ring or on the wire, so the byte stream now
-				 * describes parts of two attempts. Completing would hand the
-				 * caller a buffer assembled from both -- and because the sync
+				/* Overshoot: more bytes than the burst holds. A sender bursts
+				 * each operation once and a receiver never restarts its ring, so
+				 * this needs a peer that broke the protocol -- for example one
+				 * running an older module that still re-bursts on retry -- and
+				 * the byte stream then describes parts of two attempts.
+				 * Completing would hand the caller a buffer assembled from
+				 * both -- and because the sync
 				 * below keys on exact equality, it would also hand back pages
 				 * never synced for the CPU. Fail the QP loudly instead of
 				 * corrupting silently. */

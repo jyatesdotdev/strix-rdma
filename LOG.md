@@ -1,6 +1,29 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — zero-copy SEND/WRITE: the same E2E starvation, reproduced and removed
+- **What:** zero-copy SEND and WRITE (both on by default) still restarted the
+  receiver's data RX ring on a duplicate burst descriptor, the one-sided restart
+  that round nine showed starves the peer's data TX. A lost or late ZC_READY
+  reaches it.
+- **Reproduced:** `zc_send_fault=100` (new diagnostic parameter) failed a
+  `write 2000` with RETRY_EXC at iteration 52 on both hosts. `stall_snap` showed
+  posted TX frames against matching posted RX buffers in both directions, with
+  nothing moving. The same boot passed with no injection.
+- **Fix:** a sender bursts each operation once and after a drained timeout
+  only probes for the ACK. A receiver answers a duplicate with ZC_READY when
+  nothing has landed and otherwise ignores it. `sn_data_recv_restart()` is
+  deleted.
+- **Validated:** fresh boot with `zc_send_fault=100`: `write 2000` 20/20 and a
+  new verified `send 2000` mode 20/20 byte-for-byte, 1,600 injected faults per
+  side per mode, no QP error. READ with its fault injection and every mode with
+  faults off passed on the same boot.
+- **Also:** ok 10 and ok 14 ("lost burst") had never lost a burst. They were
+  rewritten to really drop it. `bench/scripts/` gained the smoke and streak
+  runners, and `strix-verbs-smoke` gained `send N`, a SEND/RECV mode with
+  byte-for-byte verification.
+- **Evidence:** `docs/ZEROCOPY_VERBS.md`, round eleven.
+
 ## 2026-10-12 — zero-copy RDMA READ on by default
 - **What:** `SN_ZC_READ = 15` (added 2026-10-11) is now the default for eligible
   READs. It runs at 408–418 MiB/s against 62.6 MiB/s staged, ~6.6×.

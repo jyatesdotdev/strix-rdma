@@ -1099,7 +1099,72 @@ Diagnostics kept for the next time something stalls: the ring and QP fields in
 `native_stats`, the frozen `drain_*`/`err_*` snapshots in `stall_snap`, and the
 `zc_read_fault=N` injection parameter (0644, default 0).
 
-Not covered by this work: a retried zero-copy SEND or WRITE descriptor still
-restarts the receiver's data RX ring (`sn_receive_zc`). If the same E2E
-starvation applies there, it has not shown up in the WRITE or SEND validation
-runs so far.
+Zero-copy SEND and WRITE had the same one-sided restart on a duplicate
+descriptor. It was reproduced and removed the same day; see round eleven below.
+
+## Round eleven (2026-10-12): the same starvation in zero-copy SEND and WRITE
+
+Zero-copy SEND and WRITE, both on by default, still had the action that round
+nine convicted. When a duplicate burst descriptor met a receive in progress,
+`sn_receive_zc` zeroed the count and restarted the receiver's data RX ring on
+its own. A lost or late `ZC_READY` makes the sender retransmit its descriptor,
+which is enough to reach it. A timed-out burst that the sender re-burst after
+the drain barrier reached it too.
+
+**Inducing it.** `zc_send_fault=N` (0644, default 0, diagnostic) affects every
+Nth zero-copy SEND or WRITE this host sends. On odd selections its first
+`ZC_READY` is lost. On even ones it arrives late, applied right after the
+descriptor retransmit, so the duplicate meets a burst that is already landing.
+New counters: `zc_send_ops`, `zc_send_fault_injected`, `zc_desc_dup` (duplicate
+descriptors for a receive in progress) and `zc_ack_probe`.
+
+**Reproduced on the unfixed receiver.** On the same boot, a `write 2000` with no
+injection passed at 437.60 MiB/s. With `zc_read=Y` and `zc_send_fault=100` on
+both hosts, the next `write 2000` failed with RETRY_EXC at iteration 52 on both
+sides, after 2 injections and 3 duplicates per side. `stall_snap` `err_*`
+showed round nine's signature in both directions at once. max's NHI held 55
+posted TX frames against max2's 55 posted RX buffers, and max2 held 21 against
+max's 21. Hardware ring indices agreed on both pairs (`hw_completed` 9 and 9,
+43 and 43) and nothing moved.
+
+**Fix.** Nothing re-bursts, and no data RX ring is ever restarted:
+
+- **Sender:** bursts each operation exactly once. When a drained burst times
+  out, every frame has reached the peer, because E2E transmits only into posted
+  receive buffers. So the sender re-sends the descriptor only as an ACK probe
+  and stays SENT, where a `ZC_READY` is ignored.
+- **Receiver:** on a duplicate descriptor it answers `ZC_READY` again if
+  nothing has landed, since the posted zone is still exactly right for the one
+  burst. Once bytes are landing it ignores the duplicate, and the ACK goes out
+  when the burst completes.
+- **Removed:** `sn_data_recv_restart()` is gone. A burst that truly never
+  lands, which E2E cannot produce, now fails with RETRY_EXC instead of
+  completing through a restart.
+
+**Offline.** ok 33 (lost READY) and ok 34 (late READY, duplicate mid-burst)
+replay this under `e2e_model` for SEND and WRITE, and both failed first. ok 35
+covers the injection mechanics. ok 10 and ok 14, the "lost burst" tests, turned
+out to be vacuous: `ZC_READY` only leaves on the receiver's next progress pass,
+so when `zc_drop` was set the sender was still waiting and nothing was dropped.
+They now really lose the burst and assert the loud failure. ok 9 and ok 13
+assert no restart. Differential: the engine tests pass 35/35 in isolation; with
+only the receiver and sender changes reverted, exactly ok 9, 10, 13, 14, 33 and
+34 fail.
+
+**Hardware, fresh reboot on the fix, `zc_send_fault=100` on both hosts:**
+
+- `write 2000`: **20/20 PASS** byte-for-byte, 360–396 MiB/s. 80 injections per
+  side per run (1,600 per side in total), each answered by exactly one
+  `zc_desc_dup`, with no QP error. Run 18 also hit a natural ACK timeout, and
+  the new probe handled it (`zc_ack_probe` 1).
+- `send 2000` (the new verified bulk mode, every byte of every iteration
+  checked): **20/20 PASS**, 391–398 MiB/s, again 80 injections per side per run
+  with no QP error.
+
+The throughput cost (about 391 against 437–461 MiB/s) is the injected 67 ms
+timeouts themselves, 80 per run.
+
+**Regression on the same boot.** `read 2000` with `zc_read_fault=1000` passed
+3/3 at 416–418 MiB/s, every fallback served. With all faults at 0: the SEND
+smoke passed, `send 2000` at 460.87 MiB/s, `write 2000` at 459.06 MiB/s and
+`read 2000` at 418.03 MiB/s, all byte-for-byte.

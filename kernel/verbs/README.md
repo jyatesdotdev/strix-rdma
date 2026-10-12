@@ -544,6 +544,18 @@ exercised by the offline suite (`ok 17 - burst restart waits for the data TX rin
 to drain; a ring that never drains fails the QP`) rather than on hardware; the
 hardware runs prove the common path, the offline test proves the guard.
 
+**Superseded 2026-10-12: nothing re-bursts and no ring restarts.** The drain
+barrier above made a retried burst *correct*, but the receiver's
+`sn_data_recv_restart()` turned out to be unsafe on its own. A one-sided
+stop/start of a data RX ring starves the peer's data TX of E2E credits, so the
+peer's next burst sits posted and is never sent. This was found for zero-copy
+READ, then reproduced for WRITE with `zc_send_fault` (both sides failed with
+RETRY_EXC within 52 iterations). Now a sender bursts each operation exactly once.
+After a drained burst times out, it re-sends the descriptor only as an ACK
+probe. A receiver meeting a duplicate descriptor answers ZC_READY again if
+nothing has landed, and otherwise ignores it. The restart function has been
+deleted. See `docs/ZEROCOPY_VERBS.md`, round eleven.
+
 The offline suites cannot catch any of this. Their `sn_data_send_burst` is atomic
 — one `memcpy` plus an immediate `sn_engine_zc_bytes()` — so a partially posted
 burst, a stale in-flight frame and an overshooting byte count are all
