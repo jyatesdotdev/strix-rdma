@@ -989,3 +989,63 @@ Out of scope and unchanged: a retried zero-copy SEND or WRITE descriptor still
 restarts the receiver's data RX ring (`sn_receive_zc`, duplicate descriptor).
 The same starvation may apply there, but that path was not exercised in this
 work.
+
+### Round ten: 20-run streak on the fix, with the recovery path firing in every run
+
+Fresh reboot of both hosts on the `1ab0a0b` build with `zc_read=1` (test
+override). The zero-copy READ timeout was induced throughout with
+`zc_read_fault=1000` on both hosts, since 15 natural runs in round eight produced
+none. That arms the fault on every 1000th READ, about 8 per side per run. An
+armed fault becomes a real timeout only if the engine polls before the next
+frame lands, because frames still landing refresh the deadline.
+`zc_read_fallback` is therefore the count of timeouts that actually fired, and
+`zc_read_fault_injected` the count armed. Runs 21–23 are a stress addendum at
+`zc_read_fault=100`, the setting that failed two runs out of two in round nine.
+Every run is `read 2000`, bidirectional, 8,000 zero-copy READs per side.
+Per-run counter deltas:
+
+| run | result (both sides, 16,777,216,000 B/direction) | max: fallback / served / retx / wait_drain / wait_midpost | max2: fallback / served / retx / wait_drain / wait_midpost |
+|---|---|---|---|
+| 1 | PASS, 416.99 MiB/s | 1 / 1 / 1 / 4 / 3 | 1 / 1 / 1 / 2 / 3 |
+| 2 | PASS, 417.77 MiB/s | 1 / 4 / 1 / 12 / 24 | 4 / 1 / 4 / 5 / 5 |
+| 3 | PASS, 416.68 MiB/s | 2 / 1 / 3 / 3 / 3 | 1 / 2 / 1 / 50 / 7 |
+| 4 | PASS, 416.00 MiB/s | 3 / 3 / 3 / 10 / 15 | 3 / 3 / 3 / 34 / 10 |
+| 5 | PASS, 414.30 MiB/s | 2 / 2 / 2 / 58 / 5 | 2 / 2 / 3 / 27 / 5 |
+| 6 | PASS, 417.51 MiB/s | 3 / 0 / 3 / 0 / 0 | 0 / 3 / 0 / 11 / 16 |
+| 7 | PASS, 416.48 MiB/s | 5 / 1 / 5 / 5 / 4 | 1 / 5 / 1 / 18 / 32 |
+| 8 | PASS, 414.14 MiB/s | 6 / 2 / 6 / 58 / 0 | 2 / 6 / 3 / 23 / 37 |
+| 9 | PASS, 417.21 MiB/s | 2 / 0 / 2 / 0 / 0 | 0 / 2 / 0 / 9 / 11 |
+| 10 | PASS, 416.80 MiB/s | 1 / 2 / 1 / 6 / 13 | 2 / 1 / 2 / 22 / 0 |
+| 11 | PASS, 416.15 MiB/s | 5 / 1 / 5 / 3 / 7 | 1 / 5 / 1 / 16 / 37 |
+| 12 | PASS, 417.03 MiB/s | 1 / 2 / 1 / 28 / 3 | 2 / 1 / 2 / 4 / 5 |
+| 13 | PASS, 408.23 MiB/s | 6 / 3 / 8 / 61 / 6 | 3 / 6 / 4 / 128 / 11 |
+| 14 | PASS, 417.81 MiB/s | 2 / 1 / 2 / 3 / 11 | 1 / 2 / 1 / 6 / 10 |
+| 15 | PASS, 416.04 MiB/s | 4 / 2 / 4 / 7 / 12 | 2 / 4 / 2 / 29 / 23 |
+| 16 | PASS, 416.80 MiB/s | 3 / 0 / 3 / 0 / 0 | 0 / 3 / 0 / 11 / 21 |
+| 17 | PASS, 416.51 MiB/s | 4 / 1 / 4 / 3 / 6 | 1 / 4 / 1 / 31 / 17 |
+| 18 | PASS, 415.02 MiB/s | 2 / 4 / 3 / 16 / 22 | 4 / 2 / 4 / 57 / 6 |
+| 19 | PASS, 417.09 MiB/s | 1 / 4 / 1 / 16 / 21 | 4 / 1 / 4 / 4 / 6 |
+| 20 | PASS, 416.18 MiB/s | 2 / 2 / 2 / 26 / 6 | 2 / 2 / 2 / 6 / 13 |
+| | *stress addendum, `zc_read_fault=100`* | | |
+| 21 | PASS, 411.15 MiB/s | 15 / 29 / 15 / 101 / 163 | 29 / 15 / 29 / 54 / 100 |
+| 22 | PASS, 410.72 MiB/s | 22 / 22 / 22 / 78 / 145 | 22 / 22 / 22 / 79 / 111 |
+| 23 | PASS, 408.02 MiB/s | 17 / 24 / 17 / 172 / 131 | 24 / 17 / 26 / 71 / 104 |
+
+- **20 of 20 consecutive runs pass byte-for-byte**, at 408–418 MiB/s. Each
+  run moved 16,777,216,000 B per direction, verified on both sides. The stress
+  addendum adds 3 of 3 at 408–411 MiB/s.
+- **The recovery path fired in every one of the 23 runs.** Runs 1–20 totals:
+  max initiated 56 fallbacks and max2 served exactly 56; max2 initiated 36 and
+  max served exactly 36. Stress runs 21–23: 54 and 75 fallbacks, every one
+  served. Before each staged reply, the responder finished posting and drained
+  its zero-copy reply first. Runs 1–20 spent 1,248 progress passes in those two
+  waits on the two hosts together (`zc_fb_wait_midpost` plus `zc_fb_wait_drain`;
+  both count passes, not replies).
+- **No QP error on either host in any run** (`stall_snap` `err_count` stayed 0
+  all boot). No data RX ring is restarted on this path any more, so there is no
+  starvation.
+- **The default paths are unaffected on the same boot, with the fault back at
+  0:** the SEND smoke passed, `write 200` passed at 433.37 MiB/s and `read 200`
+  at 416.67 MiB/s, all byte-for-byte.
+
+This meets the bar set for enabling zero-copy READ by default.
