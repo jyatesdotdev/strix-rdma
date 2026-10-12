@@ -744,3 +744,49 @@ released by a subsequent operation; or a benign counter gap where the original
 `SN_ZC_READ` never committed, so the fallback was served as a fresh staged READ
 that `zc_read_fallback_served` does not count. Distinguishing them needs counters on
 each exit of the responder's staged-`SN_READ` replay branch. `zc_read` stays **off**.
+
+### Rounds six and seven: the residual is a data-ring drain stall, contained to one QP
+
+Every exit of the responder's fallback path is now counted (`zc_fb_wait_midpost`,
+`zc_fb_wait_drain`, `zc_fb_reserve`, `zc_read_req_drop`, `zc_resp_retry_exc`,
+`zc_resp_start_exc`). Two failures captured with them, on two different builds:
+
+| round / build | requester | responder | where it parked |
+|---|---|---|---|
+| 6 / `18de548`+counters, run 6 | fallback 2, retx 5 | served 1, `wait_midpost` 109, `wait_drain` 38 | mid-post |
+| 7 / `7977ae2`, run 2 | fallback 2, retx 5 | served 1, `wait_midpost` 1, `wait_drain` **162** | drain |
+
+In both: zero drops, zero invalid replays, zero re-serves, zero response
+exhaustions. The unanswered staged `SN_READ` was received and recognised every
+time; the responder then waited on its own zero-copy burst. `7977ae2` stops
+posting the moment a fallback arrives mid-post (ok 30) — harmless and correct,
+since the staged reply supersedes the burst — but it only moved the wait from
+mid-post to drain. **The frames already queued in the responder's data TX ring
+are never transmitted.** The requester's data RX ring stops accepting them.
+
+The shape is the same in both failures and in the round-5 one: the first
+fallback of a run is served and completes, and a *later* zero-copy READ in the
+same run stalls with its frames stuck. The staged completion path is the only
+place that stops and restarts the requester's data RX ring, so the leading
+suspect is that restart desynchronising E2E credit state with the peer's TX —
+not every time (round 6 run 3 served three fallbacks in one run and passed), but
+often enough. RX slot accounting was checked and is not it: the cancellation
+callbacks set `done`, and the restart's drain loop reclaims them.
+
+**Contained.** On the round-7 boot, after the READ failure, the default SEND
+smoke passed and `write 200` passed at 456.62 MiB/s byte-for-byte. Round 4's
+boot-wide data-plane wedge is gone; the residual fails one QP, loudly.
+
+**Not fixable at the protocol layer with what is observable today.** The stall is
+below the engine — ring and E2E state — and the offline harness has no model of
+credits. The next step needs ring-level visibility at the moment of the stall:
+export `data_tx_head/tail`, `data_rx_head/tail`, `zdata_posted` and the QP's
+`zc_received/zc_total` in `native_stats`, capture them from both hosts while a
+READ is stuck, and see whether the requester has RX buffers posted. If it does
+not, the fix is in how the landing zone is reclaimed; if it does, the stall is in
+the NHI's E2E credit state and needs a different reclaim than `tb_ring_stop` /
+`tb_ring_start`.
+
+`zc_read` stays **off by default**. Per this goal's contract it is not flipped:
+the 20-run streak has not been achieved (best: 5 consecutive passes, two of them
+with the recovery path firing and completing byte-for-byte).
