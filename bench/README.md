@@ -105,11 +105,12 @@ and its own smoke tool, which is also the latency/throughput probe:
 ```sh
 make -C ../tools/verbs
 # usage: strix-verbs-smoke --live strix_nhiN listen|connect <explicit-IPv4> <TCP-port>
-#        [bench-iterations | ping [iters] | write [iters] | read [iters]]
+#        [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]
 ./strix-verbs-smoke --live strix_nhi0 listen  10.99.0.1 18515   # endpoint A
 ./strix-verbs-smoke --live strix_nhi0 connect 10.99.0.1 18515   # endpoint B
-# ... appending "ping 2000" for the 256 B RTT probe, or a bare iteration
-# count (e.g. "200") for the window-4 x 2 MiB bidirectional throughput run.
+# ... appending "ping 2000" for the 256 B RTT probe, "send 200" for verified
+# window-4 x 2 MiB bidirectional SEND/RECV (every byte checked), or a bare
+# iteration count (e.g. "200") for the same traffic as an unverified throughput run.
 ```
 
 From a third machine with ssh access to both hosts, two scripts drive the same
@@ -121,7 +122,8 @@ and optionally `PORT` (default 19476, which must be open in hostB's firewall),
 scripts/run-verbs-smoke.sh read 200        # one exchange, both sides' output
 scripts/verbs-streak.sh 1 20 read 2000     # stop at the first failure
 scripts/verbs-streak.sh 1 5 write 2000
-scripts/verbs-streak.sh 1 5 send
+scripts/verbs-streak.sh 1 5 send 2000      # verified bulk SEND/RECV
+scripts/verbs-streak.sh 1 5 send           # the SEND/RECV smoke
 ```
 
 `verbs-streak.sh` passes a run only if both sides print PASS with the exact

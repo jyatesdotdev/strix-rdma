@@ -276,17 +276,20 @@ int main(int argc, char **argv)
 		.cap = { .max_send_wr = WINDOW, .max_recv_wr = WINDOW, .max_send_sge = 1, .max_recv_sge = 1 } };
 	unsigned char mine[META_SIZE], theirs[META_SIZE];
 	unsigned long long expected = 0;
-	unsigned bench_iters = 0, ping_iters = 0, rdma_iters = 0;
+	unsigned bench_iters = 0, ping_iters = 0, rdma_iters = 0, send_iters = 0;
 	int count, fd; bool listening, rdma_read = false;
 	if (argc == 2 && !strcmp(argv[1], "--selftest")) { selftest(); return 0; }
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | write [iters] | read [iters]]\n", argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n", argv[0], argv[0]);
 		return 2;
 	}
 	if (argc >= 7 && !strcmp(argv[6], "ping")) {
 		if (argc == 8) ping_iters = iterations(argv[7], 1000000, "ping iteration count");
 		else ping_iters = 1000;
+	} else if (argc >= 7 && !strcmp(argv[6], "send")) {
+		if (argc == 8) send_iters = iterations(argv[7], 100000, "SEND iteration count");
+		else send_iters = 4;
 	} else if (argc >= 7 && (!strcmp(argv[6], "write") || !strcmp(argv[6], "read"))) {
 		rdma_read = !strcmp(argv[6], "read");
 		if (argc == 8) rdma_iters = iterations(argv[7], 100000, "RDMA iteration count");
@@ -414,6 +417,91 @@ int main(int argc, char **argv)
 		if (!listening)
 			printf("PINGPONG %u iters x 256 B: avg %.1f us, min %lld us, max %lld us (round-trip)\n",
 			       ping_iters, (double)total / ping_iters, (long long)best, (long long)worst);
+		goto done;
+	}
+	if (send_iters) { /* Verified bidirectional SEND/RECV, window 4 x 2 MiB. */
+		/* Unlike the bench mode, every iteration's payload is distinct and
+		 * checked byte-for-byte, so a frame replayed from an earlier iteration
+		 * into a later receive is caught, not counted as throughput. */
+		struct ibv_sge rs[WINDOW], ss[WINDOW];
+		struct ibv_recv_wr rw[WINDOW] = {}, *rbad = NULL;
+		struct ibv_send_wr sw[WINDOW] = {}, *sbad = NULL;
+		struct counters pre = stats(argv[2]);
+		unsigned long long verified = 0;
+		int64_t t0 = milliseconds();
+		for (unsigned it = 1; it <= send_iters; it++) {
+			unsigned sends = 0, recvs = 0, next_recv = 0;
+			int64_t deadline;
+			for (unsigned i = 0; i < WINDOW; i++) {
+				for (unsigned j = 0; j < CHUNK; j++) tx[i*CHUNK+j] = pattern(local.nonce, it, i, j);
+				memset(rx+i*CHUNK, 0, CHUNK);
+				rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx+i*CHUNK), .length = CHUNK, .lkey = rx_mr->lkey };
+				rw[i] = (struct ibv_recv_wr){ .wr_id = it*16u+i, .sg_list = &rs[i], .num_sge = 1,
+					.next = i+1 < WINDOW ? &rw[i+1] : NULL };
+				ss[i] = (struct ibv_sge){ .addr = (uintptr_t)(tx+i*CHUNK), .length = CHUNK, .lkey = tx_mr->lkey };
+				sw[i] = (struct ibv_send_wr){ .wr_id = it*16u+8+i, .sg_list = &ss[i], .num_sge = 1,
+					.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+					.next = i+1 < WINDOW ? &sw[i+1] : NULL };
+			}
+			verb(ibv_post_recv(qp, rw, &rbad), "post SEND window receives");
+			atomic_thread_fence(memory_order_release);
+			/* Both sides' receives are posted before either side sends. */
+			barrier(fd, it);
+			verb(ibv_post_send(qp, sw, &sbad), "post SEND window");
+			deadline = milliseconds() + TIMEOUT_MS;
+			while (sends != WINDOW || recvs != WINDOW) {
+				struct ibv_wc wc[8]; int n = ibv_poll_cq(cq, 8, wc);
+				require(n >= 0 && milliseconds() < deadline, "SEND poll/deadline");
+				for (int k = 0; k < n; k++) {
+					unsigned slot = wc[k].wr_id % 16;
+					if (wc[k].status != IBV_WC_SUCCESS || wc[k].wr_id/16 != it ||
+					    wc[k].qp_num != qp->qp_num) {
+						fprintf(stderr, "FAIL detail: iter=%u status=%d (%s) opcode=%d "
+							"wr_id=%llu (iter=%llu slot=%u) qp_num=%u want=%u\n",
+							it, wc[k].status, ibv_wc_status_str(wc[k].status), wc[k].opcode,
+							(unsigned long long)wc[k].wr_id,
+							(unsigned long long)(wc[k].wr_id/16), slot,
+							wc[k].qp_num, qp->qp_num);
+						fail("SEND WC status/identity");
+					}
+					if (wc[k].opcode == IBV_WC_RECV) {
+						require(slot == next_recv++ && wc[k].byte_len == CHUNK, "ordered full-length RECV");
+						recvs++;
+					} else {
+						require(wc[k].opcode == IBV_WC_SEND && slot >= 8 && slot < 8+WINDOW, "SEND WC opcode/slot");
+						sends++;
+					}
+				}
+			}
+			atomic_thread_fence(memory_order_acquire);
+			{
+				unsigned bad_slots = 0;
+
+				for (unsigned i = 0; i < WINDOW; i++) {
+					unsigned j;
+
+					for (j = 0; j < CHUNK; j++)
+						if (rx[i*CHUNK+j] != pattern(peer.nonce, it, i, j))
+							break;
+					if (j < CHUNK) {
+						report_mismatch(rx, peer.nonce, local.nonce, it, i, CHUNK, WINDOW);
+						bad_slots++;
+					}
+				}
+				if (bad_slots)
+					fail("SEND payload verification");
+			}
+			verified += (unsigned long long)WINDOW * CHUNK;
+		}
+		int64_t elapsed = milliseconds() - t0;
+		struct counters post = stats(argv[2]);
+		require(post.bad == pre.bad && post.send - pre.send == verified &&
+			post.write == pre.write && post.read == pre.read,
+			"native counters prove SEND placements only");
+		barrier(fd, 2); /* both finished */
+		printf("PASS native SEND/RECV verified: %u iters x %u x %u B, wall %lld ms, %.2f MiB/s, %llu bytes placed and verified byte-for-byte (%s)\n",
+		       send_iters, WINDOW, CHUNK, (long long)elapsed,
+		       (double)verified / (1048576.0 * elapsed / 1000.0), verified, argv[3]);
 		goto done;
 	}
 	if (rdma_iters) { /* Verified bidirectional RDMA WRITE or READ, window 4 x 2 MiB. */
@@ -629,7 +717,7 @@ int main(int argc, char **argv)
 	if (rd_mr) verb(ibv_dereg_mr(rd_mr), "RDMA deregistration");
 	free(tx); free(rx); free(rd); verb(ibv_destroy_cq(cq), "CQ destroy"); verb(ibv_dealloc_pd(pd), "PD free");
 	verb(ibv_close_device(ctx), "context close"); close(fd);
-	if (!bench_iters && !ping_iters && !rdma_iters)
+	if (!bench_iters && !ping_iters && !rdma_iters && !send_iters)
 		printf("PASS native CPU SEND/RECV: %llu bytes received, window4 x 2MiB setup, ERR flush; not complete RC qualification\n", expected);
 	return 0;
 }

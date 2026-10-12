@@ -4,7 +4,7 @@
 # were recorded from.
 #
 # Usage: verbs-streak.sh FIRST LAST [mode...]
-#   mode: send (default) | write <iters> | read <iters>
+#   mode: send (default: the SEND/RECV smoke) | send <iters> | write <iters> | read <iters>
 #   e.g.  verbs-streak.sh 1 20 read 2000
 #
 # Environment: CONNECT, LISTEN, LISTEN_IP (required) and PORT, DEV, TOOL_DIR
@@ -33,8 +33,14 @@ SSH=(ssh -o BatchMode=yes)
 
 case "${1:-send}" in
 send)
-    MODE=()
-    PASS='^PASS native CPU SEND/RECV: '
+    if [ -n "${2:-}" ]; then
+        MODE=(send "$2")
+        bytes=$(($2 * 4 * 2097152))
+        PASS="^PASS native SEND/RECV verified: $2 iters x 4 x 2097152 B, .* $bytes bytes placed and verified byte-for-byte"
+    else
+        MODE=()
+        PASS='^PASS native CPU SEND/RECV: '
+    fi
     ;;
 write|read)
     iters=${2:?"$1 needs an iteration count"}
@@ -45,7 +51,7 @@ write|read)
     PASS="^PASS native RDMA $op: $iters iters x 4 x 2097152 B, .* $bytes bytes placed and verified byte-for-byte"
     ;;
 *)
-    echo "unknown mode: $1 (send | write N | read N)" >&2
+    echo "unknown mode: $1 (send [N] | write N | read N)" >&2
     exit 2
     ;;
 esac
