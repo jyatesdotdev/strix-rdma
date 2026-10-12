@@ -1199,9 +1199,57 @@ static void test_zc_burst_inflight_overlap(void)
 	release(a); release(b);
 	puts("ok 26 - in-flight burst frames survive an ACK timeout: the restart defers until the ring drains");
 }
+/* A duplicate READ descriptor arriving while the response is still queued must
+ * NOT trigger a second burst. The requester zeroed its landing zone when it
+ * retransmitted, so the frames already in flight complete the message on their
+ * own; re-bursting as well puts two full messages into one zone and overshoots it.
+ * The requester cannot guard against this itself, because the frames sit in the
+ * responder's ring. This is what zero-copy READ hit on hardware at volume. */
+static void test_zc_read_duplicate_while_inflight(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	unsigned int i;
+
+	memset(b->mr[1].data, 0x77, SN_MESSAGE);
+	post(a, SN_READ, SN_MESSAGE);
+	/* Queue the whole reply as one in-flight unit. The reply must be fully POSTED
+	 * (response_offset at total, response_sent set) while its frames have not yet
+	 * landed -- that is the window the duplicate descriptor falls into. Chunking it
+	 * instead would stall here, because sn_response_may_burst() keys on
+	 * sn_data_tx_drained() and this model does not distinguish "posted but not
+	 * consumed by the NHI" from "consumed but not yet landed at the peer". */
+	b->zc_defer = SN_MESSAGE;
+	sn_engine_progress(a);		/* a arms its own RX and sends the descriptor */
+	deliver(a, b, NULL);		/* b resolves the source, response_active */
+	for (i = 0; i < 100 && !b->qp->response_sent; i++) sn_engine_progress(b);
+	assert(b->qp->response_sent && b->qp->response_offset == SN_MESSAGE);
+	assert(b->inflight_count == 1 && !sn_data_tx_drained(b));
+	assert(!a->zc_land_landed && !a->read_bytes);	/* nothing has landed yet */
+
+	/* a times out with the reply still in flight, retransmits and resets its zone. */
+	now += 1000000000ULL;
+	sn_engine_progress(a);
+	assert(a->qp->zc_received == 0 && a->qp->zc_read_armed);
+	deliver(a, b, NULL);		/* the duplicate descriptor reaches b */
+	sn_engine_progress(b);
+
+	/* b must leave the queued response alone rather than restart it. */
+	assert(b->qp->response_sent && b->qp->response_offset == SN_MESSAGE);
+	assert(b->inflight_count == 1 && b->zc_tx_bursts == 1);
+
+	/* Those frames land exactly once and complete the READ. */
+	flush_inflight(b);
+	assert(a->zc_land_landed == SN_MESSAGE && a->read_bytes == SN_MESSAGE);
+	sn_engine_progress(a);
+	for (i = 0; i < 20 && a->sends < 1; i++) { sn_engine_progress(a); deliver(a, b, NULL); deliver(b, a, NULL); sn_engine_progress(b); }
+	assert(a->sends == 1 && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	release(a); release(b);
+	puts("ok 27 - duplicate READ descriptor while the reply is in flight does not double-burst");
+}
 int main(void)
 {
-	puts("1..26");
+	puts("1..27");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1215,6 +1263,7 @@ int main(void)
 	test_zc_read_lost_ack_is_fatal();
 	test_zc_read_bidirectional();
 	test_zc_burst_inflight_overlap();
+	test_zc_read_duplicate_while_inflight();
 	assert(!warnings);
 	return 0;
 }

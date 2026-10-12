@@ -300,7 +300,8 @@ static void sn_request_error(struct sn_qp *q, const struct sn_header *h, u32 sta
  * retry may observe newer data: RC guarantees per-operation consistency, not a
  * snapshot held across retransmits. The MR is retained until the ACK, so it only
  * needs re-resolving when an ACK crossed this retransmit. */
-static void sn_read_response_rearm(struct sn_qp *q, const struct sn_header *h)
+static void sn_read_response_rearm(struct sn_device *d, struct sn_qp *q,
+				  const struct sn_header *h)
 {
 	if (!q->remote_mr)
 		q->remote_mr = sn_mr_get(q, h->rkey, h->address, h->total,
@@ -311,7 +312,22 @@ static void sn_read_response_rearm(struct sn_qp *q, const struct sn_header *h)
 		sn_ack(q, SN_ACK, h->sequence, SN_OK);
 		return;
 	}
-	if (!q->response_active || q->response_sent) {
+	/* A duplicate descriptor means the requester timed out and reset its landing
+	 * zone. Whether this side owes a fresh burst depends on whether the previous
+	 * response has actually left the ring:
+	 *
+	 *  - Frames still queued: leave the response alone. The requester zeroed
+	 *    zc_received when it retransmitted, so those frames are counted from zero
+	 *    and complete the message. Re-bursting as well would put two full messages
+	 *    into one landing zone and overshoot it -- and the requester cannot guard
+	 *    against that itself, because the frames sit in OUR ring and it has no
+	 *    visibility into it. This is the READ-side analogue of the WRITE replay
+	 *    race with the roles reversed, which is why the WRITE drain barrier did not
+	 *    cover it.
+	 *  - Ring drained: the frames were delivered and the READ_ACK was lost, so the
+	 *    requester is waiting for data that will never arrive. Re-burst from zero.
+	 */
+	if (!q->response_active || (q->response_sent && sn_data_tx_drained(d))) {
 		q->response_active = true; q->response_sent = false;
 		q->response_offset = 0;
 		q->response_deadline = ktime_get_ns() + 30000000000ULL;
@@ -335,7 +351,7 @@ static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 			sn_qp_error(q, IB_WC_REM_INV_REQ_ERR); return;
 		}
 		if (h->opcode == SN_ZC_READ && q->receive.replay_status == SN_OK) {
-			sn_read_response_rearm(q, h);
+			sn_read_response_rearm(d, q, h);
 			return;
 		}
 		sn_ack(q, SN_ACK, h->sequence, q->receive.replay_status);
