@@ -8,8 +8,9 @@ inference workload runs over the provider (377 MB placed through SEND/RECV,
 WRITE and READ pass end to end verified byte-for-byte** — including zero-copy
 WRITE at 356–456 MiB/s with 15.6 GiB (16,000 MiB) per direction checked in a single run,
 and zero-copy READ at 408–418 MiB/s over 20 consecutive 15.6 GiB-per-direction
-runs with its timeout recovery forced in every run, `bad_frames` 0 throughout. Not yet:
-hot-unplug and malformed-peer injection.** Still not complete RC conformance, production-ready, or a
+runs with its timeout recovery forced in every run, `bad_frames` 0 throughout. Two
+cable pulls (idle, and mid-transfer) recovered automatically. Not yet: repeated
+unplug cycles and malformed-peer injection.** Still not complete RC conformance, production-ready, or a
 performance claim. Existing series20
 USB4STREAM production behavior/configuration is unchanged. This separate service
 must not be tried alongside production traffic without operator-authorized
@@ -188,6 +189,9 @@ is implied by compilation or the above models. Still unrun:
    inactive-peer NHI wedge**. READY means primed/started/locally activated with
    reciprocal fresh epochs; it does not prove loss/unload races cannot wedge
    hardware. No recovery or non-disruption guarantee exists yet.
+   First hot-unplug test run 2026-10-12: one idle pull and one mid-transfer
+   pull, both removed cleanly and re-attached to ACTIVE with no reboot
+   (`../kernel/verbs/README.md`). That is evidence, not a guarantee.
 5. Actual **unmodified Linux ROCm consumer** build against normal headers/library,
    provider selection/GID0, TP exchange, model correctness and output equivalence.
    Source-call-pattern matching and a smoke binary are not this test. No

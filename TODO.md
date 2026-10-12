@@ -5,13 +5,14 @@ continue. Evidence and background live in the linked docs.
 
 ## Needs physical access
 
-- [ ] **Hot-unplug and abrupt peer loss.** Pull the Thunderbolt cable between
-  max and max2 while the verbs stack is up, first with the link idle, then in
-  the middle of a `read 2000` / `write 2000` run, and record what each side's
-  QP, port state and `stall_snap` show, and whether re-plugging recovers
-  without a reboot. Risk: the known inactive-peer NHI wedge
-  (`docs/NATIVE_VERBS.md`, acceptance gate 4) can need a power cycle, so this
-  needs someone at the machines.
+- [x] **Hot-unplug, first pass (2026-10-12).** An idle pull and a
+  mid-transfer pull both removed cleanly and re-attached to ACTIVE with no
+  reboot. A double ring-stop warning was found and fixed
+  (`kernel/verbs/README.md`, "Hot-unplug on hardware").
+- [ ] **Hot-unplug, remaining cases.** Repeated pull/replug cycles; a pull
+  during bring-up or handshake; powering a peer off instead of pulling; a long
+  disconnect (minutes); a pull during staged-only traffic. Each needs someone at
+  the machines, and the inactive-peer wedge can still need a power cycle.
 
 ## Needs a design decision
 

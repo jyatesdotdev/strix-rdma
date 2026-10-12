@@ -113,6 +113,7 @@ int sn_data_rings_start(struct sn_device *d)
 				 "strix_nhi: data ring interrupt throttling unavailable\n");
 		tb_ring_start(d->data_tx_ring);
 		tb_ring_start(d->data_rx_ring);
+		d->data_rings_started = true;
 	}
 	ret = tb_xdomain_try_enable_native_paths(xd, d->out_hop2,
 		d->data_tx_ring->hop, d->in_hop2, d->data_rx_ring->hop);
@@ -220,8 +221,15 @@ int sn_rings_stop(struct sn_device *d)
 	d->ready.paths_active = d->ready.rings_started = d->ready.rx_primed = 0;
 	/* No peer close packet. tb_ring_stop disables local DMA and synchronously
 	 * joins cancellation callbacks. Only then may staging memory be freed. */
-	if (d->data_tx_ring) tb_ring_stop(d->data_tx_ring);
-	if (d->data_rx_ring) tb_ring_stop(d->data_rx_ring);
+	/* Stop each pair only while it runs: this is retried on EAGAIN below (from
+	 * sn_remove and from every poller pass after carrier loss), and a hot
+	 * unplug makes that the normal case because core removal holds the lock
+	 * the disable trylocks. Re-stopping a stopped ring trips a core WARN. */
+	if (d->data_rings_started) {
+		if (d->data_tx_ring) tb_ring_stop(d->data_tx_ring);
+		if (d->data_rx_ring) tb_ring_stop(d->data_rx_ring);
+		d->data_rings_started = false;
+	}
 	if (d->rings_started) {
 		tb_ring_stop(d->tx_ring);
 		tb_ring_stop(d->rx_ring);

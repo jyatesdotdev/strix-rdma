@@ -343,7 +343,32 @@ qualification; these source checks are not that qualification.
 returning. That local stop contract, not timeout expiry, permits staging free.
 `xdomain.c:2109..2115` keeps runtime PM active while the XDomain exists.
 **Abrupt peer loss can still hit the known inactive-peer NHI wedge despite this
-handshake.** Neither automatic recovery nor coexistence has been hardware-proven.
+handshake.** Coexistence has not been hardware-proven.
+
+**Hot-unplug on hardware (2026-10-12).** The cable was pulled twice, on fresh
+boots of the lab pair: once with the link idle, and once mid-way through a
+bidirectional zero-copy `read 20000` at about 420 MiB/s per direction.
+
+- **Removal:** both hosts removed the verbs device within 10 ms of each other.
+  Under traffic, both applications got `EIO` on their next post and exited
+  within about a second. No task was left stuck, and the module ended unused.
+- **Re-attach:** plugging back in, the XDomain was rediscovered about 5.5 s
+  after the replug began. The service driver re-probed on its own and the port
+  was ACTIVE about 1–1.5 s later, with the zero-copy data plane live. No
+  reboot, reload or manual step was needed.
+- **After re-attach:** SEND, WRITE and READ all passed byte-for-byte at full
+  rate after both re-attachments, including full `2000` runs after the
+  mid-transfer pull. Neither the inactive-peer wedge nor the router wedge
+  (`-110`) appeared.
+- **Driver bug found and fixed:** `sn_rings_stop()` re-stopped the data rings
+  when retried on EAGAIN, which a hot unplug makes routine, because core
+  removal holds the lock the disable trylocks. The core's `tb_ring_stop`
+  warned "TX ring 2 already stopped". The data pair now has its own
+  `data_rings_started` guard, backed by a source-contract test, and the
+  mid-transfer pull ran warning-free.
+- **Not covered:** two pulls are evidence, not a guarantee. Repeated cycles,
+  a pull during bring-up or handshake, peer power-off, long disconnects and
+  coexistence are still open.
 
 ## Data wire version1
 
@@ -584,7 +609,7 @@ Endurance (2026-10-12): 120 consecutive verified runs, 40 rounds of `write
 boot. That is about 1.83 TiB per direction, with `bad_frames 0` and no QP error.
 See `docs/ZEROCOPY_VERBS.md`, round fourteen.
 
-Also not yet run: hot-unplug/malformed-peer injection, and an end-to-end
+Also not yet run: malformed-peer injection, and an end-to-end
 inference re-run over the zero-copy data plane (the earlier proven run predates
 it). Do not describe this bounded experimental implementation as
 complete RC or production-ready.

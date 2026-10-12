@@ -122,8 +122,10 @@ Open:
   injected on hardware at volume (`zc_send_fault`, `ack_drop`, `zc_read_fault`;
   see `docs/ZEROCOPY_VERBS.md`), but malformed-peer frames and control-ring
   loss are still covered only offline.
-- Hot-unplug and abrupt peer loss, including the known inactive-peer NHI wedge.
-  No recovery or non-disruption guarantee exists yet.
+- Hot-unplug beyond the first test. Two pulls (idle, and mid-transfer)
+  recovered automatically with no reboot (2026-10-12, `kernel/verbs/README.md`).
+  Repeated cycles, a pull during handshake, peer power-off and the known
+  inactive-peer NHI wedge are untested, so there is no recovery guarantee yet.
 - GPU-direct registration for the verbs path (it stages through pinned CPU
   pages today).
 

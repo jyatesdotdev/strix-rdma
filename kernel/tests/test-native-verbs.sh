@@ -48,6 +48,17 @@ awk '
  END { if (!passed) exit 1 }
 ' "$main"
 printf 'ok - netdev released on NETDEV_UNREGISTER; poller stopped before ring teardown (source contract)\n'
+# sn_rings_stop() is retried on EAGAIN (hot unplug makes that routine), so it
+# must stop each ring pair only while that pair runs: tb_ring_stop() WARNs on
+# a ring already stopped (seen on hardware, 2026-10-12 hot-unplug test).
+awk '
+ /^int sn_rings_stop\(/ { f=1 }
+ f && /if \(d->data_rings_started\)/ { guard=1 }
+ f && /tb_ring_stop\(d->data_(tx|rx)_ring\)/ { if (!guard) exit 1; n++ }
+ f && /^}/ { if (n == 2) passed=1; exit }
+ END { if (!passed) exit 1 }
+' "$here/../verbs/ring.c"
+printf 'ok - sn_rings_stop stops the data rings only while they run (source contract)\n'
 # The dynamic session handshake must be wire-carried: no DATA property blob,
 # handshake frames gated on local paths only, one-shot static rendezvous.
 if grep -F 'tb_property_add_data(dir, "session"' "$main" "$tmp/native.patch" >/dev/null; then

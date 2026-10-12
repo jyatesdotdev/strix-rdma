@@ -205,6 +205,10 @@ struct sn_device {
 	int in_hop2, out_hop2;
 	bool zc_unavail;
 	bool paths_active, rings_started, rx_primed, dead, registered, net_gone;
+	/* The data ring pair is started. Like rings_started for the control pair,
+	 * it makes sn_rings_stop() idempotent: that call is retried while the core
+	 * answers EAGAIN, and tb_ring_stop() warns on a ring already stopped. */
+	bool data_rings_started;
 	bool reset_rings, static_published;
 	bool have_context, have_pd;
 	unsigned int cq_count, mr_count;

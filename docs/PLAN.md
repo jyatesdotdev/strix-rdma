@@ -295,8 +295,8 @@ is done; hardware READ/WRITE are now validated end to end (zero-copy WRITE at
 356–456 MiB/s with 15.6 GiB (16,000 MiB) per direction verified byte-for-byte, and
 zero-copy READ, on by default since 2026-10-12, at 408–418 MiB/s over 20 consecutive
 15.6 GiB-per-direction runs with its timeout recovery forced, `bad_frames` 0); the open work is conformance breadth
-(hot-unplug, malformed peers,
-packet loss) and GPU-direct registration instead of CPU
+(repeated hot-unplug cycles beyond the first idle and mid-transfer pulls,
+malformed peers) and GPU-direct registration instead of CPU
 staging. Production
 work on any path remains dominated by disconnect/reset cancellation,
 synchronization, security, and compatibility rather than descriptor creation.

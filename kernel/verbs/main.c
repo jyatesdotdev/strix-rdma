@@ -337,7 +337,10 @@ static int sn_thread(void *arg)
 			continue;
 		}
 		d->poll_sleeps++;
-		wait_event_timeout(d->poll_wait,
+		/* TASK_IDLE: an idle poller is not uninterruptible work, so it must
+		 * not show as D state or add 1 to the load average for as long as the
+		 * device exists (it did with wait_event_timeout). */
+		wait_event_idle_timeout(d->poll_wait,
 			READ_ONCE(d->poll_kick) || sn_ring_pending(d) ||
 			READ_ONCE(d->control_count) ||
 			READ_ONCE(d->dead) || kthread_should_stop(),

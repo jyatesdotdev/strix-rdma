@@ -1,6 +1,25 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — first hot-unplug test: two pulls, both recovered automatically
+- **Idle pull:** both hosts removed the verbs device cleanly. Replugging,
+  the XDomain was found again and the driver re-probed and reached ACTIVE about
+  1.5 s later, with every mode then passing at full rate.
+- **Mid-transfer pull** (bidirectional zero-copy `read 20000`, about 420 MiB/s
+  each way): both applications got `EIO` and exited within about a second. Both
+  kernels stayed clean. After replugging the link was ACTIVE about 1 s later,
+  and full `read`/`write`/`send 2000` runs passed byte-for-byte. No wedge.
+- **Driver bug:** `sn_rings_stop()` re-stopped already-stopped data rings when
+  retried on EAGAIN (hot unplug makes that routine), so the core warned "TX ring
+  2 already stopped". Fixed with a `data_rings_started` guard and a
+  source-contract test; the mid-transfer pull was then warning-free.
+- **Cosmetic:** the idle poller slept uninterruptibly, showing as D state and
+  adding 1 to the load average. It now uses `wait_event_idle_timeout`.
+- **Process error:** a remote `pkill -f hp-monitor` matched its own shell and
+  aborted a build-and-reboot step. The step-1 monitor logs were then deleted;
+  the kernel log was recovered from the persistent journal.
+- Remaining unplug cases are in `TODO.md`.
+
 ## 2026-10-12 — 90-minute endurance: 120/120
 - 40 rounds of verified `write 2000`, `send 2000` and `read 2000` on one boot,
   all fault injection off. All 120 runs passed byte-for-byte in 5,445 s, about

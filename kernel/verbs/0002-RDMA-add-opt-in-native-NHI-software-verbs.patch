@@ -459,7 +459,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,331 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -667,6 +667,10 @@ new file mode 100644
 +	int in_hop2, out_hop2;
 +	bool zc_unavail;
 +	bool paths_active, rings_started, rx_primed, dead, registered, net_gone;
++	/* The data ring pair is started. Like rings_started for the control pair,
++	 * it makes sn_rings_stop() idempotent: that call is retried while the core
++	 * answers EAGAIN, and tb_ring_stop() warns on a ring already stopped. */
++	bool data_rings_started;
 +	bool reset_rings, static_published;
 +	bool have_context, have_pd;
 +	unsigned int cq_count, mr_count;
@@ -791,7 +795,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,588 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -1131,7 +1135,10 @@ new file mode 100644
 +			continue;
 +		}
 +		d->poll_sleeps++;
-+		wait_event_timeout(d->poll_wait,
++		/* TASK_IDLE: an idle poller is not uninterruptible work, so it must
++		 * not show as D state or add 1 to the load average for as long as the
++		 * device exists (it did with wait_event_timeout). */
++		wait_event_idle_timeout(d->poll_wait,
 +			READ_ONCE(d->poll_kick) || sn_ring_pending(d) ||
 +			READ_ONCE(d->control_count) ||
 +			READ_ONCE(d->dead) || kthread_should_stop(),
@@ -1381,7 +1388,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,561 @@
+@@ -0,0 +1,569 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1497,6 +1504,7 @@ new file mode 100644
 +				 "strix_nhi: data ring interrupt throttling unavailable\n");
 +		tb_ring_start(d->data_tx_ring);
 +		tb_ring_start(d->data_rx_ring);
++		d->data_rings_started = true;
 +	}
 +	ret = tb_xdomain_try_enable_native_paths(xd, d->out_hop2,
 +		d->data_tx_ring->hop, d->in_hop2, d->data_rx_ring->hop);
@@ -1604,8 +1612,15 @@ new file mode 100644
 +	d->ready.paths_active = d->ready.rings_started = d->ready.rx_primed = 0;
 +	/* No peer close packet. tb_ring_stop disables local DMA and synchronously
 +	 * joins cancellation callbacks. Only then may staging memory be freed. */
-+	if (d->data_tx_ring) tb_ring_stop(d->data_tx_ring);
-+	if (d->data_rx_ring) tb_ring_stop(d->data_rx_ring);
++	/* Stop each pair only while it runs: this is retried on EAGAIN below (from
++	 * sn_remove and from every poller pass after carrier loss), and a hot
++	 * unplug makes that the normal case because core removal holds the lock
++	 * the disable trylocks. Re-stopping a stopped ring trips a core WARN. */
++	if (d->data_rings_started) {
++		if (d->data_tx_ring) tb_ring_stop(d->data_tx_ring);
++		if (d->data_rx_ring) tb_ring_stop(d->data_rx_ring);
++		d->data_rings_started = false;
++	}
 +	if (d->rings_started) {
 +		tb_ring_stop(d->tx_ring);
 +		tb_ring_stop(d->rx_ring);
