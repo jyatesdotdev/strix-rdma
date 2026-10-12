@@ -34,6 +34,7 @@ extern unsigned int sn_data_throttle_ns;
 extern bool sn_zc_write;
 /* Opt-in zero-copy RDMA READ, same shape and latched the same way. */
 extern bool sn_zc_read;
+extern unsigned int sn_zc_read_fault;
 #define SN_SERVICE "strixv1"
 #define SN_CONTROL_BYTES 112
 /* Handshake retransmission intervals; loss is expected, peers retransmit. */
@@ -120,6 +121,8 @@ struct sn_qp {
 	 * staged SN_READ. Responder: a staged SN_READ replaced the zero-copy
 	 * response for the same operation and is waiting to be served. */
 	bool zc_read_staged, response_fallback;
+	/* This zero-copy READ was selected by zc_read_fault; cleared once injected. */
+	bool zc_read_fault;
 	/* Inbound burst descriptor held because the landing zone was busy with our
 	 * own zero-copy READ response; re-driven by sn_engine_progress as soon as it
 	 * frees. Header-less frames from two bursts could not be told apart, so one
@@ -209,6 +212,8 @@ struct sn_device {
 	u64 zc_read_fallback, zc_read_fallback_served;
 	/* Responder-side exits of the zero-copy READ fallback path (diagnostic). */
 	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
+	/* Zero-copy READs requested, and timeouts forced on them by zc_read_fault. */
+	u64 zc_read_ops, zc_read_fault_injected;
 	struct sn_stall_snap snap_drain, snap_err;
 	struct list_head mrs;
 	struct sn_qp *qp;

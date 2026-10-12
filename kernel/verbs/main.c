@@ -77,6 +77,16 @@ bool sn_zc_read = false;
 module_param_named(zc_read, sn_zc_read, bool, 0444);
 MODULE_PARM_DESC(zc_read,
 	"Let eligible RDMA READs take the zero-copy data ring (default off; 1 opts in, 0 keeps the staged READ path)");
+/* Fault injection for diagnosing zero-copy READ recovery: every Nth zero-copy
+ * READ this host requests has its retransmit window expired the moment its reply
+ * is within 32 frames of landing, so the requester falls back to a staged
+ * SN_READ while the tail of the responder's burst is still live -- the
+ * precondition of every recovery failure seen on hardware. Writable at runtime so
+ * a capture needs no reload; 0 (the default) never faults. */
+unsigned int sn_zc_read_fault;
+module_param_named(zc_read_fault, sn_zc_read_fault, uint, 0644);
+MODULE_PARM_DESC(zc_read_fault,
+	"Diagnostic: force every Nth zero-copy READ to time out near its tail (default 0 = off)");
 
 static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);

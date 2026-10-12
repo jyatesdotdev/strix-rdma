@@ -536,8 +536,17 @@ void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 		 * peer's burst rather than by a frame we can time against, so measure the
 		 * retransmit window from the last frame: without this a burst slower than
 		 * one window would be restarted on top of frames still in flight. */
-		if (read && !q->zc_read_staged)
-			q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
+		if (read && !q->zc_read_staged) {
+			if (q->zc_read_fault && q->zc_total - q->zc_received <= 32 * SN_FRAME) {
+				/* zc_read_fault: time out now, with the tail of the burst
+				 * still queued in the responder's data TX ring. */
+				q->zc_read_fault = false;
+				d->zc_read_fault_injected++;
+				q->deadline = 0;
+			} else {
+				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
+			}
+		}
 		return;
 	}
 	/* The burst landed. Drop the landing zone first: either completion path can
@@ -942,10 +951,16 @@ void sn_engine_progress(struct sn_device *d)
 				 * no payload, so the retransmit path below is the whole state
 				 * machine and q->zc_read_armed marks the landing zone as ours. */
 				if (!q->zc_read_armed) {
+					unsigned int every;
+
 					if (q->zc_expect) { ret = 0; break; }
 					q->zc_mr = w->mr; q->zc_address = w->address;
 					q->zc_total = w->length; q->zc_received = 0;
 					q->zc_expect = true; q->zc_read_armed = true;
+					/* One read: the parameter is writable at runtime. */
+					every = READ_ONCE(sn_zc_read_fault);
+					d->zc_read_ops++;
+					q->zc_read_fault = every && !(d->zc_read_ops % every);
 					if (sn_data_recv_start(d, q)) {
 						q->zc_expect = q->zc_read_armed = false;
 						q->zc_mr = NULL; q->zc_address = 0;

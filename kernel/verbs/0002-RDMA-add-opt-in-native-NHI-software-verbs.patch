@@ -459,7 +459,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,301 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -496,6 +496,7 @@ new file mode 100644
 +extern bool sn_zc_write;
 +/* Opt-in zero-copy RDMA READ, same shape and latched the same way. */
 +extern bool sn_zc_read;
++extern unsigned int sn_zc_read_fault;
 +#define SN_SERVICE "strixv1"
 +#define SN_CONTROL_BYTES 112
 +/* Handshake retransmission intervals; loss is expected, peers retransmit. */
@@ -582,6 +583,8 @@ new file mode 100644
 +	 * staged SN_READ. Responder: a staged SN_READ replaced the zero-copy
 +	 * response for the same operation and is waiting to be served. */
 +	bool zc_read_staged, response_fallback;
++	/* This zero-copy READ was selected by zc_read_fault; cleared once injected. */
++	bool zc_read_fault;
 +	/* Inbound burst descriptor held because the landing zone was busy with our
 +	 * own zero-copy READ response; re-driven by sn_engine_progress as soon as it
 +	 * frees. Header-less frames from two bursts could not be told apart, so one
@@ -671,6 +674,8 @@ new file mode 100644
 +	u64 zc_read_fallback, zc_read_fallback_served;
 +	/* Responder-side exits of the zero-copy READ fallback path (diagnostic). */
 +	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
++	/* Zero-copy READs requested, and timeouts forced on them by zc_read_fault. */
++	u64 zc_read_ops, zc_read_fault_injected;
 +	struct sn_stall_snap snap_drain, snap_err;
 +	struct list_head mrs;
 +	struct sn_qp *qp;
@@ -760,7 +765,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,554 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -840,6 +845,16 @@ new file mode 100644
 +module_param_named(zc_read, sn_zc_read, bool, 0444);
 +MODULE_PARM_DESC(zc_read,
 +	"Let eligible RDMA READs take the zero-copy data ring (default off; 1 opts in, 0 keeps the staged READ path)");
++/* Fault injection for diagnosing zero-copy READ recovery: every Nth zero-copy
++ * READ this host requests has its retransmit window expired the moment its reply
++ * is within 32 frames of landing, so the requester falls back to a staged
++ * SN_READ while the tail of the responder's burst is still live -- the
++ * precondition of every recovery failure seen on hardware. Writable at runtime so
++ * a capture needs no reload; 0 (the default) never faults. */
++unsigned int sn_zc_read_fault;
++module_param_named(zc_read_fault, sn_zc_read_fault, uint, 0644);
++MODULE_PARM_DESC(zc_read_fault,
++	"Diagnostic: force every Nth zero-copy READ to time out near its tail (default 0 = off)");
 +
 +static const uuid_t sn_uuid = UUID_INIT(0x9dfdfb88, 0xeaa4, 0x4d26,
 +				      0x98, 0x92, 0x59, 0xf2, 0x08, 0x45, 0x51, 0x01);
@@ -1888,7 +1903,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/str
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/verbs.c
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,554 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/random.h>
 +#include <linux/vmalloc.h>
@@ -2349,7 +2364,7 @@ new file mode 100644
 +	ssize_t n;
 +
 +	mutex_lock(&d->lock);
-+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\n",
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\n",
 +		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 +		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_retries, d->zc_aborts,
 +		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
@@ -2358,7 +2373,8 @@ new file mode 100644
 +		d->zc_read_dup_posting, d->zc_read_dup_undrained,
 +		d->zc_read_fallback, d->zc_read_fallback_served,
 +		d->zc_fb_wait_midpost, d->zc_fb_wait_drain, d->zc_fb_reserve,
-+		d->zc_read_req_drop, d->zc_resp_retry_exc, d->zc_resp_start_exc);
++		d->zc_read_req_drop, d->zc_resp_retry_exc, d->zc_resp_start_exc,
++		d->zc_read_ops, d->zc_read_fault_injected);
 +	n += sysfs_emit_at(buf, n,
 +		"zdata %d\ndata_tx_head %u\ndata_tx_tail %u\ndata_rx_head %u\n"
 +		"data_rx_tail %u\nzdata_posted %u\n",
@@ -2621,7 +2637,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,1004 @@
+@@ -0,0 +1,1019 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -3160,8 +3176,17 @@ new file mode 100644
 +		 * peer's burst rather than by a frame we can time against, so measure the
 +		 * retransmit window from the last frame: without this a burst slower than
 +		 * one window would be restarted on top of frames still in flight. */
-+		if (read && !q->zc_read_staged)
-+			q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
++		if (read && !q->zc_read_staged) {
++			if (q->zc_read_fault && q->zc_total - q->zc_received <= 32 * SN_FRAME) {
++				/* zc_read_fault: time out now, with the tail of the burst
++				 * still queued in the responder's data TX ring. */
++				q->zc_read_fault = false;
++				d->zc_read_fault_injected++;
++				q->deadline = 0;
++			} else {
++				q->deadline = ktime_get_ns() + sn_ack_timeout_ns(q->attr.timeout);
++			}
++		}
 +		return;
 +	}
 +	/* The burst landed. Drop the landing zone first: either completion path can
@@ -3566,10 +3591,16 @@ new file mode 100644
 +				 * no payload, so the retransmit path below is the whole state
 +				 * machine and q->zc_read_armed marks the landing zone as ours. */
 +				if (!q->zc_read_armed) {
++					unsigned int every;
++
 +					if (q->zc_expect) { ret = 0; break; }
 +					q->zc_mr = w->mr; q->zc_address = w->address;
 +					q->zc_total = w->length; q->zc_received = 0;
 +					q->zc_expect = true; q->zc_read_armed = true;
++					/* One read: the parameter is writable at runtime. */
++					every = READ_ONCE(sn_zc_read_fault);
++					d->zc_read_ops++;
++					q->zc_read_fault = every && !(d->zc_read_ops % every);
 +					if (sn_data_recv_start(d, q)) {
 +						q->zc_expect = q->zc_read_armed = false;
 +						q->zc_mr = NULL; q->zc_address = 0;

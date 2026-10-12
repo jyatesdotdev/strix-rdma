@@ -827,3 +827,120 @@ timeout, is rare and varies from boot to boot. No stall was captured, so the
 branch question is still open. Capturing one reliably needs the timeout to be
 *induced*: make the requester time out a zero-copy READ while the responder's
 burst is still live. That is the precondition of every failure captured so far.
+
+### Round nine: an induced stall, captured on both hosts
+
+**Inducing it.** A smoke-tool `--qp-timeout` option was the first plan, but the
+driver accepts only `timeout 14` at RTS (`EINVAL` otherwise), so the timeout is
+forced inside the driver instead. The new `zc_read_fault=N` module parameter
+(0644, default 0, diagnostic) works like this: on every Nth zero-copy READ this
+host requests, the retransmit window expires as soon as the reply is within 32
+frames of landing. The requester then falls back to a staged `SN_READ` while the
+tail of the responder's burst is still live, which is the precondition of every
+recovery failure seen so far. `zc_read_ops` and `zc_read_fault_injected` count
+it, and ok 31 covers it offline (differentially verified: with the selection
+disabled, ok 31 fails and every other test passes).
+
+**Result:** with `zc_read_fault=100` on both hosts, the first two `read 2000`
+runs both failed with RETRY_EXC (run 1 at iter 51, run 2 likewise early). Both
+show the same signature. In both, the injected READ fell back, was served staged
+and completed byte-for-byte. The *next* zero-copy READ never received one frame.
+Frozen state, verbatim (max = responder, `drain_*` taken during the stall;
+max2 = requester, `err_*` taken at its retry exhaustion, before the flush):
+
+```
+--- run 1
+max: drain_count 106
+max: drain_status 0
+max: drain_data_tx_head 102455
+max: drain_data_tx_tail 102392
+max: drain_data_rx_head 104448
+max: drain_data_rx_tail 104448
+max: drain_zdata_posted 2097152
+max: drain_zc_received 2097152
+max: drain_zc_total 2097152
+max: drain_zc_expect 0
+max: drain_zc_read_staged 0
+max: drain_zc_read_armed 0
+max: drain_response 1/1/1/258048
+max: drain_hw_tx ret=0 head=55 tail=56 hw_posted=55 hw_completed=56 queued=0 in_flight=63 posted=102455 completed=102392 running=1 irq_en=1 hw_valid=1 tail_flags=0xc
+max: drain_hw_rx ret=0 head=0 tail=0 hw_posted=0 hw_completed=0 queued=0 in_flight=0 posted=104448 completed=104448 running=1 irq_en=1 hw_valid=1 tail_flags=0x0
+max2: err_count 1
+max2: err_status 12
+max2: err_data_tx_head 104448
+max2: err_data_tx_tail 104440
+max2: err_data_rx_head 102463
+max2: err_data_rx_tail 102400
+max2: err_zdata_posted 258048
+max2: err_zc_received 0
+max2: err_zc_total 2097152
+max2: err_zc_expect 1
+max2: err_zc_read_staged 1
+max2: err_zc_read_armed 1
+max2: err_response 0/1/0/2097152
+max2: err_hw_tx ret=0 head=0 tail=0 hw_posted=0 hw_completed=0 queued=0 in_flight=0 posted=104448 completed=104448 running=1 irq_en=1 hw_valid=1 tail_flags=0x0
+max2: err_hw_rx ret=0 head=63 tail=0 hw_posted=63 hw_completed=0 queued=0 in_flight=63 posted=102463 completed=102392 running=1 irq_en=1 hw_valid=1 tail_flags=0xc
+--- run 2
+max: drain_count 211
+max: drain_status 0
+max: drain_data_tx_head 567406
+max: drain_data_tx_tail 567343
+max: drain_data_rx_head 569856
+max: drain_data_rx_tail 569856
+max: drain_zdata_posted 2097152
+max: drain_zc_received 2097152
+max: drain_zc_total 2097152
+max: drain_zc_expect 0
+max: drain_zc_read_staged 0
+max: drain_zc_read_armed 0
+max: drain_response 1/1/1/258048
+max: drain_hw_tx ret=0 head=55 tail=56 hw_posted=55 hw_completed=56 queued=0 in_flight=63 posted=567406 completed=567280 running=1 irq_en=1 hw_valid=1 tail_flags=0xc
+max: drain_hw_rx ret=0 head=0 tail=0 hw_posted=0 hw_completed=0 queued=0 in_flight=0 posted=569856 completed=569856 running=1 irq_en=1 hw_valid=1 tail_flags=0x0
+max2: err_count 2
+max2: err_status 12
+max2: err_data_tx_head 569856
+max2: err_data_tx_tail 569848
+max2: err_data_rx_head 567422
+max2: err_data_rx_tail 567359
+max2: err_zdata_posted 258048
+max2: err_zc_received 0
+max2: err_zc_total 2097152
+max2: err_zc_expect 1
+max2: err_zc_read_staged 1
+max2: err_zc_read_armed 1
+max2: err_response 0/1/0/2097152
+max2: err_hw_tx ret=0 head=0 tail=0 hw_posted=0 hw_completed=0 queued=0 in_flight=0 posted=569856 completed=569856 running=1 irq_en=1 hw_valid=1 tail_flags=0x0
+max2: err_hw_rx ret=0 head=63 tail=0 hw_posted=63 hw_completed=0 queued=0 in_flight=63 posted=567422 completed=567280 running=1 irq_en=1 hw_valid=1 tail_flags=0xc
+```
+
+Reading it (run 2; run 1 is identical in shape):
+
+- **The requester still has data RX buffers posted. That answers the open
+  question: yes.** max2's NHI holds 63 posted RX descriptors (`hw_posted=63
+  in_flight=63`) and has completed none (`hw_completed=0`, tail flags `0xc` =
+  POSTED|INTERRUPT, no COMPLETED). `zdata_posted` is 258048 = 63 frames.
+- **The responder's frames are posted to the hardware and never sent.** max's
+  NHI TX ring is full with 63 descriptors (`head=55 tail=56`, `in_flight=63`).
+  The hardware consumer index has not moved past the software tail
+  (`hw_completed=56`), and that tail descriptor is POSTED but not COMPLETED.
+- **Nothing was lost.** max TX `completed` equals max2 RX `completed` exactly
+  (102392 and 567280), so every frame the responder's NHI ever transmitted was
+  received. Driver and core ring indices agree. The other direction (max2 TX to
+  max RX) is fully drained.
+- **The requester's RX ring was restarted immediately before.** Its core indices
+  read `head=63 tail=0`: since the last `tb_ring_start`, exactly this READ's 63
+  buffers were posted and nothing was received. The only restart in this path is
+  `sn_data_recv_restart()` in the staged completion of the injected READ. In
+  run 1 it canceled 8 posted buffers the truncated burst never filled
+  (`data_rx_tail` 102400 minus `completed` 102392).
+- **Restarting both ends recovers.** On the same boot, after each failure the
+  QP teardown restarted both data rings on both hosts. The SEND smoke then passed
+  and `write 200` passed at 401 MiB/s, byte-for-byte.
+
+So a transmitter with frames posted, facing a receiver with buffers posted, sends
+nothing. That is E2E credit starvation: the responder's TX ring holds no credits
+for the requester's re-posted buffers. It begins exactly at a one-sided
+`tb_ring_stop`/`tb_ring_start` of the requester's data RX ring while the peer's
+data TX ring stays up, and it clears when both ends restart together. This also
+explains rounds 5–7: in each, the first fallback of a run was served, and a
+*later* zero-copy READ stalled.

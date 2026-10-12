@@ -61,7 +61,7 @@ struct sn_qp {
 	u32 zc_total, zc_received;
 	struct sn_mr *zc_mr;
 	u64 zc_address;
-	bool zc_read_armed, zc_held, zc_read_staged, response_fallback;
+	bool zc_read_armed, zc_held, zc_read_staged, response_fallback, zc_read_fault;
 	struct sn_header zc_held_header;
 };
 struct packet { u8 data[SN_FRAME]; size_t bytes; };
@@ -84,6 +84,7 @@ struct sn_device {
 	u64 zc_read_dup_posting, zc_read_dup_undrained;
 	u64 zc_read_fallback, zc_read_fallback_served;
 	u64 zc_fb_wait_midpost, zc_fb_wait_drain, zc_fb_reserve, zc_read_req_drop, zc_resp_retry_exc, zc_resp_start_exc;
+	u64 zc_read_ops, zc_read_fault_injected;
 	/* Set when this side's queued burst was stranded by the peer stopping and
 	 * restarting its data RX ring underneath it. Observed on hardware: the ring
 	 * then never drains and its frames never land, for the rest of the boot. */
@@ -178,6 +179,8 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 void sn_data_abort(struct sn_device *d);
 void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status);
 bool sn_data_tx_drained(struct sn_device *d);
+unsigned int sn_zc_read_fault;
+#define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
 #include "../verbs/protocol.c"
 /* Modeled zero-copy data plane: one burst copies payload from an explicit source
  * MR straight into the peer's expected-burst landing zone and feeds the engine's
@@ -1333,9 +1336,44 @@ static void test_zc_read_fallback_truncates_midpost(void)
 	release(a); release(b);
 	puts("ok 30 - a fallback arriving mid-post truncates the zero-copy reply and is served staged");
 }
+/* zc_read_fault (diagnostic) forces every Nth zero-copy READ to time out with the
+ * tail of its reply still live -- the precondition of every hardware stall. Only
+ * the selected operation is faulted; it must still complete exactly once,
+ * byte-for-byte, through the staged fallback. */
+static void read_until(struct sn_device *a, struct sn_device *b, unsigned int sends)
+{
+	unsigned int i;
+
+	for (i = 0; i < 400 && a->sends < sends && !a->errors; i++) {
+		flush_inflight(b);
+		step(a, b, NULL, NULL);
+	}
+	assert(a->sends == sends && !a->errors && !b->errors);
+}
+static void test_zc_read_fault_injection(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+
+	sn_zc_read_fault = 2;
+	b->zc_defer = SN_MESSAGE / 16;
+	memset(b->mr[1].data, 0x9e, SN_MESSAGE);
+	post(a, SN_READ, SN_MESSAGE);
+	read_until(a, b, 1);			/* first READ: not selected */
+	assert(!a->zc_read_fault_injected && !a->zc_read_fallback);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	memset(b->mr[1].data, 0x4b, SN_MESSAGE);
+	post(a, SN_READ, SN_MESSAGE);
+	read_until(a, b, 2);			/* second READ: faulted near its tail */
+	sn_zc_read_fault = 0;
+	assert(a->zc_read_fault_injected == 1 && a->zc_read_fallback == 1);
+	assert(b->zc_read_fallback_served == 1);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data, SN_MESSAGE));
+	release(a); release(b);
+	puts("ok 31 - zc_read_fault forces a READ timeout with its tail live; the staged fallback completes it once");
+}
 int main(void)
 {
-	puts("1..30");
+	puts("1..31");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1353,6 +1391,7 @@ int main(void)
 	test_zc_read_cross_path_identity();
 	test_zc_read_never_lands();
 	test_zc_read_fallback_truncates_midpost();
+	test_zc_read_fault_injection();
 	assert(!warnings);
 	return 0;
 }
