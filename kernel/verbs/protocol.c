@@ -333,7 +333,13 @@ static void sn_read_response_rearm(struct sn_device *d, struct sn_qp *q,
 		q->response_offset = 0;
 		q->response_deadline = ktime_get_ns() + 30000000000ULL;
 	} else {
+		/* Split so a captured failure says WHERE the response is stuck:
+		 * still being posted (the burst itself cannot get onto the data TX
+		 * ring), or fully posted but the ring never drains (the NHI cannot
+		 * transmit what is queued -- e.g. the peer has no RX buffer posted). */
 		d->zc_read_dup_inflight++;
+		if (!q->response_sent) d->zc_read_dup_posting++;
+		else d->zc_read_dup_undrained++;
 	}
 }
 /* Receiver: a zero-copy burst descriptor arrived on the control ring. The

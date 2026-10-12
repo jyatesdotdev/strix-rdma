@@ -81,6 +81,7 @@ struct sn_device {
 	u64 bad_frames, send_bytes, write_bytes, read_bytes;
 	u64 zc_bursts, zc_retries, zc_aborts, zc_tx_bursts;
 	u64 zc_read_retx, zc_read_dup_inflight, zc_read_rearm, zc_seq_ahead, zc_seq_stale;
+	u64 zc_read_dup_posting, zc_read_dup_undrained;
 	u64 sched_calls, rnr_sent;
 	bool check_ids;
 	u32 caps;
@@ -1237,6 +1238,10 @@ static void test_zc_read_duplicate_while_inflight(void)
 	/* b must leave the queued response alone rather than restart it. */
 	assert(b->qp->response_sent && b->qp->response_offset == SN_MESSAGE);
 	assert(b->inflight_count == 1 && b->zc_tx_bursts == 1);
+	/* The reply was fully posted, so the duplicate is attributed to the
+	 * undrained side of the split, never the still-posting side. */
+	assert(b->zc_read_dup_inflight == 1 && b->zc_read_dup_undrained == 1 &&
+	       !b->zc_read_dup_posting && !b->zc_read_rearm);
 
 	/* Those frames land exactly once and complete the READ. */
 	flush_inflight(b);

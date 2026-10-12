@@ -453,7 +453,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,269 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -640,6 +640,8 @@ new file mode 100644
 +	 * zc_retries increment in the retry path never fires. These count what it
 +	 * misses, plus the two silent-drop outcomes of an unexpected sequence. */
 +	u64 zc_read_retx, zc_read_dup_inflight, zc_read_rearm, zc_seq_ahead, zc_seq_stale;
++	/* zc_read_dup_inflight = posting + undrained. */
++	u64 zc_read_dup_posting, zc_read_dup_undrained;
 +	struct list_head mrs;
 +	struct sn_qp *qp;
 +	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
@@ -1824,7 +1826,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/str
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/verbs.c
-@@ -0,0 +1,499 @@
+@@ -0,0 +1,500 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/random.h>
 +#include <linux/vmalloc.h>
@@ -2282,12 +2284,13 @@ new file mode 100644
 +	ssize_t n;
 +
 +	mutex_lock(&d->lock);
-+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\n",
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\n",
 +		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 +		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_retries, d->zc_aborts,
 +		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
 +		d->sched_calls, d->rnr_sent, d->zc_read_retx, d->zc_read_dup_inflight,
-+		d->zc_read_rearm, d->zc_seq_ahead, d->zc_seq_stale);
++		d->zc_read_rearm, d->zc_seq_ahead, d->zc_seq_stale,
++		d->zc_read_dup_posting, d->zc_read_dup_undrained);
 +	if (d->qp) {
 +		struct sn_qp *q = d->qp;
 +
@@ -2503,7 +2506,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,918 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -2839,7 +2842,13 @@ new file mode 100644
 +		q->response_offset = 0;
 +		q->response_deadline = ktime_get_ns() + 30000000000ULL;
 +	} else {
++		/* Split so a captured failure says WHERE the response is stuck:
++		 * still being posted (the burst itself cannot get onto the data TX
++		 * ring), or fully posted but the ring never drains (the NHI cannot
++		 * transmit what is queued -- e.g. the peer has no RX buffer posted). */
 +		d->zc_read_dup_inflight++;
++		if (!q->response_sent) d->zc_read_dup_posting++;
++		else d->zc_read_dup_undrained++;
 +	}
 +}
 +/* Receiver: a zero-copy burst descriptor arrived on the control ring. The

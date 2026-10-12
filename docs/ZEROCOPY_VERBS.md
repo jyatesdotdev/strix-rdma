@@ -596,3 +596,53 @@ peer's later zero-copy responses through `sn_response_may_burst()`.
 Next measurement worth taking first: split `zc_read_dup_inflight` into
 "response not yet fully posted" vs "posted but TX ring not drained", to confirm
 which side of the stall the responder is stuck on.
+
+### Fourth hardware round: the stall is *undrained*, and it wedges the whole data plane
+
+`zc_read_dup_inflight` is now split at its single increment site into
+`zc_read_dup_posting` (duplicate arrived while the reply was still being posted
+onto the data TX ring) and `zc_read_dup_undrained` (reply fully posted, ring not
+yet drained); ok 27 asserts a fully-posted reply is attributed to the undrained
+side. The smoke tool also gained a per-frame source diagnosis: within one 4 KiB
+frame `pattern()` reduces to the source nonce plus one constant
+`C = 2*frame ^ 29*iter ^ 53*slot`, so each bad frame reports whose buffer it came
+from and its C delta.
+
+One reboot cycle with `zc_read=1`, `read 2000` repeated:
+
+| run | result | responder | requester |
+|---|---|---|---|
+| (pre-split) 1 | **corrupt payload**, whole 2 MiB slot non-zero wrong bytes | `zc_read_rearm` +1 | `zc_read_retx` +1 |
+| 1–6 | PASS | — | — |
+| 7 | **RETRY_EXC**, iter 189 | max2 `zc_read_dup_undrained` **+3** | max `zc_read_retx` +3 |
+| 8 | RETRY_EXC at **iter 1**, both sides | `zc_read_dup_posting` +3 | `zc_read_retx` +3 |
+| 9 | RETRY_EXC at **iter 1**, both sides | `zc_read_dup_posting` +3 | `zc_read_retx` +3 |
+
+Then the default **SEND smoke failed** (`CQ poll/deadline`) on the same boot,
+with the port ACTIVE, `bad_frames` 0 and dmesg silent. A normal reboot cleared
+it (SEND PASS, `write 200` PASS at 457.27 MiB/s), so the wedge is boot-scoped.
+
+What this settles:
+
+1. **The stall is on the undrained side.** In run 7 the responder had fully
+   posted its reply and its data TX ring never drained. Its frames could not be
+   transmitted.
+2. **It persists across QPs and is ring-wide.** Runs 8 and 9 were fresh QPs that
+   could not even *post* a reply (`dup_posting`) — the stranded frames from run 7
+   still filled the ring — and zero-copy SEND then failed too. One READ recovery
+   failure silently disables the zero-copy data plane for the rest of the boot.
+3. **Open design question 2 is answered: yes.** Restarting the requester's data
+   RX ring (`sn_data_recv_restart()`: `tb_ring_stop` + `tb_ring_start`) while the
+   peer still has a burst in flight leaves the peer's TX unable to drain under E2E
+   flow control. The recovery path must therefore **never stop/start the data RX
+   ring under a live peer burst**. Posted buffers must stay posted; late frames
+   from an abandoned attempt must be absorbed and discarded, not cancelled.
+4. **The drained re-burst path also corrupts** (pre-split run): with the ring
+   drained the responder re-armed and re-burst, and the requester landed a whole
+   slot of wrong, non-zero bytes. Re-bursting into a landing zone that was just
+   stopped and restarted is not trustworthy either.
+
+Together these rule out every recovery that keeps using the data ring after a
+timeout. That is the case for the staged fallback: once a READ times out, the
+requester stops expecting the data ring for that operation entirely and fetches
+the bytes through header'd, offset-addressed control-ring fragments.

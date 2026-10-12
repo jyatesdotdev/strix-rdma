@@ -168,8 +168,37 @@ static int pattern_run(const unsigned char *p, unsigned n, uint64_t nonce,
 		if (p[k] != pattern(nonce, window, slot, byte + k)) return 0;
 	return 1;
 }
-static void report_mismatch(const unsigned char *landed, uint64_t nonce, unsigned it,
-			    unsigned slot, unsigned chunk, unsigned slots)
+/* Within one 4 KiB frame, pattern() reduces to the source nonce byte, k*131, and
+ * one constant C = 2*frame ^ 29*iter ^ 53*slot. So each bad frame reveals whose
+ * buffer it came from (peer or this side's own) and C_delta against the expected
+ * C: a delta that is constant across frames means a whole-burst source mix-up
+ * (wrong iteration or slot); one that varies frame to frame means frames landed
+ * in the wrong order or at the wrong offset. */
+static void frame_diag(const unsigned char *s, unsigned chunk, uint64_t peer_n,
+		       uint64_t own_n, unsigned it, unsigned slot)
+{
+	unsigned shown = 0;
+
+	for (unsigned f = 0; f < chunk / 4096 && shown < 6; f++) {
+		const unsigned char *p = s + (size_t)f * 4096;
+		unsigned base = f * 4096, ok_peer = 1, ok_own = 1;
+		unsigned char cp = p[0] ^ (unsigned char)peer_n, co = p[0] ^ (unsigned char)own_n;
+		unsigned char want = (unsigned char)((2u * f) ^ (it * 29u) ^ (slot * 53u));
+
+		if (p[0] == pattern(peer_n, it, slot, base)) continue;
+		for (unsigned k = 1; k < 8; k++) {
+			unsigned char t = (unsigned char)((base + k) * 131u);
+			if ((unsigned char)(p[k] ^ t ^ (unsigned char)(peer_n >> (k * 8))) != cp) ok_peer = 0;
+			if ((unsigned char)(p[k] ^ t ^ (unsigned char)(own_n >> (k * 8))) != co) ok_own = 0;
+		}
+		fprintf(stderr, "  bad frame %u: source=%s C_delta=0x%02x zero=%d\n", f,
+			ok_peer ? "peer-buffer" : ok_own ? "OWN-buffer" : "neither",
+			(unsigned)((unsigned char)((ok_peer ? cp : co) ^ want)), !p[0] && !p[1] && !p[2]);
+		shown++;
+	}
+}
+static void report_mismatch(const unsigned char *landed, uint64_t nonce, uint64_t own_nonce,
+			    unsigned it, unsigned slot, unsigned chunk, unsigned slots)
 {
 	const unsigned char *s = landed + (size_t)slot * chunk;
 	unsigned first = chunk, last = 0, bad = 0, n, k;
@@ -199,6 +228,7 @@ static void report_mismatch(const unsigned char *landed, uint64_t nonce, unsigne
 		"last_bad=%u bad_bytes=%u/%u got=0x%02x want=0x%02x -> %s\n",
 		it, slot, first, first / 4096, first % 4096, last, bad, chunk,
 		s[first], pattern(nonce, it, slot, first), kind);
+	frame_diag(s, chunk, nonce, own_nonce, it, slot);
 }
 static struct counters stats(const char *device)
 {
@@ -457,7 +487,7 @@ int main(int argc, char **argv)
 						if (landed[i*CHUNK+j] != pattern(peer.nonce, it, i, j))
 							break;
 					if (j < CHUNK) {
-						report_mismatch(landed, peer.nonce, it, i, CHUNK, WINDOW);
+						report_mismatch(landed, peer.nonce, local.nonce, it, i, CHUNK, WINDOW);
 						bad_slots++;
 					}
 				}

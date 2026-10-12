@@ -184,6 +184,8 @@ struct sn_device {
 	 * zc_retries increment in the retry path never fires. These count what it
 	 * misses, plus the two silent-drop outcomes of an unexpected sequence. */
 	u64 zc_read_retx, zc_read_dup_inflight, zc_read_rearm, zc_seq_ahead, zc_seq_stale;
+	/* zc_read_dup_inflight = posting + undrained. */
+	u64 zc_read_dup_posting, zc_read_dup_undrained;
 	struct list_head mrs;
 	struct sn_qp *qp;
 	/* CQE identities; see sn_wc_qp(). Only qp_num is ever set or read. */
