@@ -40,8 +40,7 @@ continue. Evidence and background live in the linked docs.
 - [x] **GPU-direct registration, v1 (2026-10-12).** DMA-BUF MRs from
   `hipMalloc` (`docs/GPU_DIRECT_VERBS.md`): GPU-to-GPU write/read/send verified
   at volume, forced READ fallbacks through GPU memory, kill -9 releases cleanly.
-- [ ] **GPU-direct, remaining gates.** G4: a stale-cache gate in which GPU
-  kernels produce and consume hot buffers, run with and without the
-  system-scope acquire (needs a small HIP program; the v1 test consumes through
-  `hipMemcpy`). G5: hot-unplug with GPU MRs registered (needs someone at the
-  machines). (G3, small and unaligned operations, passed 2026-10-12.)
+- [ ] **GPU-direct, hot-unplug with GPU MRs registered (G5).** Needs someone
+  at the machines. G3 (small/unaligned) and G4 (stale cache: the producer's
+  release is required, the acquire was not observed to matter) passed on
+  2026-10-12 (`docs/GPU_DIRECT_VERBS.md`).

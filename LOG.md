@@ -1,6 +1,23 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — GPU-direct G3 and G4: staged paths through GPU memory; the release is required
+- **G3:** `strix-verbs-smoke --len/--off` sets per-slot transfer geometry.
+  WRITE, READ and SEND on CPU and GPU memory, at 3,000 B (staged), 1 MiB at
+  offset 100 (staged) and 2,093,055 B (zero-copy with a partial last frame):
+  all 18 combinations pass byte-for-byte with no overrun. This was also the
+  first hardware run of the staged paths at volume.
+- **G4:** `--gpu-kernels` runs GPU kernels that produce and check the data,
+  with a positive control and a "hot" mode that keeps the probed lines
+  resident in L2.
+  - Release and acquire on: 0 mismatches.
+  - Acquire off: 0 mismatches.
+  - **Release off: 5–97% of iterations stale**, so the producer's
+    system-scope release is required.
+  - The first, non-hot G4 run had passed every arm because its clears evicted
+    the lines under test.
+- `docs/GPU_DIRECT_VERBS.md`, "Results". Remaining: hot-unplug with GPU MRs.
+
 ## 2026-10-12 — GPU-direct v1: GPU memory as verbs MRs, GPU-to-GPU byte-for-byte
 - **What:** `ibv_reg_dmabuf_mr` on `hipMalloc` memory now works.
   - **Kernel:** `reg_user_mr_dmabuf` imports through

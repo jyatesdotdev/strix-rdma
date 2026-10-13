@@ -128,8 +128,8 @@ Open:
   inactive-peer NHI wedge are untested, so there is no recovery guarantee yet.
 - GPU-direct beyond v1. GPU memory registers as a DMA-BUF MR and moves
   GPU-to-GPU byte-for-byte at volume (2026-10-12, `docs/GPU_DIRECT_VERBS.md`).
-  Still open: the stale-cache gate with GPU kernels as producer and consumer,
-  and hot-unplug with GPU MRs registered.
+  The stale-cache gate shows a GPU producer's system-scope release is required
+  before posting. Still open: hot-unplug with GPU MRs registered.
 
 ## Test hosts
 
