@@ -372,7 +372,7 @@ bidirectional zero-copy `read 20000` at about 420 MiB/s per direction.
   a pull during bring-up or handshake, peer power-off, long disconnects and
   coexistence are still open.
 
-## Data wire version1
+## Data wire
 
 All fields are big endian. `native_wire.h` is the shared tested codec; its C
 structure is never transmitted. Frames are exactly 112+payload bytes, <=4096;
@@ -382,7 +382,7 @@ reserved bits, length overflow and CRC mismatch are rejected before copying.
 | Byte offset | Field |
 |---|---|
 | 0 | magic `0x534e4831` (SNH1) u32 |
-| 4/5/6/7 | version1 / reserved0 / header-length high0 / low112 |
+| 4/5/6/7 | version2 / reserved0 / header-length high0 / low112 |
 | 8/9..11 | opcode / flags and reserved (all zero) |
 | 12/16/20 | total length / source QPN / destination QPN (u32) |
 | 24/32 | source/destination QP generation (u64) |
@@ -396,7 +396,8 @@ CRC32C Castagnoli uses initial/final complement and treats bytes96..99 as zero,
 covering the complete header and payload. It detects corruption, not an
 unauthorized peer. Opcodes: SEND1, WRITE2, READ3, READ_REPLY4, ACK5, READ_ACK6,
 CREDIT7, HELLO8, HELLO_ACK9, BIND10, BIND_ACK11, ZC_SEND12, ZC_READY13,
-ZC_WRITE14, ZC_READ15. Status: OK0, RNR1, ACCESS2, LENGTH3, PROTOCOL4, STAGED5. Unused fields must be zero.
+ZC_WRITE14, ZC_READ15, READ_PROBE16. Status: OK0, RNR1, ACCESS2, LENGTH3,
+PROTOCOL4, STAGED5. Unused fields must be zero.
 CREDIT total is available application RQ WQEs, serial its revision; it is only a
 hint. Actual SEND admission checks RQ ownership and returns RNR without consuming
 an absent WQE. Preposted transport RX slots are never application credits.
@@ -420,7 +421,10 @@ late duplicate descriptor is harmless. Before 2026-10-12 this case failed both
 QPs.
 `ZC_READ` names the responder's source MR. The requester arms its own MR as the
 landing zone before sending it, so it needs no `ZC_READY`, and the responder
-bursts the reply from the source MR, retaining it until `READ_ACK`. The same
+bursts the reply from the source MR, retaining it until `READ_ACK`. Because a
+zero-copy reply is never re-burst, a `READ_ACK` lost while the connection is idle
+is recovered by `READ_PROBE`: the responder asks, and the requester answers with
+the retained `READ_ACK` for any READ it has already completed. The same
 threshold and alignment rules (local landing zone, remote source) keep a READ
 staged. On timeout the requester re-asks with a staged `READ` for the same
 serial; see "Outcome" in `docs/ZEROCOPY_VERBS.md`.
@@ -622,19 +626,27 @@ inference re-run over the zero-copy data plane (the earlier proven run predates
 it). Do not describe this bounded experimental implementation as
 complete RC or production-ready.
 
-**Mixed-version pairs fail rather than degrade.** `SN_ZC_WRITE` is opcode 14 and
-reuses the existing `SN_CAP_ZDATA` negotiation instead of adding a capability
-bit. That is deliberate: `SN_CAPS_KNOWN` is enforced during HELLO/HELLO_ACK
-validation, so a new bit would make a pre-change peer reject the handshake
-outright and the session would never form at all — strictly worse than the
-alternative. The consequence is that a peer running the older module still
-advertises ZDATA, accepts the descriptor, and then rejects opcode 14 at
-`sn_decode`: the frame is dropped, `bad_frames` increments, and the requester
-eventually fails with retry-exceeded. There is no misinterpretation and no
-memory-safety hazard, but **both hosts must run the same module build** before
-exercising zero-copy WRITE. Real mixed-version safety would need an `SN_VERSION`
-bump negotiated in HELLO; that is a larger wire-ABI decision and has not been
-taken.
+**Mixed-version pairs are refused at the first frame (wire version 2).** The
+wire version is checked in every frame header. Since 2026-10-12 `SN_VERSION` is
+2: version 1 was SEND/WRITE/READ and their zero-copy forms, and 2 adds the
+`SN_STAGED` refusal status and the `SN_READ_PROBE` recovery frame. Two builds
+that disagree about what those values mean cannot talk, so a frame from another
+version does not decode. That is deliberate: it is refused at the first frame
+rather than forming a session that fails in the middle of an operation.
+
+The refusal is diagnosable, not silent. `sn_engine_receive` tells a version
+mismatch apart from corruption: `version_mismatch` counts it (corruption still
+counts `bad_frames`), and the first mismatched frame logs
+
+```text
+strix_nhi: peer speaks wire version N, this build speaks 2; refusing the session
+```
+
+The port stays down. Before the bump, a mixed pair formed a session and then
+failed mid-operation with a trail of `bad_frames`, which read as corruption
+rather than as two incompatible builds.
+
+
 
 All new code here is GPL-2.0-only, authored for this implementation against the
 pinned Linux API. No Hellas source was copied. The experimental Hellas repository

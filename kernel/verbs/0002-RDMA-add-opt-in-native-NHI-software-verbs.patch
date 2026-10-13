@@ -54,7 +54,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/native_wire.h b/drivers/infiniband/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/native_wire.h
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,304 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_NATIVE_WIRE_H
 +#define STRIX_NHI_NATIVE_WIRE_H
@@ -75,7 +75,13 @@ new file mode 100644
 +#endif
 +
 +#define SN_MAGIC 0x534e4831U /* SNH1; not compatible with USB4STREAM or TVD1 */
-+#define SN_VERSION 1U
++/* Wire version, carried in every frame header. Version 1 was SEND/WRITE/READ
++ * plus their zero-copy forms. Version 2 adds the SN_STAGED refusal status and
++ * the SN_READ_PROBE recovery frame. A peer speaking a different version is
++ * refused at the first frame it sends, rather than forming a session that then
++ * fails in the middle of an operation: the two builds no longer agree on what
++ * these values mean, and only an exact match is safe. */
++#define SN_VERSION 2U
 +#define SN_HEADER 112U
 +#define SN_FRAME 4096U
 +#define SN_PAYLOAD (SN_FRAME - SN_HEADER)
@@ -93,7 +99,8 @@ new file mode 100644
 +	SN_SEND = 1, SN_WRITE = 2, SN_READ = 3, SN_READ_REPLY = 4,
 +	SN_ACK = 5, SN_READ_ACK = 6, SN_CREDIT = 7,
 +	SN_HELLO = 8, SN_HELLO_ACK = 9, SN_BIND = 10, SN_BIND_ACK = 11,
-+	SN_ZC_SEND = 12, SN_ZC_READY = 13, SN_ZC_WRITE = 14, SN_ZC_READ = 15
++	SN_ZC_SEND = 12, SN_ZC_READY = 13, SN_ZC_WRITE = 14, SN_ZC_READ = 15,
++	SN_READ_PROBE = 16
 +};
 +/* HELLO/HELLO_ACK capability bits in total: v1 is SEND/WRITE/READ. */
 +#define SN_CAPS_V1 0x7U
@@ -222,6 +229,14 @@ new file mode 100644
 +	case SN_ACK:
 +		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
 +		       !h->address && !h->rkey && !h->sequence && h->status <= SN_STAGED;
++	case SN_READ_PROBE:
++		/* Asks whether the peer completed the READ with this serial: a
++		 * zero-copy READ response is never re-burst, so its READ_ACK can only
++		 * be recovered by asking. total is the message length, as in the
++		 * response header it refers to. */
++		return sn_qp_fields_valid(h) && h->sequence && h->total && !h->length &&
++		       !h->offset && !h->address && !h->rkey && !h->status &&
++		       !h->ack_sequence;
 +	case SN_READ_ACK:
 +		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
 +		       !h->address && !h->rkey && !h->sequence && !h->status;
@@ -467,7 +482,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,354 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -720,6 +735,9 @@ new file mode 100644
 +	/* Zero-copy SENDs refused for an unaligned receive (receiver), and SENDs
 +	 * resent staged after such a refusal (sender). */
 +	u64 zc_send_refused, zc_send_fallback;
++	/* Frames from a peer that speaks another wire version, and READ probes this
++	 * host sent to recover a lost READ_ACK. */
++	u64 version_mismatch, zc_read_probe;
 +	struct sn_stall_snap snap_drain, snap_err, snap_tmo;
 +	/* Poller timing for stall diagnosis: when a data frame was last harvested,
 +	 * when the last pass started and whether it left work outstanding, and the
@@ -777,6 +795,9 @@ new file mode 100644
 +int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *payload, bool control);
 +int sn_rings_start(struct sn_device *d);
 +int sn_rings_stop(struct sn_device *d);
++/* The peer sent a frame for another wire version (d->version_mismatch already
++ * counted it). Reports the first one in the open; ring.c. */
++void sn_peer_version_mismatch(struct sn_device *d, unsigned int version);
 +void sn_ring_receive(struct sn_device *d);
 +bool sn_ring_pending(struct sn_device *d);
 +void sn_data_receive(struct sn_device *d);
@@ -1415,7 +1436,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,572 @@
+@@ -0,0 +1,581 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1630,6 +1651,15 @@ new file mode 100644
 +fail:
 +	sn_rings_stop(d);
 +	return ret;
++}
++/* Wire-version mismatch from a peer: the session is refused frame by frame, so
++ * this is the only place it becomes visible. Warn on the first frame. */
++void sn_peer_version_mismatch(struct sn_device *d, unsigned int version)
++{
++	if (d->version_mismatch == 1)
++		dev_warn(&d->service->dev,
++			 "strix_nhi: peer speaks wire version %u, this build speaks %u; refusing the session\n",
++			 version, SN_VERSION);
 +}
 +int sn_rings_stop(struct sn_device *d)
 +{
@@ -1992,7 +2022,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/str
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/verbs.c
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,564 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/random.h>
 +#include <linux/vmalloc.h>
@@ -2453,7 +2483,7 @@ new file mode 100644
 +	ssize_t n;
 +
 +	mutex_lock(&d->lock);
-+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\nzc_send_ops %llu\nzc_send_fault_injected %llu\nzc_desc_dup %llu\nzc_ack_probe %llu\nmax_pass_gap_us %llu\nack_dropped %llu\nzc_send_refused %llu\nzc_send_fallback %llu\n",
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\nzc_send_ops %llu\nzc_send_fault_injected %llu\nzc_desc_dup %llu\nzc_ack_probe %llu\nmax_pass_gap_us %llu\nack_dropped %llu\nzc_send_refused %llu\nzc_send_fallback %llu\nversion_mismatch %llu\nzc_read_probe %llu\n",
 +		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 +		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_retries, d->zc_aborts,
 +		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
@@ -2466,7 +2496,8 @@ new file mode 100644
 +		d->zc_read_ops, d->zc_read_fault_injected,
 +		d->zc_send_ops, d->zc_send_fault_injected, d->zc_desc_dup,
 +		d->zc_ack_probe, div_u64(d->max_pass_gap_ns, NSEC_PER_USEC),
-+		d->ack_dropped, d->zc_send_refused, d->zc_send_fallback);
++		d->ack_dropped, d->zc_send_refused, d->zc_send_fallback,
++		d->version_mismatch, d->zc_read_probe);
 +	n += sysfs_emit_at(buf, n,
 +		"zdata %d\ndata_tx_head %u\ndata_tx_tail %u\ndata_rx_head %u\n"
 +		"data_rx_tail %u\nzdata_posted %u\n",
@@ -2840,7 +2871,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,1145 @@
+@@ -0,0 +1,1186 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -3110,6 +3141,19 @@ new file mode 100644
 +	sn_dev(q->ib.device)->zc_send_fallback++;
 +	q->zc_state = SN_ZC_NONE;
 +	q->outgoing_sent = false; q->outgoing_offset = 0;
++}
++/* The peer is asking whether this host completed the READ with this serial:
++ * a zero-copy READ response is never re-burst, so a lost READ_ACK can only be
++ * recovered while the connection is idle by answering this. Sequences are
++ * monotonic, so answer for any READ at or before the last one completed and
++ * stay silent for anything newer -- an unanswered probe is bounded by the
++ * responder's own retry budget, and the next operation acknowledges the
++ * previous READ implicitly. */
++static void sn_receive_read_probe(struct sn_qp *q, const struct sn_header *h)
++{
++	if (!q->have_last_read || h->sequence > q->last_read)
++		return;
++	sn_ack(q, SN_READ_ACK, h->sequence, SN_OK);
 +}
 +static void sn_receive_ack(struct sn_qp *q, const struct sn_header *h)
 +{
@@ -3497,6 +3541,11 @@ new file mode 100644
 +		q->zc_expect = false; q->zc_read_armed = false;
 +		d->read_bytes += q->zc_total;
 +		d->zc_bursts++;
++		/* Record the completion the way the staged path does, so that a peer
++		 * probing for this READ (its READ_ACK was lost) and a duplicate reply
++		 * behind it can both be answered from here. */
++		q->last_read = q->next_sequence; q->last_read_length = q->zc_total;
++		q->have_last_read = true;
 +		if (sn_ack(q, SN_READ_ACK, q->next_sequence, SN_OK)) return;
 +		sn_send_complete(q);
 +		return;
@@ -3618,7 +3667,19 @@ new file mode 100644
 +	struct sn_header h;
 +
 +	if (sn_decode(&h, frame, bytes)) {
-+		d->bad_frames++;
++		/* A frame that fails to decode is normally corruption. It is worth
++		 * telling apart from a peer whose wire version differs -- that one is
++		 * not damage, it is two builds that cannot talk -- so report it in the
++		 * open instead of leaving a trail of bad_frames. */
++		const sn_u8 *raw = frame;
++
++		if (bytes >= SN_HEADER && sn_get32(raw) == SN_MAGIC &&
++		    raw[4] != SN_VERSION) {
++			d->version_mismatch++;
++			sn_peer_version_mismatch(d, raw[4]);
++		} else {
++			d->bad_frames++;
++		}
 +		return;
 +	}
 +	switch (h.opcode) {
@@ -3634,6 +3695,7 @@ new file mode 100644
 +	}
 +	switch (h.opcode) {
 +	case SN_ACK: case SN_READ_ACK: sn_receive_ack(q, &h); break;
++	case SN_READ_PROBE: sn_receive_read_probe(q, &h); break;
 +	case SN_ZC_READY: sn_receive_zc_ready(q, &h); break;
 +	case SN_ZC_SEND: case SN_ZC_WRITE: case SN_ZC_READ: sn_receive_zc(q, &h); break;
 +	case SN_READ_REPLY: sn_receive_read_reply(q, &h, frame + SN_HEADER); break;
@@ -3770,6 +3832,16 @@ new file mode 100644
 +				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 +			}
 +			if (defer) {
++				/* Zero-copy: the reply is never re-burst, so ask whether the
++				 * READ completed instead of only waiting. A peer that has not
++				 * completed it yet ignores the probe; the retry budget taken
++				 * above still bounds the wait. */
++				struct sn_header p = sn_out_header(q, SN_READ_PROBE);
++
++				p.sequence = q->read_request.sequence;
++				p.total = q->read_request.total;
++				if (!sn_ring_send(d, &p, NULL, false))
++					d->zc_read_probe++;
 +				q->response_deadline = now + sn_ack_timeout_ns(q->attr.timeout);
 +			} else {
 +				q->response_sent = false; q->response_offset = 0;

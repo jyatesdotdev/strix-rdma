@@ -213,6 +213,15 @@ fail:
 	sn_rings_stop(d);
 	return ret;
 }
+/* Wire-version mismatch from a peer: the session is refused frame by frame, so
+ * this is the only place it becomes visible. Warn on the first frame. */
+void sn_peer_version_mismatch(struct sn_device *d, unsigned int version)
+{
+	if (d->version_mismatch == 1)
+		dev_warn(&d->service->dev,
+			 "strix_nhi: peer speaks wire version %u, this build speaks %u; refusing the session\n",
+			 version, SN_VERSION);
+}
 int sn_rings_stop(struct sn_device *d)
 {
 	struct tb_xdomain *xd = tb_service_parent(d->service);

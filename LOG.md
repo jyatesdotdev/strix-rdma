@@ -1,6 +1,21 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — wire version 2: mixed pairs refused at the first frame; READ_ACK probe
+- **`SN_VERSION` is 2.** Correlation is that version 2 adds the `SN_STAGED`
+  status and the `SN_READ_PROBE` frame. A frame from another version is refused
+  at the first frame, counted as `version_mismatch` (never as corruption) and
+  reported: "peer speaks wire version N, this build speaks 2". Previously a
+  mixed pair formed a session and failed mid-operation with a bad_frames trail.
+- **`SN_READ_PROBE` (opcode 16)** closes ok 24: a zero-copy READ response is
+  never re-burst, so a READ_ACK lost while the connection was idle failed the
+  responder's QP and could strand a crossing operation. The responder now asks
+  and the requester answers from its recorded completions.
+- Zero-copy READ completions now record `last_read`/`have_last_read` like the
+  staged path always did; without that a probe had nothing to answer from.
+- Offline: 39/39 isolated, 66 green, and three mutations each caught by the
+  intended test. Wire tests cover the new opcode and the version check.
+
 ## 2026-10-12 — zero-copy SEND into an unaligned receive buffer no longer fails both QPs
 - **Bug:** a zero-copy SEND (aligned source, more than 64 KiB) matched to a
   receive buffer that is not frame aligned failed both QPs. That is legal in

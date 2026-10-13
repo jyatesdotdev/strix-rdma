@@ -1329,3 +1329,53 @@ refusals per side, each followed by exactly one staged resend, with no QP
 error. The default-geometry regressions (send, write and read 500, plus the SEND
 smoke) pass. Transfer-only throughput is unchanged (WRITE about 995, SEND about
 1,021 MiB/s).
+
+## Round sixteen (2026-10-12): wire version 2, and the READ_ACK probe
+
+Two protocol changes, both needing a wire-version bump to be safe, because the
+two builds of a mixed pair must not disagree about what a value means.
+
+**Version 2.** `SN_VERSION` was 1 (SEND/WRITE/READ and their zero-copy forms);
+it is now 2, adding the `SN_STAGED` refusal status and the `SN_READ_PROBE`
+frame. The version has always been in every frame header and `sn_decode` has
+always rejected a mismatch, but it was counted as corruption: a mixed pair
+formed a session and then failed in the middle of an operation with a trail of
+`bad_frames`, which reads as damage rather than as two incompatible builds.
+Now the receive path tells the two apart:
+
+```text
+strix_nhi: peer speaks wire version N, this build speaks 2; refusing the session
+```
+
+`version_mismatch` counts it in `native_stats` and corruption still counts
+`bad_frames`. The port never comes up. ok 39 covers it, including that a
+corrupt magic byte is still corruption.
+
+**`SN_READ_PROBE` (opcode 16).** This closes the last known failure: a
+zero-copy READ response is never re-burst (a re-burst could overshoot a landing
+zone the requester has already handed back), so a `READ_ACK` lost while the
+connection is idle left the responder holding its retained source MR until its
+retry budget failed the QP — and, with a crossing operation held behind that
+response, stranded it too. Now the responder asks, and the requester answers
+from its recorded completion.
+
+Two details make it work:
+
+- A zero-copy READ completion must record itself the way the staged path always
+  did (`last_read`, `have_last_read`). It did not, so a probe had nothing to
+  answer from. Recording it also lets a duplicate staged reply behind a
+  zero-copy completion be re-acknowledged rather than re-assembled.
+- The answer is cumulative: any READ at or before the last one completed. A
+  newer probe is ignored, so an unanswered probe is still bounded by the
+  responder's retry budget and cannot release an operation that never happened.
+
+What was `ok 24 - a lost READ_ACK is unrecoverable zero-copy` is now
+`ok 24 - a lost READ_ACK is recovered by the probe, and the crossing WRITE is
+released`, and ok 38 covers the plain idle case.
+
+Offline: the engine suite passes 39/39 in isolation and `make
+check-native-verbs` is 66. Three mutations are each caught by the test that
+should catch it: never sending the probe (ok 24, ok 38), not recording
+zero-copy completions (ok 38), and counting a version mismatch as corruption
+(ok 39). The wire tests cover the new opcode's field rules and the version
+check (ok 10, ok 11).

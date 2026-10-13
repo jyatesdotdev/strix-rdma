@@ -91,6 +91,7 @@ struct sn_device {
 	u64 zc_read_ops, zc_read_fault_injected;
 	u64 zc_send_ops, zc_send_fault_injected, zc_desc_dup, zc_ack_probe;
 	u64 ack_seen, ack_dropped;
+	u64 version_mismatch, zc_read_probe;
 	u64 zc_send_refused, zc_send_fallback;
 	/* Set when this side's queued burst was stranded by the peer stopping and
 	 * restarting its data RX ring underneath it. Observed on hardware: the ring
@@ -191,6 +192,7 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q);
 void sn_data_abort(struct sn_device *d);
 void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status);
 bool sn_data_tx_drained(struct sn_device *d);
+void sn_peer_version_mismatch(struct sn_device *d, unsigned int version);
 unsigned int sn_zc_read_fault;
 unsigned int sn_zc_send_fault;
 unsigned int sn_ack_drop;
@@ -272,6 +274,10 @@ int sn_data_recv_restart(struct sn_device *d, struct sn_qp *q)
 }
 void sn_data_abort(struct sn_device *d) { (void)d; }
 void sn_stall_snapshot(struct sn_device *d, struct sn_qp *q, int status) { (void)d; (void)q; (void)status; }
+/* The version a mismatched frame reported, or 0. */
+static unsigned int peer_version_seen;
+void sn_peer_version_mismatch(struct sn_device *d, unsigned int version)
+{ (void)d; peer_version_seen = version; }
 /* Deliver everything a device has queued, in order, into each frame's destination
  * landing zone. A frame whose destination no longer expects a burst is dropped,
  * exactly as a data RX ring with nothing posted drops it. The landing-zone assert
@@ -1059,7 +1065,12 @@ static void test_zc_read_serializes_inbound_bursts(void)
  * into each other: the SQ burst waits for the response to retire and the response
  * waits for the SQ burst to stop queueing, and the bounded retry budget fails the
  * QP instead of letting two payloads share one header-less byte stream. */
-static void test_zc_read_lost_ack_is_fatal(void)
+/* A lost READ_ACK used to leave the responder owing a zero-copy response until
+ * its retry budget failed the QP, which also stranded the peer's crossing WRITE
+ * (nothing may burst into the zone while that response is owed). The probe
+ * recovers it: the requester answers from its recorded completion, the response
+ * is released, and the held WRITE proceeds. */
+static void test_zc_read_lost_ack_is_recovered(void)
 {
 	struct sn_device *b, *a = zc_pair(&b);
 	int drop_ack = SN_READ_ACK;
@@ -1074,21 +1085,18 @@ static void test_zc_read_lost_ack_is_fatal(void)
 	deliver(b, a, NULL);
 	deliver(a, b, NULL);
 	for (i = 0; i < 1000 && !a->sends; i++) step(a, b, &drop_ack, NULL);
-	/* The READ itself completed; only its ACK was lost. It is still queued when the
-	 * loop above exits, so this is the pass that flushes and drops it. */
-	step(a, b, &drop_ack, NULL);
-	assert(a->sends == 1 && a->zc_bursts == 1 && !a->errors && !b->errors);
-	assert(b->qp->response_active && b->qp->remote_mr == &b->mr[1] && b->zc_tx_bursts == 1);
-	/* a releases the held WRITE descriptor and arms for it; b never bursts into
-	 * that zone while it still owes a response, so nothing lands there. */
-	for (i = 0; i < 1000 && !b->errors; i++) step(a, b, NULL, NULL);
-	assert(b->errors == 1 && b->last_error == IB_WC_RETRY_EXC_ERR);
-	assert(b->zc_tx_bursts == 1 && b->qp->response_retries == 3);
-	assert(!a->zc_land_landed && a->zc_bursts == 1 && !a->write_bytes && !a->errors);
-	for (i = 0; i < SN_MESSAGE; i++) assert(!a->mr[1].data[i]);
-	for (i = 0; i < SN_MESSAGE; i++) assert(a->mr[0].data[i] == 0xc3);
+	step(a, b, &drop_ack, NULL);		/* the queued READ_ACK is dropped */
+	assert(!drop_ack && a->sends == 1 && a->zc_bursts == 1 && !a->errors && !b->errors);
+	assert(b->qp->response_active && b->qp->remote_mr == &b->mr[1]);
+	for (i = 0; i < 4000 && !b->sends && !a->errors && !b->errors; i++)
+		step(a, b, NULL, NULL);
+	assert(!a->errors && !b->errors && b->zc_read_probe >= 1);
+	assert(b->sends == 1 && !a->recvs);
+	assert(!memcmp(b->mr[0].data, a->mr[1].data, SN_MESSAGE));
+	assert(!b->qp->response_active && !b->qp->remote_mr);
+	assert(!b->mr[1].users && !b->mr[0].users && !a->mr[1].users);
 	release(a); release(b);
-	puts("ok 24 - a lost READ_ACK is unrecoverable zero-copy: bursts never interleave, the responder fails instead");
+	puts("ok 24 - a lost READ_ACK is recovered by the probe, and the crossing WRITE is released");
 }
 static void test_zc_write_fallback(void)
 {
@@ -1620,9 +1628,59 @@ static void test_zc_send_unaligned_receive(void)
 	release(a); release(b);
 	puts("ok 37 - zero-copy SEND into an unaligned receive buffer falls back to staged; lost refusal and late duplicate are safe");
 }
+/* A zero-copy READ response is never re-burst, so a lost READ_ACK used to leave
+ * the responder waiting until its retry budget failed the QP. While the
+ * connection is idle, a probe now asks whether the READ completed and the
+ * requester answers with the retained READ_ACK. */
+static void test_read_ack_probe(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	int drop_ack = SN_READ_ACK;
+	unsigned int i;
+
+	memset(b->mr[1].data, 0x9b, SN_MESSAGE);
+	post(a, SN_READ, SN_MESSAGE);
+	for (i = 0; i < 400 && a->sends < 1; i++)
+		step(a, b, &drop_ack, NULL);		/* the READ_ACK never lands */
+	step(a, b, &drop_ack, NULL);			/* the queued READ_ACK is dropped */
+	assert(!drop_ack && a->sends == 1 && !a->errors && !b->errors);
+	assert(b->qp->response_active && b->qp->remote_mr == &b->mr[1]);
+	for (i = 0; i < 2000 && b->qp->response_active && !b->errors; i++)
+		step(a, b, NULL, NULL);
+	assert(!b->errors && !a->errors && b->zc_read_probe >= 1);
+	assert(!b->qp->response_active && !b->qp->remote_mr && !b->mr[1].users);
+	release(a); release(b);
+	puts("ok 38 - a lost READ_ACK is recovered by the responder's probe once the connection is idle");
+}
+/* A frame for another wire version is refused -- counted and reported as a
+ * version mismatch, never as corruption -- and the current version still
+ * decodes. */
+static void test_wire_version_mismatch(void)
+{
+	struct sn_device *a = endpoint(10, 20, 100, 200);
+	struct sn_header h = {0};
+	sn_u8 buf[SN_FRAME];
+
+	h.opcode = SN_HELLO; h.src_epoch = 100; h.total = SN_CAPS_V1;
+	assert(!sn_encode(buf, sizeof(buf), &h));
+	sn_engine_receive(a, buf, SN_HEADER);
+	assert(!a->version_mismatch && !a->bad_frames);
+	assert(!peer_version_seen);
+	buf[4] = SN_VERSION + 1;			/* the peer's version */
+	sn_engine_receive(a, buf, SN_HEADER);
+	assert(a->version_mismatch == 1 && !a->bad_frames && peer_version_seen == SN_VERSION + 1);
+	sn_engine_receive(a, buf, SN_HEADER);
+	assert(a->version_mismatch == 2 && !a->bad_frames);
+	assert(peer_version_seen == SN_VERSION + 1);
+	buf[4] = SN_VERSION; buf[0] ^= 0xff;		/* corruption stays corruption */
+	sn_engine_receive(a, buf, SN_HEADER);
+	assert(a->version_mismatch == 2 && a->bad_frames == 1);
+	release(a);
+	puts("ok 39 - a peer speaking another wire version is refused and reported, not counted as corruption");
+}
 int main(void)
 {
-	puts("1..37");
+	puts("1..39");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1633,7 +1691,7 @@ int main(void)
 	test_zc_read(); test_zc_read_retry_burst(); test_zc_read_retry_waits_for_drain();
 	test_zc_read_fallback(); test_zc_read_refusal();
 	test_zc_read_serializes_inbound_bursts();
-	test_zc_read_lost_ack_is_fatal();
+	test_zc_read_lost_ack_is_recovered();
 	test_zc_read_bidirectional();
 	test_zc_burst_inflight_overlap();
 	test_zc_read_timeout_staged_fallback();
@@ -1647,6 +1705,8 @@ int main(void)
 	test_zc_send_fault_injection();
 	test_ack_drop();
 	test_zc_send_unaligned_receive();
+	test_read_ack_probe();
+	test_wire_version_mismatch();
 	assert(!warnings);
 	return 0;
 }

@@ -268,6 +268,19 @@ static void sn_zc_send_fallback(struct sn_qp *q)
 	q->zc_state = SN_ZC_NONE;
 	q->outgoing_sent = false; q->outgoing_offset = 0;
 }
+/* The peer is asking whether this host completed the READ with this serial:
+ * a zero-copy READ response is never re-burst, so a lost READ_ACK can only be
+ * recovered while the connection is idle by answering this. Sequences are
+ * monotonic, so answer for any READ at or before the last one completed and
+ * stay silent for anything newer -- an unanswered probe is bounded by the
+ * responder's own retry budget, and the next operation acknowledges the
+ * previous READ implicitly. */
+static void sn_receive_read_probe(struct sn_qp *q, const struct sn_header *h)
+{
+	if (!q->have_last_read || h->sequence > q->last_read)
+		return;
+	sn_ack(q, SN_READ_ACK, h->sequence, SN_OK);
+}
 static void sn_receive_ack(struct sn_qp *q, const struct sn_header *h)
 {
 	if (h->opcode == SN_READ_ACK) {
@@ -654,6 +667,11 @@ void sn_engine_zc_bytes(struct sn_qp *q, u32 bytes)
 		q->zc_expect = false; q->zc_read_armed = false;
 		d->read_bytes += q->zc_total;
 		d->zc_bursts++;
+		/* Record the completion the way the staged path does, so that a peer
+		 * probing for this READ (its READ_ACK was lost) and a duplicate reply
+		 * behind it can both be answered from here. */
+		q->last_read = q->next_sequence; q->last_read_length = q->zc_total;
+		q->have_last_read = true;
 		if (sn_ack(q, SN_READ_ACK, q->next_sequence, SN_OK)) return;
 		sn_send_complete(q);
 		return;
@@ -775,7 +793,19 @@ void sn_engine_receive(struct sn_device *d, const void *frame, size_t bytes)
 	struct sn_header h;
 
 	if (sn_decode(&h, frame, bytes)) {
-		d->bad_frames++;
+		/* A frame that fails to decode is normally corruption. It is worth
+		 * telling apart from a peer whose wire version differs -- that one is
+		 * not damage, it is two builds that cannot talk -- so report it in the
+		 * open instead of leaving a trail of bad_frames. */
+		const sn_u8 *raw = frame;
+
+		if (bytes >= SN_HEADER && sn_get32(raw) == SN_MAGIC &&
+		    raw[4] != SN_VERSION) {
+			d->version_mismatch++;
+			sn_peer_version_mismatch(d, raw[4]);
+		} else {
+			d->bad_frames++;
+		}
 		return;
 	}
 	switch (h.opcode) {
@@ -791,6 +821,7 @@ void sn_engine_receive(struct sn_device *d, const void *frame, size_t bytes)
 	}
 	switch (h.opcode) {
 	case SN_ACK: case SN_READ_ACK: sn_receive_ack(q, &h); break;
+	case SN_READ_PROBE: sn_receive_read_probe(q, &h); break;
 	case SN_ZC_READY: sn_receive_zc_ready(q, &h); break;
 	case SN_ZC_SEND: case SN_ZC_WRITE: case SN_ZC_READ: sn_receive_zc(q, &h); break;
 	case SN_READ_REPLY: sn_receive_read_reply(q, &h, frame + SN_HEADER); break;
@@ -927,6 +958,16 @@ void sn_engine_progress(struct sn_device *d)
 				sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 			}
 			if (defer) {
+				/* Zero-copy: the reply is never re-burst, so ask whether the
+				 * READ completed instead of only waiting. A peer that has not
+				 * completed it yet ignores the probe; the retry budget taken
+				 * above still bounds the wait. */
+				struct sn_header p = sn_out_header(q, SN_READ_PROBE);
+
+				p.sequence = q->read_request.sequence;
+				p.total = q->read_request.total;
+				if (!sn_ring_send(d, &p, NULL, false))
+					d->zc_read_probe++;
 				q->response_deadline = now + sn_ack_timeout_ns(q->attr.timeout);
 			} else {
 				q->response_sent = false; q->response_offset = 0;

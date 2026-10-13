@@ -214,11 +214,54 @@ static void test_zc_read_descriptor(void)
 	h.src_qpn = 0; assert(!sn_header_valid(&h));
 	puts("ok 9 - zero-copy READ request: source rkey/address required, reply stays header-less");
 }
+/* The wire version is in every frame header. A frame from another version must
+ * not decode: two builds that disagree on what the status and opcode values mean
+ * cannot form a session. */
+static void test_wire_version(void)
+{
+	struct sn_header h = header(), got;
+	sn_u8 p[SN_FRAME];
+
+	h.opcode = SN_READ_ACK; h.sequence = 0;
+	assert(!sn_encode(p, sizeof(p), &h));
+	p[4] = SN_VERSION + 1;
+	assert(sn_decode(&got, p, SN_HEADER));
+	repair_crc(p, SN_HEADER);
+	assert(sn_decode(&got, p, SN_HEADER));
+	p[4] = SN_VERSION;
+	repair_crc(p, SN_HEADER);
+	assert(!sn_decode(&got, p, SN_HEADER) && got.opcode == SN_READ_ACK);
+	p[5] = 1; assert(sn_decode(&got, p, SN_HEADER));
+	repair_crc(p, SN_HEADER);
+	puts("ok 10 - the wire version is checked in every frame, and SN_VERSION is 2");
+}
+/* The probe that recovers a lost READ_ACK while the connection is idle. */
+static void test_read_probe(void)
+{
+	struct sn_header h = header(), got;
+	sn_u8 p[SN_FRAME];
+
+	h.opcode = SN_READ_PROBE; h.total = SN_MESSAGE; h.sequence = 0;
+	assert(!sn_header_valid(&h));			/* serial required */
+	h.sequence = 7; assert(sn_header_valid(&h));
+	assert(!sn_encode(p, sizeof(p), &h) && !sn_decode(&got, p, SN_HEADER));
+	assert(!memcmp(&got, &h, sizeof(h)));
+	assert(got.opcode == SN_READ_PROBE && got.sequence == 7 && got.total == SN_MESSAGE);
+	h.total = 0; assert(!sn_header_valid(&h)); h.total = SN_MESSAGE;
+	h.length = 1; assert(!sn_header_valid(&h)); h.length = 0;
+	h.offset = 1; assert(!sn_header_valid(&h)); h.offset = 0;
+	h.address = SN_FRAME; assert(!sn_header_valid(&h)); h.address = 0;
+	h.rkey = 1; assert(!sn_header_valid(&h)); h.rkey = 0;
+	h.status = SN_ACCESS; assert(!sn_header_valid(&h)); h.status = SN_OK;
+	h.ack_sequence = 1; assert(!sn_header_valid(&h));
+	h.total = SN_MESSAGE + 1; assert(!sn_header_valid(&h));
+	puts("ok 11 - READ probe: serial and length only, no payload and no remote key");
+}
 int main(void)
 {
 	unsigned int id;
 
-	puts("1..9");
+	puts("1..11");
 	test_codec(); test_admission(); test_opcodes(); test_zc_descriptors();
 	assert(sn_crc((const sn_u8 *)"123456789", 9) == 0xe3069283U);
 	for (id = 0; id <= 0xffff; id++) {
@@ -226,6 +269,6 @@ int main(void)
 		assert(sn_supported_nhi(id, 0x158e) == (id == 0x1022));
 	}
 	puts("ok 8 - CRC32C reference vector and exhaustive admitted PCI identity predicate");
-	test_zc_read_descriptor();
+	test_zc_read_descriptor(); test_wire_version(); test_read_probe();
 	return 0;
 }

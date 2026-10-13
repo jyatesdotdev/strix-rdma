@@ -18,7 +18,13 @@ typedef uint64_t sn_u64;
 #endif
 
 #define SN_MAGIC 0x534e4831U /* SNH1; not compatible with USB4STREAM or TVD1 */
-#define SN_VERSION 1U
+/* Wire version, carried in every frame header. Version 1 was SEND/WRITE/READ
+ * plus their zero-copy forms. Version 2 adds the SN_STAGED refusal status and
+ * the SN_READ_PROBE recovery frame. A peer speaking a different version is
+ * refused at the first frame it sends, rather than forming a session that then
+ * fails in the middle of an operation: the two builds no longer agree on what
+ * these values mean, and only an exact match is safe. */
+#define SN_VERSION 2U
 #define SN_HEADER 112U
 #define SN_FRAME 4096U
 #define SN_PAYLOAD (SN_FRAME - SN_HEADER)
@@ -36,7 +42,8 @@ enum sn_opcode {
 	SN_SEND = 1, SN_WRITE = 2, SN_READ = 3, SN_READ_REPLY = 4,
 	SN_ACK = 5, SN_READ_ACK = 6, SN_CREDIT = 7,
 	SN_HELLO = 8, SN_HELLO_ACK = 9, SN_BIND = 10, SN_BIND_ACK = 11,
-	SN_ZC_SEND = 12, SN_ZC_READY = 13, SN_ZC_WRITE = 14, SN_ZC_READ = 15
+	SN_ZC_SEND = 12, SN_ZC_READY = 13, SN_ZC_WRITE = 14, SN_ZC_READ = 15,
+	SN_READ_PROBE = 16
 };
 /* HELLO/HELLO_ACK capability bits in total: v1 is SEND/WRITE/READ. */
 #define SN_CAPS_V1 0x7U
@@ -165,6 +172,14 @@ static inline int sn_header_valid(const struct sn_header *h)
 	case SN_ACK:
 		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
 		       !h->address && !h->rkey && !h->sequence && h->status <= SN_STAGED;
+	case SN_READ_PROBE:
+		/* Asks whether the peer completed the READ with this serial: a
+		 * zero-copy READ response is never re-burst, so its READ_ACK can only
+		 * be recovered by asking. total is the message length, as in the
+		 * response header it refers to. */
+		return sn_qp_fields_valid(h) && h->sequence && h->total && !h->length &&
+		       !h->offset && !h->address && !h->rkey && !h->status &&
+		       !h->ack_sequence;
 	case SN_READ_ACK:
 		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
 		       !h->address && !h->rkey && !h->sequence && !h->status;

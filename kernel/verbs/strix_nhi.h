@@ -250,6 +250,9 @@ struct sn_device {
 	/* Zero-copy SENDs refused for an unaligned receive (receiver), and SENDs
 	 * resent staged after such a refusal (sender). */
 	u64 zc_send_refused, zc_send_fallback;
+	/* Frames from a peer that speaks another wire version, and READ probes this
+	 * host sent to recover a lost READ_ACK. */
+	u64 version_mismatch, zc_read_probe;
 	struct sn_stall_snap snap_drain, snap_err, snap_tmo;
 	/* Poller timing for stall diagnosis: when a data frame was last harvested,
 	 * when the last pass started and whether it left work outstanding, and the
@@ -307,6 +310,9 @@ struct ib_mr *sn_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset, u64 length,
 int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *payload, bool control);
 int sn_rings_start(struct sn_device *d);
 int sn_rings_stop(struct sn_device *d);
+/* The peer sent a frame for another wire version (d->version_mismatch already
+ * counted it). Reports the first one in the open; ring.c. */
+void sn_peer_version_mismatch(struct sn_device *d, unsigned int version);
 void sn_ring_receive(struct sn_device *d);
 bool sn_ring_pending(struct sn_device *d);
 void sn_data_receive(struct sn_device *d);

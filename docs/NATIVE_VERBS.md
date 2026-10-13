@@ -44,6 +44,7 @@ and [provider interface/build](../providers/strix_nhi/README.md).
 | Objects | one context/PD/RC QP, SQ4/RQ4, exactly one SGE per WR; two CQs up to64 each |
 | Memory | four MRs, each <=8MiB, page-rounded aggregate32MiB plus normal memlock; fresh nonreused keys; CPU pages (`ibv_reg_mr`) or GPU memory as a pinned DMA-BUF (`ibv_reg_dmabuf_mr`, page-aligned offset and iova) |
 | Operations | SEND/RECV, bounded software WRITE/READ <=2MiB; one real requester/responder READ resource; signaled/unsignaled and serialized FENCE |
+| Wire | version 2, exact match required; another version is refused at the first frame and reported as a version mismatch |
 | Setup | MTU4096 only, 24-bit PSNs, global exact peer GID, SGID0/hop64; timeout14, min_rnr_timer12, retry/rnr_retry0..6, read depths0..1 |
 | Unsupported | ODP, revocable DMA-BUF, relaxed ordering, inline/solicited send, IMM/invalidation, atomics, SRQ/MW, other QP types, CM/MAD, alternate routes, infinite retries, other MTUs/timer policies |
 
