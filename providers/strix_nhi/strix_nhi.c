@@ -65,6 +65,19 @@ static struct ibv_mr *strix_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 	if (ret) { free(mr); errno = ret; return NULL; }
 	return &mr->ibv_mr;
 }
+/* GPU memory exported as a DMA-BUF (docs/GPU_DIRECT_VERBS.md): the standard
+ * command, no private bytes; the kernel validates alignment, caps and access. */
+static struct ibv_mr *strix_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
+	size_t length, uint64_t iova, int fd, int access)
+{
+	struct verbs_mr *mr = calloc(1, sizeof(*mr));
+	int ret;
+
+	if (!mr) return NULL;
+	ret = ibv_cmd_reg_dmabuf_mr(pd, offset, length, iova, fd, access, mr, NULL);
+	if (ret) { free(mr); errno = ret; return NULL; }
+	return &mr->ibv_mr;
+}
 static int strix_dereg_mr(struct verbs_mr *mr)
 {
 	int ret = ibv_cmd_dereg_mr(mr);
@@ -194,7 +207,8 @@ static void strix_free_context(struct ibv_context *ibv)
 static const struct verbs_context_ops strix_context_ops = {
 	.query_device_ex = strix_query_device, .query_port = strix_query_port,
 	.alloc_pd = strix_alloc_pd, .dealloc_pd = strix_dealloc_pd,
-	.reg_mr = strix_reg_mr, .dereg_mr = strix_dereg_mr,
+	.reg_mr = strix_reg_mr, .reg_dmabuf_mr = strix_reg_dmabuf_mr,
+	.dereg_mr = strix_dereg_mr,
 	.create_cq = strix_create_cq, .destroy_cq = strix_destroy_cq,
 	.poll_cq = strix_poll_cq, .req_notify_cq = ibv_cmd_req_notify_cq,
 	.create_qp = strix_create_qp, .destroy_qp = strix_destroy_qp,

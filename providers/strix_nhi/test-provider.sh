@@ -17,7 +17,8 @@ ${CC:-cc} -std=gnu11 -Wall -Wextra -Werror -g ${CFLAGS:-} \
     -Wl,-rpath,"$build/lib" -libverbs -lpthread \
     -Wl,--wrap=ibv_cmd_post_send -Wl,--wrap=ibv_cmd_post_recv \
     -Wl,--wrap=ibv_cmd_poll_cq -Wl,--wrap=ibv_cmd_dereg_mr \
-    -Wl,--wrap=ibv_cmd_destroy_qp -o "$out/test-provider"
+    -Wl,--wrap=ibv_cmd_destroy_qp -Wl,--wrap=ibv_cmd_reg_dmabuf_mr \
+    -o "$out/test-provider"
 "$out/test-provider" "$out/sys/ib"
 # Same identity, wrong real parent driver must fail (test portable helper alone).
 ${CC:-cc} -std=gnu11 -Wall -Wextra -Werror -I"$here" \

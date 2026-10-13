@@ -556,7 +556,8 @@ const struct ib_device_ops sn_verbs_ops = {
 	.create_qp = sn_create_qp, .destroy_qp = sn_destroy_qp,
 	.modify_qp = sn_modify_qp, .query_qp = sn_query_qp,
 	.post_send = sn_post_send, .post_recv = sn_post_recv,
-	.reg_user_mr = sn_reg_user_mr, .dereg_mr = sn_dereg_mr,
+	.reg_user_mr = sn_reg_user_mr, .reg_user_mr_dmabuf = sn_reg_user_mr_dmabuf,
+	.dereg_mr = sn_dereg_mr,
 	.size_ib_cq = sizeof(struct sn_cq), .size_ib_pd = sizeof(struct ib_pd),
 	.size_ib_qp = sizeof(struct sn_qp), .size_ib_ucontext = sizeof(struct ib_ucontext),
 };

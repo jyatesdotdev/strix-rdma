@@ -11,8 +11,10 @@ and offline tests do not establish live discovery. See the integrated
 This is a real Linux `ib_device`/uverbs backend, not a libibverbs replacement.
 It implements bounded connected SEND/RECV, WRITE and READ in software over new
 NHI rings. CPU pages are pinned with `ib_umem`; CPU copies stage data into/out of
-separate coherent DMA buffers. No GPU/DMA-BUF, zero-copy, RoCE interoperability,
-RNIC offload, CM, atomics or performance claim is made.
+separate coherent DMA buffers; large aligned transfers take a zero-copy data
+ring instead, and GPU memory can be registered as a DMA-BUF MR
+(`docs/GPU_DIRECT_VERBS.md`). No RoCE interoperability, RNIC offload, CM, atomics
+or production claim is made.
 
 ## Source and build
 

@@ -31,6 +31,18 @@ int __wrap_ibv_cmd_poll_cq(struct ibv_cq *cq, int n, struct ibv_wc *wc)
 	(void)cq; (void)wc; polled = n;
 	return failure ? -1 : n;
 }
+static uint64_t dmabuf_args[5];
+int __wrap_ibv_cmd_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset, size_t length,
+				 uint64_t iova, int fd, int access,
+				 struct verbs_mr *vmr, struct ibv_command_buffer *driver)
+{
+	(void)pd;
+	assert(vmr && !driver);	/* no private command bytes */
+	dmabuf_args[0] = offset; dmabuf_args[1] = length; dmabuf_args[2] = iova;
+	dmabuf_args[3] = (uint64_t)fd; dmabuf_args[4] = (uint64_t)access;
+	if (!failure) vmr->ibv_mr.lkey = 41;
+	return failure;
+}
 int __wrap_ibv_cmd_dereg_mr(struct verbs_mr *mr)
 {
 	assert(mr->ibv_mr.lkey == 37); return failure;
@@ -118,6 +130,18 @@ static void lifetime_test(void)
 	assert(!pthread_mutex_unlock(&qp->send_lock));
 	failure = 0;
 	assert(!strix_dereg_mr(mr)); assert(!strix_destroy_qp(&qp->ibv));
+	{	/* DMA-BUF MR: arguments forwarded unchanged; failure sets errno. */
+		struct ibv_mr *g;
+
+		failure = EINVAL;
+		assert(!strix_reg_dmabuf_mr(NULL, 4096, 8192, 0x7f0000000000ULL, 9, 7) && errno == EINVAL);
+		failure = 0;
+		g = strix_reg_dmabuf_mr(NULL, 4096, 8192, 0x7f0000000000ULL, 9, 7);
+		assert(g && g->lkey == 41 && dmabuf_args[0] == 4096 && dmabuf_args[1] == 8192 &&
+		       dmabuf_args[2] == 0x7f0000000000ULL && dmabuf_args[3] == 9 && dmabuf_args[4] == 7);
+		free(container_of(g, struct verbs_mr, ibv_mr));
+		assert(strix_context_ops.reg_dmabuf_mr == strix_reg_dmabuf_mr);
+	}
 	polled = 0;
 	assert(strix_poll_cq(NULL, -1, wc) == -1 && errno == EINVAL && !polled);
 	assert(strix_poll_cq(NULL, 1, NULL) == -1 && errno == EINVAL);

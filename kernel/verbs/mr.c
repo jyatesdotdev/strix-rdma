@@ -37,6 +37,17 @@ int sn_mr_copy(struct sn_mr *m, u64 address, void *buffer, u32 length, bool to_m
 		return -EACCES;
 	if (!length)
 		return 0;
+	if (m->dmabuf) {
+		/* GPU memory: through the CPU mapping made at registration. An
+		 * importer must not touch the exporter's scatterlist pages. */
+		size_t off = address - m->base;
+
+		if (to_mr)
+			iosys_map_memcpy_to(&m->vmap, off, buffer, length);
+		else
+			iosys_map_memcpy_from(buffer, &m->vmap, off, length);
+		return 0;
+	}
 	skip = address - m->base + ib_umem_offset(m->umem);
 	/* VIRT_DMA umem owns pinned CPU pages; only separate coherent staging
 	 * buffers are ever mapped into the NHI. sg_pcopy handles page boundaries. */
@@ -57,7 +68,8 @@ int sn_mr_ensure_mapped(struct sn_device *d, struct sn_mr *m)
 	int n;
 
 	lockdep_assert_held(&d->lock);
-	if (m->map_nents)
+	/* A GPU MR is mapped for the NHI by its exporter at registration. */
+	if (m->map_nents || m->dmabuf)
 		return 0;
 	if (!d->rx_ring)
 		return -ENODEV;
@@ -148,6 +160,102 @@ fail:
 	kfree(m);
 	return ERR_PTR(ret);
 }
+/* Register GPU memory exported as a DMA-BUF (docs/GPU_DIRECT_VERBS.md). The
+ * attachment is made for the NHI's DMA device -- this IB device has none of
+ * its own -- pinned, mapped and trimmed to [offset, offset + length) by the
+ * core helper; the data path then uses that mapping as is. A CPU mapping is
+ * made too, because the staged paths (small or unaligned operations, and the
+ * zero-copy READ fallback's snapshot) copy through sn_mr_copy(). */
+struct ib_mr *sn_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset, u64 length,
+				   u64 iova, int fd, int access,
+				   struct ib_dmah *dmah,
+				   struct uverbs_attr_bundle *attrs)
+{
+	struct sn_device *d = sn_dev(pd->device);
+	struct ib_umem_dmabuf *umem;
+	struct sn_mr *m;
+	u64 pinned = PAGE_ALIGN(length);
+	int ret = 0;
+
+	if (dmah || access & ~SN_ACCESS_FLAGS)
+		return ERR_PTR(-EOPNOTSUPP);
+	/* Page-aligned offset and iova keep a frame-aligned iova frame-aligned in
+	 * DMA space; the core helper trims the table to whole pages. */
+	if (!length || length > SN_MR_BYTES ||
+	    (offset | iova) & ~PAGE_MASK || offset > ULONG_MAX - length ||
+	    !sn_range(iova, length, iova, length) ||
+	    ((access & IB_ACCESS_REMOTE_WRITE) && !(access & IB_ACCESS_LOCAL_WRITE)))
+		return ERR_PTR(-EINVAL);
+	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	if (!m)
+		return ERR_PTR(-ENOMEM);
+	mutex_lock(&d->lock);
+	if (d->dead) ret = -ENODEV;
+	else if (d->mr_count == SN_MAX_MRS || pinned > SN_PIN_BYTES - d->pinned)
+		ret = -ENOMEM;
+	else if (d->key_serial == U32_MAX) ret = -EOVERFLOW;
+	if (ret)
+		goto fail;
+	/* Reserve the slot and quota before dropping the lock for the import,
+	 * which may wait on the exporter's fences. */
+	d->mr_count++; d->pinned += pinned;
+	mutex_unlock(&d->lock);
+
+	umem = ib_umem_dmabuf_get_pinned_with_dma_device(&d->ib,
+		tb_service_parent(d->service)->tb->nhi->dev, offset, length,
+		fd, access);
+	if (IS_ERR(umem)) {
+		ret = PTR_ERR(umem);
+		goto unreserve;
+	}
+	ret = dma_buf_vmap_unlocked(umem->attach->dmabuf, &m->vmap);
+	if (ret) {
+		ib_umem_release(&umem->umem);
+		goto unreserve;
+	}
+	mutex_lock(&d->lock);
+	if (d->dead || d->key_serial == U32_MAX) {
+		ret = d->dead ? -ENODEV : -EOVERFLOW;
+		mutex_unlock(&d->lock);
+		dma_buf_vunmap_unlocked(umem->attach->dmabuf, &m->vmap);
+		ib_umem_release(&umem->umem);
+		goto unreserve;
+	}
+	m->dmabuf = umem;
+	m->umem = &umem->umem;
+	m->ib.device = &d->ib;
+	m->ib.pd = pd;
+	m->ib.lkey = ++d->key_serial;
+	m->ib.rkey = m->ib.lkey;
+	m->base = iova; m->size = length; m->pinned = pinned; m->access = access;
+	m->ib.iova = iova; m->ib.length = length;
+	/* The exporter's mapping, trimmed to the MR, is the NHI mapping. */
+	m->map_dev = tb_service_parent(d->service)->tb->nhi->dev;
+	m->map_nents = umem->umem.sgt_append.sgt.nents;
+	m->cur_sg = NULL; m->cur_idx = 0; m->cur_off = 0;
+	list_add_tail(&m->entry, &d->mrs);
+	mutex_unlock(&d->lock);
+	return &m->ib;
+unreserve:
+	mutex_lock(&d->lock);
+	d->mr_count--; d->pinned -= pinned;
+fail:
+	mutex_unlock(&d->lock);
+	kfree(m);
+	return ERR_PTR(ret);
+}
+/* Undo a registration's mappings and drop its memory: the NHI mapping of a
+ * CPU MR, or the CPU mapping of a GPU MR (whose NHI mapping, pin, attachment
+ * and DMA-BUF reference ib_umem_release() drops). */
+static void sn_mr_release(struct sn_mr *m)
+{
+	if (m->dmabuf)
+		dma_buf_vunmap_unlocked(m->dmabuf->attach->dmabuf, &m->vmap);
+	else if (m->map_nents)
+		dma_unmap_sg(m->map_dev, m->umem->sgt_append.sgt.sgl,
+			m->umem->sgt_append.sgt.orig_nents, DMA_BIDIRECTIONAL);
+	ib_umem_release(m->umem);
+}
 int sn_dereg_mr(struct ib_mr *ib, struct ib_udata *udata)
 {
 	struct sn_mr *m = container_of(ib, struct sn_mr, ib);
@@ -160,10 +268,7 @@ int sn_dereg_mr(struct ib_mr *ib, struct ib_udata *udata)
 	}
 	list_del(&m->entry);
 	d->mr_count--; d->pinned -= m->pinned;
-	if (m->map_nents)
-		dma_unmap_sg(m->map_dev, m->umem->sgt_append.sgt.sgl,
-			m->umem->sgt_append.sgt.orig_nents, DMA_BIDIRECTIONAL);
-	ib_umem_release(m->umem);
+	sn_mr_release(m);
 	mutex_unlock(&d->lock);
 	kfree(m);
 	return 0;

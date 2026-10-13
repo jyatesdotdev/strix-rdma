@@ -16,7 +16,7 @@ extract() {
     ' "$source"
 }
 : > "$tmp/native-objects.inc"
-for fn in sn_mr_get sn_mr_put sn_dereg_mr; do
+for fn in sn_mr_get sn_mr_put sn_reg_user_mr_dmabuf sn_mr_release sn_dereg_mr; do
     extract "$fn" "$here/../verbs/mr.c" >> "$tmp/native-objects.inc"
 done
 for fn in sn_event sn_wc_qp sn_complete sn_flush_qp sn_qp_error sn_cq_remove_qp sn_poll_cq sn_notify_cq sn_post_send sn_post_recv; do

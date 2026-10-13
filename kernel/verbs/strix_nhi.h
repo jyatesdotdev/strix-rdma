@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef STRIX_NHI_H
 #define STRIX_NHI_H
+#include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
@@ -67,6 +69,12 @@ struct sn_mr {
 	struct scatterlist *cur_sg;
 	unsigned int cur_idx;
 	u64 cur_off;
+	/* GPU memory (DMA-BUF) MR: the pinned attachment whose exporter mapping,
+	 * made for the NHI, the data path uses as is (never re-mapped or synced
+	 * here), and the CPU mapping the staged paths copy through. NULL for an
+	 * ordinary CPU-page MR. See docs/GPU_DIRECT_VERBS.md. */
+	struct ib_umem_dmabuf *dmabuf;
+	struct iosys_map vmap;
 };
 struct sn_cq {
 	struct ib_cq ib;
@@ -287,6 +295,10 @@ int sn_complete(struct sn_qp *q, struct sn_wqe *w, bool receive,
 struct sn_mr *sn_mr_get(struct sn_qp *q, u32 key, u64 address, u32 length, u32 access);
 void sn_mr_put(struct sn_mr *m);
 int sn_mr_copy(struct sn_mr *m, u64 address, void *buffer, u32 length, bool to_mr);
+struct ib_mr *sn_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset, u64 length,
+				   u64 iova, int fd, int access,
+				   struct ib_dmah *dmah,
+				   struct uverbs_attr_bundle *attrs);
 int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *payload, bool control);
 int sn_rings_start(struct sn_device *d);
 int sn_rings_stop(struct sn_device *d);

@@ -585,4 +585,6 @@ static void __exit sn_exit(void)
 module_init(sn_init);
 module_exit(sn_exit);
 MODULE_LICENSE("GPL");
+/* dma_buf_vmap_unlocked() for GPU-memory MRs (mr.c). */
+MODULE_IMPORT_NS("DMA_BUF");
 MODULE_DESCRIPTION("Opt-in native NHI CPU-copy software verbs; not RoCE");

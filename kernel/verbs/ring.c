@@ -338,8 +338,10 @@ static int sn_data_burst(struct sn_device *d, struct sn_mr *mr, u64 address,
 	ret = sn_mr_ensure_mapped(d, mr);
 	if (ret)
 		return ret;
-	dma_sync_sg_for_device(mr->map_dev, mr->umem->sgt_append.sgt.sgl,
-		mr->umem->sgt_append.sgt.orig_nents, DMA_TO_DEVICE);
+	/* A GPU MR's mapping belongs to its exporter; never sync it here. */
+	if (!mr->dmabuf)
+		dma_sync_sg_for_device(mr->map_dev, mr->umem->sgt_append.sgt.sgl,
+			mr->umem->sgt_append.sgt.orig_nents, DMA_TO_DEVICE);
 	while (d->data_tx_head != d->data_tx_tail &&
 	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE])) {
 		if (d->data_tx[d->data_tx_tail % SN_RING_SIZE].canceled)
@@ -448,8 +450,9 @@ int sn_data_recv_start(struct sn_device *d, struct sn_qp *q)
 	ret = sn_mr_ensure_mapped(d, q->zc_mr);
 	if (ret)
 		return ret;
-	dma_sync_sg_for_device(q->zc_mr->map_dev, q->zc_mr->umem->sgt_append.sgt.sgl,
-		q->zc_mr->umem->sgt_append.sgt.orig_nents, DMA_FROM_DEVICE);
+	if (!q->zc_mr->dmabuf)
+		dma_sync_sg_for_device(q->zc_mr->map_dev, q->zc_mr->umem->sgt_append.sgt.sgl,
+			q->zc_mr->umem->sgt_append.sgt.orig_nents, DMA_FROM_DEVICE);
 	d->zdata_posted = 0;
 	return sn_zdata_repost(d, q);
 }
@@ -555,7 +558,7 @@ void sn_data_receive(struct sn_device *d)
 			if (d->qp->zc_received + size == d->qp->zc_total) {
 				struct sn_mr *m = d->qp->zc_mr;
 
-				if (m && m->map_nents)
+				if (m && m->map_nents && !m->dmabuf)
 					dma_sync_sg_for_cpu(m->map_dev,
 						m->umem->sgt_append.sgt.sgl,
 						m->umem->sgt_append.sgt.orig_nents,

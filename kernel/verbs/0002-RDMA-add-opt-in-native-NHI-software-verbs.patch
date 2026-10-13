@@ -459,10 +459,12 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,343 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
++#include <linux/dma-buf.h>
++#include <linux/iosys-map.h>
 +#include <linux/module.h>
 +#include <linux/mutex.h>
 +#include <linux/netdevice.h>
@@ -529,6 +531,12 @@ new file mode 100644
 +	struct scatterlist *cur_sg;
 +	unsigned int cur_idx;
 +	u64 cur_off;
++	/* GPU memory (DMA-BUF) MR: the pinned attachment whose exporter mapping,
++	 * made for the NHI, the data path uses as is (never re-mapped or synced
++	 * here), and the CPU mapping the staged paths copy through. NULL for an
++	 * ordinary CPU-page MR. See docs/GPU_DIRECT_VERBS.md. */
++	struct ib_umem_dmabuf *dmabuf;
++	struct iosys_map vmap;
 +};
 +struct sn_cq {
 +	struct ib_cq ib;
@@ -749,6 +757,10 @@ new file mode 100644
 +struct sn_mr *sn_mr_get(struct sn_qp *q, u32 key, u64 address, u32 length, u32 access);
 +void sn_mr_put(struct sn_mr *m);
 +int sn_mr_copy(struct sn_mr *m, u64 address, void *buffer, u32 length, bool to_mr);
++struct ib_mr *sn_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset, u64 length,
++				   u64 iova, int fd, int access,
++				   struct ib_dmah *dmah,
++				   struct uverbs_attr_bundle *attrs);
 +int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *payload, bool control);
 +int sn_rings_start(struct sn_device *d);
 +int sn_rings_stop(struct sn_device *d);
@@ -795,7 +807,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,588 @@
+@@ -0,0 +1,590 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -1383,12 +1395,14 @@ new file mode 100644
 +module_init(sn_init);
 +module_exit(sn_exit);
 +MODULE_LICENSE("GPL");
++/* dma_buf_vmap_unlocked() for GPU-memory MRs (mr.c). */
++MODULE_IMPORT_NS("DMA_BUF");
 +MODULE_DESCRIPTION("Opt-in native NHI CPU-copy software verbs; not RoCE");
 diff --git a/drivers/infiniband/hw/strix_nhi/ring.c b/drivers/infiniband/hw/strix_nhi/ring.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/ring.c
-@@ -0,0 +1,569 @@
+@@ -0,0 +1,572 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/dma-mapping.h>
 +#include "strix_nhi.h"
@@ -1729,8 +1743,10 @@ new file mode 100644
 +	ret = sn_mr_ensure_mapped(d, mr);
 +	if (ret)
 +		return ret;
-+	dma_sync_sg_for_device(mr->map_dev, mr->umem->sgt_append.sgt.sgl,
-+		mr->umem->sgt_append.sgt.orig_nents, DMA_TO_DEVICE);
++	/* A GPU MR's mapping belongs to its exporter; never sync it here. */
++	if (!mr->dmabuf)
++		dma_sync_sg_for_device(mr->map_dev, mr->umem->sgt_append.sgt.sgl,
++			mr->umem->sgt_append.sgt.orig_nents, DMA_TO_DEVICE);
 +	while (d->data_tx_head != d->data_tx_tail &&
 +	       sn_slot_done(d, &d->data_tx[d->data_tx_tail % SN_RING_SIZE])) {
 +		if (d->data_tx[d->data_tx_tail % SN_RING_SIZE].canceled)
@@ -1839,8 +1855,9 @@ new file mode 100644
 +	ret = sn_mr_ensure_mapped(d, q->zc_mr);
 +	if (ret)
 +		return ret;
-+	dma_sync_sg_for_device(q->zc_mr->map_dev, q->zc_mr->umem->sgt_append.sgt.sgl,
-+		q->zc_mr->umem->sgt_append.sgt.orig_nents, DMA_FROM_DEVICE);
++	if (!q->zc_mr->dmabuf)
++		dma_sync_sg_for_device(q->zc_mr->map_dev, q->zc_mr->umem->sgt_append.sgt.sgl,
++			q->zc_mr->umem->sgt_append.sgt.orig_nents, DMA_FROM_DEVICE);
 +	d->zdata_posted = 0;
 +	return sn_zdata_repost(d, q);
 +}
@@ -1946,7 +1963,7 @@ new file mode 100644
 +			if (d->qp->zc_received + size == d->qp->zc_total) {
 +				struct sn_mr *m = d->qp->zc_mr;
 +
-+				if (m && m->map_nents)
++				if (m && m->map_nents && !m->dmabuf)
 +					dma_sync_sg_for_cpu(m->map_dev,
 +						m->umem->sgt_append.sgt.sgl,
 +						m->umem->sgt_append.sgt.orig_nents,
@@ -1962,7 +1979,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/verbs.c b/drivers/infiniband/hw/str
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/verbs.c
-@@ -0,0 +1,562 @@
+@@ -0,0 +1,563 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/random.h>
 +#include <linux/vmalloc.h>
@@ -2521,7 +2538,8 @@ new file mode 100644
 +	.create_qp = sn_create_qp, .destroy_qp = sn_destroy_qp,
 +	.modify_qp = sn_modify_qp, .query_qp = sn_query_qp,
 +	.post_send = sn_post_send, .post_recv = sn_post_recv,
-+	.reg_user_mr = sn_reg_user_mr, .dereg_mr = sn_dereg_mr,
++	.reg_user_mr = sn_reg_user_mr, .reg_user_mr_dmabuf = sn_reg_user_mr_dmabuf,
++	.dereg_mr = sn_dereg_mr,
 +	.size_ib_cq = sizeof(struct sn_cq), .size_ib_pd = sizeof(struct ib_pd),
 +	.size_ib_qp = sizeof(struct sn_qp), .size_ib_ucontext = sizeof(struct ib_ucontext),
 +};
@@ -2529,7 +2547,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/mr.c b/drivers/infiniband/hw/strix_
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/mr.c
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,275 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/scatterlist.h>
 +#include "strix_nhi.h"
@@ -2569,6 +2587,17 @@ new file mode 100644
 +		return -EACCES;
 +	if (!length)
 +		return 0;
++	if (m->dmabuf) {
++		/* GPU memory: through the CPU mapping made at registration. An
++		 * importer must not touch the exporter's scatterlist pages. */
++		size_t off = address - m->base;
++
++		if (to_mr)
++			iosys_map_memcpy_to(&m->vmap, off, buffer, length);
++		else
++			iosys_map_memcpy_from(buffer, &m->vmap, off, length);
++		return 0;
++	}
 +	skip = address - m->base + ib_umem_offset(m->umem);
 +	/* VIRT_DMA umem owns pinned CPU pages; only separate coherent staging
 +	 * buffers are ever mapped into the NHI. sg_pcopy handles page boundaries. */
@@ -2589,7 +2618,8 @@ new file mode 100644
 +	int n;
 +
 +	lockdep_assert_held(&d->lock);
-+	if (m->map_nents)
++	/* A GPU MR is mapped for the NHI by its exporter at registration. */
++	if (m->map_nents || m->dmabuf)
 +		return 0;
 +	if (!d->rx_ring)
 +		return -ENODEV;
@@ -2680,6 +2710,102 @@ new file mode 100644
 +	kfree(m);
 +	return ERR_PTR(ret);
 +}
++/* Register GPU memory exported as a DMA-BUF (docs/GPU_DIRECT_VERBS.md). The
++ * attachment is made for the NHI's DMA device -- this IB device has none of
++ * its own -- pinned, mapped and trimmed to [offset, offset + length) by the
++ * core helper; the data path then uses that mapping as is. A CPU mapping is
++ * made too, because the staged paths (small or unaligned operations, and the
++ * zero-copy READ fallback's snapshot) copy through sn_mr_copy(). */
++struct ib_mr *sn_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset, u64 length,
++				   u64 iova, int fd, int access,
++				   struct ib_dmah *dmah,
++				   struct uverbs_attr_bundle *attrs)
++{
++	struct sn_device *d = sn_dev(pd->device);
++	struct ib_umem_dmabuf *umem;
++	struct sn_mr *m;
++	u64 pinned = PAGE_ALIGN(length);
++	int ret = 0;
++
++	if (dmah || access & ~SN_ACCESS_FLAGS)
++		return ERR_PTR(-EOPNOTSUPP);
++	/* Page-aligned offset and iova keep a frame-aligned iova frame-aligned in
++	 * DMA space; the core helper trims the table to whole pages. */
++	if (!length || length > SN_MR_BYTES ||
++	    (offset | iova) & ~PAGE_MASK || offset > ULONG_MAX - length ||
++	    !sn_range(iova, length, iova, length) ||
++	    ((access & IB_ACCESS_REMOTE_WRITE) && !(access & IB_ACCESS_LOCAL_WRITE)))
++		return ERR_PTR(-EINVAL);
++	m = kzalloc(sizeof(*m), GFP_KERNEL);
++	if (!m)
++		return ERR_PTR(-ENOMEM);
++	mutex_lock(&d->lock);
++	if (d->dead) ret = -ENODEV;
++	else if (d->mr_count == SN_MAX_MRS || pinned > SN_PIN_BYTES - d->pinned)
++		ret = -ENOMEM;
++	else if (d->key_serial == U32_MAX) ret = -EOVERFLOW;
++	if (ret)
++		goto fail;
++	/* Reserve the slot and quota before dropping the lock for the import,
++	 * which may wait on the exporter's fences. */
++	d->mr_count++; d->pinned += pinned;
++	mutex_unlock(&d->lock);
++
++	umem = ib_umem_dmabuf_get_pinned_with_dma_device(&d->ib,
++		tb_service_parent(d->service)->tb->nhi->dev, offset, length,
++		fd, access);
++	if (IS_ERR(umem)) {
++		ret = PTR_ERR(umem);
++		goto unreserve;
++	}
++	ret = dma_buf_vmap_unlocked(umem->attach->dmabuf, &m->vmap);
++	if (ret) {
++		ib_umem_release(&umem->umem);
++		goto unreserve;
++	}
++	mutex_lock(&d->lock);
++	if (d->dead || d->key_serial == U32_MAX) {
++		ret = d->dead ? -ENODEV : -EOVERFLOW;
++		mutex_unlock(&d->lock);
++		dma_buf_vunmap_unlocked(umem->attach->dmabuf, &m->vmap);
++		ib_umem_release(&umem->umem);
++		goto unreserve;
++	}
++	m->dmabuf = umem;
++	m->umem = &umem->umem;
++	m->ib.device = &d->ib;
++	m->ib.pd = pd;
++	m->ib.lkey = ++d->key_serial;
++	m->ib.rkey = m->ib.lkey;
++	m->base = iova; m->size = length; m->pinned = pinned; m->access = access;
++	m->ib.iova = iova; m->ib.length = length;
++	/* The exporter's mapping, trimmed to the MR, is the NHI mapping. */
++	m->map_dev = tb_service_parent(d->service)->tb->nhi->dev;
++	m->map_nents = umem->umem.sgt_append.sgt.nents;
++	m->cur_sg = NULL; m->cur_idx = 0; m->cur_off = 0;
++	list_add_tail(&m->entry, &d->mrs);
++	mutex_unlock(&d->lock);
++	return &m->ib;
++unreserve:
++	mutex_lock(&d->lock);
++	d->mr_count--; d->pinned -= pinned;
++fail:
++	mutex_unlock(&d->lock);
++	kfree(m);
++	return ERR_PTR(ret);
++}
++/* Undo a registration's mappings and drop its memory: the NHI mapping of a
++ * CPU MR, or the CPU mapping of a GPU MR (whose NHI mapping, pin, attachment
++ * and DMA-BUF reference ib_umem_release() drops). */
++static void sn_mr_release(struct sn_mr *m)
++{
++	if (m->dmabuf)
++		dma_buf_vunmap_unlocked(m->dmabuf->attach->dmabuf, &m->vmap);
++	else if (m->map_nents)
++		dma_unmap_sg(m->map_dev, m->umem->sgt_append.sgt.sgl,
++			m->umem->sgt_append.sgt.orig_nents, DMA_BIDIRECTIONAL);
++	ib_umem_release(m->umem);
++}
 +int sn_dereg_mr(struct ib_mr *ib, struct ib_udata *udata)
 +{
 +	struct sn_mr *m = container_of(ib, struct sn_mr, ib);
@@ -2692,10 +2818,7 @@ new file mode 100644
 +	}
 +	list_del(&m->entry);
 +	d->mr_count--; d->pinned -= m->pinned;
-+	if (m->map_nents)
-+		dma_unmap_sg(m->map_dev, m->umem->sgt_append.sgt.sgl,
-+			m->umem->sgt_append.sgt.orig_nents, DMA_BIDIRECTIONAL);
-+	ib_umem_release(m->umem);
++	sn_mr_release(m);
 +	mutex_unlock(&d->lock);
 +	kfree(m);
 +	return 0;
