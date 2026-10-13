@@ -30,13 +30,11 @@ continue. Evidence and background live in the linked docs.
   - (c) Replace hardware E2E on the data ring with a software credit scheme,
     as thunderbolt-ibverbs does on AMD. This is a redesign: the zero-copy
     recovery design currently relies on E2E being lossless.
-- [ ] **`SN_VERSION` bump (wire ABI).** A mixed-version pair fails mid-operation
-  today instead of refusing to pair. The 2026-10-12 SEND/WRITE change widens
-  the gap: an old sender still re-bursts on retry, and a new receiver treats
-  that as an overshoot error. A version bump negotiated in HELLO would refuse
-  mixed pairs cleanly at handshake. The same bump could add a READ_ACK probe,
-  which would close the remaining limit (ok 24): a zero-copy READ whose READ_ACK
-  is lost, followed by an idle connection, fails the responder.
+- [x] **`SN_VERSION` = 2 (wire ABI, 2026-10-12).** A mixed pair is now refused
+  at the first frame, counted as `version_mismatch` (never as corruption) and
+  reported in the log, instead of forming a session that fails mid-operation.
+  The same bump carries `SN_READ_PROBE`, which recovers a READ_ACK lost while
+  the connection is idle (the ok-24 limitation).
 - [x] **GPU-direct registration, v1 (2026-10-12).** DMA-BUF MRs from
   `hipMalloc` (`docs/GPU_DIRECT_VERBS.md`): GPU-to-GPU write/read/send verified
   at volume, forced READ fallbacks through GPU memory, kill -9 releases cleanly.
