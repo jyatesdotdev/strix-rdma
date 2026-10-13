@@ -59,12 +59,30 @@ static struct {
 	int (*event_create)(void **, unsigned);
 	int (*event_record)(void *, void *);
 	const char *(*error)(int);
-	void *acquire;
+	int (*module_load)(void **, const char *);
+	int (*module_function)(void **, void *, const char *);
+	int (*launch)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
+		      unsigned, void *, void **, void **);
+	int (*event_sync)(void *);
+	void *acquire, *no_fence, *fill, *check;
+	unsigned *bad;		/* device counter written by sn_check */
 } hip;
+/* --gpu-kernels PATH: GPU kernels from that code object produce the pattern and
+ * check what landed (the G4 stale-cache gate). STRIX_GPU_NO_RELEASE=1 waits for
+ * the producer without a system-scope release; STRIX_GPU_NO_ACQUIRE=1 checks
+ * without a system-scope acquire. Mismatches are counted, not fatal mid-run, so a
+ * diagnostic arm reports a rate; any mismatch still fails the run at the end.
+ * STRIX_GPU_CHECK_SKEW=1 is the positive control: every iteration must fail.
+ * STRIX_GPU_HOT=1 keeps the probed lines L2-resident (see sn_check). */
+static const char *gpu_kernels;
+static unsigned long long kernel_bad_bytes;
+static unsigned kernel_bad_iters;
 #define HIP_H2D 1
 #define HIP_D2H 2
 #define HIP_DMABUF_FD 1
 #define HIP_EVENT_RELEASE_TO_SYSTEM 0x80000000u
+#define HIP_EVENT_DISABLE_TIMING 0x2u
+#define HIP_EVENT_DISABLE_SYSTEM_FENCE 0x20000000u
 static void fail(const char *what)
 {
 	fprintf(stderr, "FAIL: %s (errno=%d: %s)\n", what, errno, strerror(errno));
@@ -87,10 +105,22 @@ static void gpu_load(void)
 	SYM(synchronize, "hipDeviceSynchronize"); SYM(address_range, "hipMemGetAddressRange");
 	SYM(export, "hipMemGetHandleForAddressRange"); SYM(event_create, "hipEventCreateWithFlags");
 	SYM(event_record, "hipEventRecord"); SYM(error, "hipGetErrorString");
-#undef SYM
 	hip_ok(hip.set_device(0), "hipSetDevice(0)");
 	/* Timing-enabled, system-scope: recording it emits the acquire. */
 	hip_ok(hip.event_create(&hip.acquire, HIP_EVENT_RELEASE_TO_SYSTEM), "acquire event");
+	if (gpu_kernels) {
+		void *module = NULL;
+
+		SYM(module_load, "hipModuleLoad"); SYM(module_function, "hipModuleGetFunction");
+		SYM(launch, "hipModuleLaunchKernel"); SYM(event_sync, "hipEventSynchronize");
+		hip_ok(hip.module_load(&module, gpu_kernels), "load GPU kernels code object");
+		hip_ok(hip.module_function(&hip.fill, module, "sn_fill"), "kernel sn_fill");
+		hip_ok(hip.module_function(&hip.check, module, "sn_check"), "kernel sn_check");
+		hip_ok(hip.malloc((void **)&hip.bad, sizeof(*hip.bad)), "mismatch counter");
+		hip_ok(hip.event_create(&hip.no_fence, HIP_EVENT_DISABLE_TIMING |
+			HIP_EVENT_DISABLE_SYSTEM_FENCE), "fence-free completion event");
+	}
+#undef SYM
 }
 /* A registered buffer and the host memory its contents are staged through.
  * Without --gpu they are the same allocation. */
@@ -125,12 +155,62 @@ static void buffer_free(unsigned char *buf, unsigned char *host)
 /* Make a host-built pattern the buffer's content and clear a landing buffer,
  * then release: the NHI must not race dirty GPU cache lines (a later write-back
  * of the cleared lines would overwrite received data). */
-static void buffers_publish(unsigned char *src, const unsigned char *src_host, unsigned char *dst)
+static void buffers_publish(unsigned char *src, const unsigned char *src_host, unsigned char *dst,
+			    uint64_t nonce, unsigned it)
 {
 	if (!gpu) return;
-	hip_ok(hip.memcpy(src, src_host, POOL, HIP_H2D), "publish pattern to GPU buffer");
-	hip_ok(hip.memset(dst, 0, POOL), "clear GPU landing buffer");
-	hip_ok(hip.synchronize(), "system-scope release");
+	if (gpu_kernels) {
+		unsigned long long n = nonce;
+		void *args[] = { &src, &n, &it, &xfer_len, &xfer_off };
+
+		hip_ok(hip.launch(hip.fill, 256, 1, 1, 256, 1, 1, 0, NULL, args, NULL), "launch sn_fill");
+	} else {
+		hip_ok(hip.memcpy(src, src_host, POOL, HIP_H2D), "publish pattern to GPU buffer");
+	}
+	/* STRIX_GPU_HOT=1 clears the landing buffer only once, so neither this
+	 * clear nor its write-back evicts the lines the stale-cache gate probes. */
+	if (!(gpu_kernels && getenv("STRIX_GPU_HOT")) || it == 1)
+		hip_ok(hip.memset(dst, 0, POOL), "clear GPU landing buffer");
+	if (gpu_kernels && getenv("STRIX_GPU_NO_RELEASE")) {
+		/* Diagnostic: wait for the GPU without a system-scope release. */
+		hip_ok(hip.event_record(hip.no_fence, NULL), "fence-free completion");
+		hip_ok(hip.event_sync(hip.no_fence), "wait without release");
+	} else {
+		hip_ok(hip.synchronize(), "system-scope release");
+	}
+}
+/* Check a landing buffer with sn_check on the GPU, after a system-scope acquire
+ * unless STRIX_GPU_NO_ACQUIRE is set. Counts, and reports the first few. */
+static void gpu_kernel_verify(const unsigned char *buf, uint64_t nonce, unsigned it)
+{
+	unsigned long long n = nonce;
+	unsigned bad = 0;
+	/* Positive control: STRIX_GPU_CHECK_SKEW=1 checks against the next
+	 * iteration's pattern, so a live check must report nearly every byte. */
+	unsigned want = it + (getenv("STRIX_GPU_CHECK_SKEW") ? 1u : 0u);
+	unsigned full = getenv("STRIX_GPU_HOT") ? 0u : 1u;
+	void *args[] = { &buf, &n, &want, &xfer_len, &xfer_off, &hip.bad, &full };
+
+	hip_ok(hip.memset(hip.bad, 0, sizeof(bad)), "reset mismatch counter");
+	if (!getenv("STRIX_GPU_NO_ACQUIRE"))
+		hip_ok(hip.event_record(hip.acquire, NULL), "system-scope acquire");
+	hip_ok(hip.launch(hip.check, 256, 1, 1, 256, 1, 1, 0, NULL, args, NULL), "launch sn_check");
+	hip_ok(hip.memcpy(&bad, hip.bad, sizeof(bad), HIP_D2H), "read mismatch counter");
+	if (bad) {
+		if (kernel_bad_iters < 10)
+			fprintf(stderr, "GPU-KERNEL MISMATCH iter %u: %u of %u bytes wrong\n", it, bad, POOL);
+		kernel_bad_iters++; kernel_bad_bytes += bad;
+	}
+}
+static void gpu_kernel_summary(unsigned iters, const char *role)
+{
+	if (!gpu_kernels) return;
+	printf("GPU kernels: produced and checked on the GPU, release=%s acquire=%s hot=%s, %u of %u iterations mismatched (%llu bytes) (%s)\n",
+	       getenv("STRIX_GPU_NO_RELEASE") ? "OFF" : "on", getenv("STRIX_GPU_NO_ACQUIRE") ? "OFF" : "on",
+	       getenv("STRIX_GPU_HOT") ? "yes" : "no",
+	       kernel_bad_iters, iters, kernel_bad_bytes, role);
+	fflush(stdout);
+	require(!kernel_bad_iters, "GPU-kernel payload verification");
 }
 static void buffer_collect(unsigned char *host, const unsigned char *buf)
 {
@@ -413,6 +493,9 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[1], "--gpu")) {
 			gpu = true;
 			argv[1] = argv[0]; argv++; argc--;
+		} else if (argc >= 3 && !strcmp(argv[1], "--gpu-kernels")) {
+			gpu = true; gpu_kernels = argv[2];
+			argv[2] = argv[0]; argv += 2; argc -= 2;
 		} else if (argc >= 3 && !strcmp(argv[1], "--len")) {
 			xfer_len = iterations(argv[2], CHUNK, "--len 1..2097152");
 			argv[2] = argv[0]; argv += 2; argc -= 2;
@@ -426,7 +509,7 @@ int main(int argc, char **argv)
 	require(xfer_off + (unsigned long)xfer_len <= CHUNK, "--off + --len must fit one 2 MiB slot");
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu] [--len N] [--off N] --live ... send|write|read iters\n", argv[0], argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] --live ... send|write|read iters\n", argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	if (argc >= 7 && !strcmp(argv[6], "ping")) {
@@ -583,7 +666,8 @@ int main(int argc, char **argv)
 			unsigned sends = 0, recvs = 0, next_recv = 0;
 			int64_t deadline;
 			for (unsigned i = 0; i < WINDOW; i++) {
-				for (unsigned j = 0; j < xfer_len; j++) htx[i*CHUNK+xfer_off+j] = pattern(local.nonce, it, i, j);
+				if (!gpu_kernels)
+					for (unsigned j = 0; j < xfer_len; j++) htx[i*CHUNK+xfer_off+j] = pattern(local.nonce, it, i, j);
 				if (!gpu) memset(rx+i*CHUNK, 0, CHUNK);
 				rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx+i*CHUNK+xfer_off), .length = xfer_len, .lkey = rx_mr->lkey };
 				rw[i] = (struct ibv_recv_wr){ .wr_id = it*16u+i, .sg_list = &rs[i], .num_sge = 1,
@@ -593,7 +677,7 @@ int main(int argc, char **argv)
 					.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
 					.next = i+1 < WINDOW ? &sw[i+1] : NULL };
 			}
-			buffers_publish(tx, htx, rx);
+			buffers_publish(tx, htx, rx, local.nonce, it);
 			verb(ibv_post_recv(qp, rw, &rbad), "post SEND window receives");
 			atomic_thread_fence(memory_order_release);
 			/* Both sides' receives are posted before either side sends. */
@@ -627,8 +711,9 @@ int main(int argc, char **argv)
 			}
 			xfer_us += microseconds() - x0;
 			atomic_thread_fence(memory_order_acquire);
-			buffer_collect(hrx, rx);
-			{
+			if (gpu_kernels) gpu_kernel_verify(rx, peer.nonce, it);
+			else buffer_collect(hrx, rx);
+			if (!gpu_kernels) {
 				unsigned bad_slots = 0;
 
 				for (unsigned i = 0; i < WINDOW; i++) {
@@ -641,6 +726,7 @@ int main(int argc, char **argv)
 			verified += (unsigned long long)WINDOW * xfer_len;
 		}
 		int64_t elapsed = milliseconds() - t0;
+		gpu_kernel_summary(send_iters, argv[3]);
 		struct counters post = stats(argv[2]);
 		require(post.bad == pre.bad && post.send - pre.send == verified &&
 			post.write == pre.write && post.read == pre.read,
@@ -672,10 +758,11 @@ int main(int argc, char **argv)
 			unsigned done = 0, completed = 0, next = 0;
 			int64_t deadline;
 			for (unsigned i = 0; i < WINDOW; i++) {
-				for (unsigned j = 0; j < xfer_len; j++) hfilled[i*CHUNK+xfer_off+j] = pattern(local.nonce, it, i, j);
+				if (!gpu_kernels)
+					for (unsigned j = 0; j < xfer_len; j++) hfilled[i*CHUNK+xfer_off+j] = pattern(local.nonce, it, i, j);
 				if (!gpu) memset(landed+i*CHUNK, 0, CHUNK);
 			}
-			buffers_publish(filled, hfilled, landed);
+			buffers_publish(filled, hfilled, landed, local.nonce, it);
 			atomic_thread_fence(memory_order_release);
 			/* Both sides must have published their source and cleared their
 			 * landing buffer before either operation can reach the peer. */
@@ -720,8 +807,9 @@ int main(int argc, char **argv)
 			barrier(fd, 1000 + it);
 			xfer_us += microseconds() - x0;
 			atomic_thread_fence(memory_order_acquire);
-			buffer_collect(hlanded, landed);
-			{
+			if (gpu_kernels) gpu_kernel_verify(landed, peer.nonce, it);
+			else buffer_collect(hlanded, landed);
+			if (!gpu_kernels) {
 				unsigned bad_slots = 0;
 
 				for (unsigned i = 0; i < WINDOW; i++) {
@@ -734,6 +822,7 @@ int main(int argc, char **argv)
 			verified += (unsigned long long)WINDOW * xfer_len;
 		}
 		int64_t elapsed = milliseconds() - t0;
+		gpu_kernel_summary(rdma_iters, argv[3]);
 		struct counters post = stats(argv[2]);
 		require(post.bad == pre.bad && post.tx > pre.tx && post.rx > pre.rx,
 			"no rejected frames during RDMA verification");

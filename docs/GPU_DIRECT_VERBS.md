@@ -1,9 +1,10 @@
 # GPU-direct registration for native verbs (DMA-BUF MRs)
 
 Status (2026-10-12): **v1 implemented and validated on hardware.** GPU-to-GPU
-SEND, WRITE and READ pass byte-for-byte at volume. Open: G4 (GPU-kernel
-stale-cache gate), G5 hot-unplug, and the small/unaligned part of G3. See
-"Results" at the end.
+SEND, WRITE and READ pass byte-for-byte at volume, including small and
+unaligned operations. The stale-cache gate (G4) shows the producer's
+system-scope release is required. Open: G5, hot-unplug with GPU MRs
+registered. See "Results" at the end.
 
 ## Goal
 
@@ -121,7 +122,11 @@ fences. The application must:
 - **Before posting** a SEND/WRITE from a GPU MR, or before a peer READs it:
   make the GPU's writes system-visible. Use `hipDeviceSynchronize()` /
   `hipStreamSynchronize()` after the producing work, or a
-  `hipEventReleaseToSystem` event synchronized before the post.
+  `hipEventReleaseToSystem` event synchronized before the post. **This is
+  required; G4 measured what happens without it.** A completion wait that is
+  explicitly fence-free (`hipEventDisableSystemFence`) left the producer's
+  writes dirty in the GPU L2, and the NHI then sent stale bytes in 5–97% of
+  iterations.
 - **After a completion** that wrote a GPU MR (RECV, a READ's local landing
   buffer, or a peer's WRITE signalled by a later message): perform a
   system-scope acquire before GPU kernels read it. A timing-enabled
@@ -164,9 +169,9 @@ fences. The application must:
       870–1,390 MiB/s.
   - This was also the first hardware run of small and unaligned operations at
     volume for CPU memory.
-- [ ] **G4 Stale-cache gate.** Not run. The v1 test consumes received data
-  with `hipMemcpy` after a system-scope acquire event. It does not answer
-  whether GPU *kernels* reading hot buffers need that acquire.
+- [x] **G4 Stale-cache gate.** GPU kernels produce and check the data
+  (`strix-verbs-smoke --gpu-kernels`). The result is below: the release is
+  required, and the acquire made no observed difference.
 - [~] **G5 Lifecycle.** `kill -9` of one side mid-transfer: both processes
   exit, both hosts drop to 0 DMA-BUF objects within seconds, no kernel message,
   and the next GPU runs pass. Not yet: hot-unplug with GPU MRs registered.
@@ -189,6 +194,32 @@ GPU memory is never slower. For WRITE it is consistently faster: the ranges
 don't overlap. One unverified explanation is that GPU allocations come in large
 physically contiguous pieces, which means fewer IOMMU page walks for the NHI
 than scattered 4 KiB CPU pages. That hasn't been measured.
+
+**G4: GPU caches.** GPU kernels from a code object
+(`tools/verbs/strix-verbs-gpu-kernels.hip`) fill the source and count wrong
+bytes at the destination. "Hot" mode (`STRIX_GPU_HOT=1`) clears the landing
+buffer only once and checks only the 1 MiB of transfer ranges. That keeps the
+probed lines resident in the GPU L2 across the NHI's writes, and every byte
+changes between iterations, so a stale line always shows as a mismatch.
+
+Results with `--len 262144`, 300 iterations, mismatched iterations per side:
+
+| arm | WRITE | READ | SEND |
+|---|---|---|---|
+| positive control (check against the wrong iteration) | 20/20, every byte | | |
+| release + acquire (the contract) | 0, 0 | 0, 0 | 0, 0 |
+| no acquire | 0, 0 | 0, 0 | 0, 0 |
+| **no release** | 30, 24 | 56, 259 | 196, 33 |
+| neither | 15, 20 | 28, 291 | 205, 26 |
+
+- **The producer's release is required.** Without it the NHI reads memory
+  that the GPU L2 still holds dirty.
+- **A missing acquire was not observed to matter** on this platform (Strix
+  Halo, ROCm 7.15, coarse-grained `hipMalloc`). It stays in the contract: it
+  is cheap, and an unobserved hazard is not a guarantee.
+- **The first, non-hot run passed every arm.** Its per-iteration 8 MiB clear
+  and full-window check evicted exactly the lines under test. A cache test has
+  to keep its probe lines resident to mean anything.
 
 **A correction to earlier throughput figures.** The verified modes' *wall*
 rates in earlier records (about 410–490 MiB/s) are bound by the test tool's
