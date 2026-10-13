@@ -125,6 +125,8 @@ scripts/verbs-streak.sh 1 5 write 2000
 scripts/verbs-streak.sh 1 5 send 2000      # verified bulk SEND/RECV
 scripts/verbs-streak.sh 1 5 send           # the SEND/RECV smoke
 SMOKE_FLAGS=--gpu scripts/verbs-streak.sh 1 5 write 2000   # all buffers in GPU memory
+SMOKE_FLAGS='--len 3000 --off 64' XFER_LEN=3000 scripts/verbs-streak.sh 1 1 send 200
+                                            # small/unaligned: the staged path
 ```
 
 `strix-verbs-smoke --gpu` allocates every buffer with `hipMalloc` (HIP is

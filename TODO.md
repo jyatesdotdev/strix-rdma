@@ -44,5 +44,4 @@ continue. Evidence and background live in the linked docs.
   kernels produce and consume hot buffers, run with and without the
   system-scope acquire (needs a small HIP program; the v1 test consumes through
   `hipMemcpy`). G5: hot-unplug with GPU MRs registered (needs someone at the
-  machines). G3 remainder: small and unaligned operations on GPU MRs, which use
-  the staged path through the CPU mapping.
+  machines). (G3, small and unaligned operations, passed 2026-10-12.)

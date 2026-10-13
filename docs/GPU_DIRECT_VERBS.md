@@ -150,11 +150,20 @@ fences. The application must:
 - [x] **G2 Data path.** Every buffer is in GPU memory on both hosts.
   `write 2000`, `read 2000` and `send 2000` (16.8 GB per direction each) all
   verified byte-for-byte on both sides, with no kernel message.
-- [~] **G3 Staged paths on GPU MRs.** `read 2000` 3/3 PASS with
-  `zc_read_fault=100`. 18 fallbacks fired, each snapshotting a GPU source
-  through the vmap and completing into a GPU landing buffer through it,
-  byte-for-byte. Not yet: small and unaligned operations on GPU MRs (the smoke
-  modes are all 2 MiB and aligned).
+- [x] **G3 Staged paths on GPU MRs.**
+  - **Forced READ fallbacks:** `read 2000` 3/3 PASS with `zc_read_fault=100`.
+    18 fallbacks fired, each snapshotting a GPU source through the vmap and
+    completing into a GPU landing buffer through it, byte-for-byte.
+  - **Varied geometry** (`strix-verbs-smoke --len/--off`): for each of WRITE,
+    READ and SEND, on CPU and on GPU memory, all 18 combinations PASS
+    byte-for-byte. Every landing slot is also checked to be untouched outside
+    the transfer range (no overrun).
+    - 3,000 B, aligned, ×500: staged, 20–35 MiB/s.
+    - 1 MiB at offset 100, ×30: staged because unaligned, 60–68 MiB/s.
+    - 2,093,055 B at offset 4096, ×200: zero-copy with a partial last frame,
+      870–1,390 MiB/s.
+  - This was also the first hardware run of small and unaligned operations at
+    volume for CPU memory.
 - [ ] **G4 Stale-cache gate.** Not run. The v1 test consumes received data
   with `hipMemcpy` after a system-scope acquire event. It does not answer
   whether GPU *kernels* reading hot buffers need that acquire.

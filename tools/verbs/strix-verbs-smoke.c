@@ -41,6 +41,12 @@ struct counters { unsigned long long tx, rx, bad, send, write, read; };
  * system-scope acquire and checked on the host. STRIX_GPU_NO_ACQUIRE=1 drops
  * that acquire, a diagnostic arm for the stale-cache gate. */
 static bool gpu;
+/* --len/--off: each window slot carries one transfer of xfer_len bytes starting
+ * xfer_off bytes into its 2 MiB slot (default: the whole slot). Small or
+ * unaligned geometry takes the staged path; an aligned odd length takes the
+ * zero-copy path with a partial last frame. The rest of every landing slot must
+ * stay zero, so an overrun is caught too. */
+static unsigned xfer_len = CHUNK, xfer_off;
 static struct {
 	int (*set_device)(int);
 	int (*malloc)(void **, size_t);
@@ -172,6 +178,7 @@ static void control_io(int fd, void *buf, size_t size, bool writing, int64_t dea
 		wait_fd(fd, writing ? POLLOUT : POLLIN, deadline);
 		n = writing ? send(fd, p, size, MSG_NOSIGNAL) : recv(fd, p, size, 0);
 		if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+		if (n == 0) { errno = 0; fail("control I/O: peer closed the connection"); }
 		require(n > 0, "control I/O"); p += n; size -= (size_t)n;
 	}
 }
@@ -357,6 +364,34 @@ static void selftest(void)
 	require(pattern(e.nonce, 1, 0, 0) != pattern(e.nonce, 2, 0, 0), "distinct iterations");
 	puts("ok - smoke metadata codec/selftest only; no device opened");
 }
+/* One landing slot: the transfer range holds the peer's pattern for this
+ * iteration and slot, and every byte outside it is still zero (no overrun). On
+ * a whole-slot transfer the existing classifier explains a mismatch. */
+static bool slot_verified(const unsigned char *landed, uint64_t nonce, uint64_t own_nonce,
+			  unsigned it, unsigned slot)
+{
+	const unsigned char *b = landed + (size_t)slot * CHUNK;
+	unsigned j;
+
+	for (j = 0; j < xfer_len; j++)
+		if (b[xfer_off + j] != pattern(nonce, it, slot, j))
+			break;
+	if (j < xfer_len) {
+		if (!xfer_off && xfer_len == CHUNK)
+			report_mismatch(landed, nonce, own_nonce, it, slot, CHUNK, WINDOW);
+		else
+			fprintf(stderr, "MISMATCH iter %u slot %u: first bad byte %u of %u (offset %u): got 0x%02x want 0x%02x\n",
+				it, slot, j, xfer_len, xfer_off, b[xfer_off + j], pattern(nonce, it, slot, j));
+		return false;
+	}
+	for (j = 0; j < CHUNK; j++)
+		if ((j < xfer_off || j >= xfer_off + xfer_len) && b[j]) {
+			fprintf(stderr, "MISMATCH iter %u slot %u: overrun, byte %u outside [%u, %u) is 0x%02x\n",
+				it, slot, j, xfer_off, xfer_off + xfer_len, b[j]);
+			return false;
+		}
+	return true;
+}
 int main(int argc, char **argv)
 {
 	struct ibv_device **devices; struct ibv_context *ctx = NULL;
@@ -374,13 +409,24 @@ int main(int argc, char **argv)
 	unsigned bench_iters = 0, ping_iters = 0, rdma_iters = 0, send_iters = 0;
 	int count, fd; bool listening, rdma_read = false;
 	if (argc == 2 && !strcmp(argv[1], "--selftest")) { selftest(); return 0; }
-	if (argc >= 2 && !strcmp(argv[1], "--gpu")) {
-		gpu = true;
-		argv[1] = argv[0]; argv++; argc--;
+	while (argc >= 2 && strcmp(argv[1], "--live")) {
+		if (!strcmp(argv[1], "--gpu")) {
+			gpu = true;
+			argv[1] = argv[0]; argv++; argc--;
+		} else if (argc >= 3 && !strcmp(argv[1], "--len")) {
+			xfer_len = iterations(argv[2], CHUNK, "--len 1..2097152");
+			argv[2] = argv[0]; argv += 2; argc -= 2;
+		} else if (argc >= 3 && !strcmp(argv[1], "--off")) {
+			char *end = NULL; unsigned long v = strtoul(argv[2], &end, 10);
+			require(end && !*end && v < CHUNK, "--off 0..2097151");
+			xfer_off = (unsigned)v;
+			argv[2] = argv[0]; argv += 2; argc -= 2;
+		} else break;
 	}
+	require(xfer_off + (unsigned long)xfer_len <= CHUNK, "--off + --len must fit one 2 MiB slot");
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n       %s --gpu --live ... send|write|read iters   (all buffers in GPU memory)\n", argv[0], argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu] [--len N] [--off N] --live ... send|write|read iters\n", argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	if (argc >= 7 && !strcmp(argv[6], "ping")) {
@@ -537,12 +583,12 @@ int main(int argc, char **argv)
 			unsigned sends = 0, recvs = 0, next_recv = 0;
 			int64_t deadline;
 			for (unsigned i = 0; i < WINDOW; i++) {
-				for (unsigned j = 0; j < CHUNK; j++) htx[i*CHUNK+j] = pattern(local.nonce, it, i, j);
+				for (unsigned j = 0; j < xfer_len; j++) htx[i*CHUNK+xfer_off+j] = pattern(local.nonce, it, i, j);
 				if (!gpu) memset(rx+i*CHUNK, 0, CHUNK);
-				rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx+i*CHUNK), .length = CHUNK, .lkey = rx_mr->lkey };
+				rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx+i*CHUNK+xfer_off), .length = xfer_len, .lkey = rx_mr->lkey };
 				rw[i] = (struct ibv_recv_wr){ .wr_id = it*16u+i, .sg_list = &rs[i], .num_sge = 1,
 					.next = i+1 < WINDOW ? &rw[i+1] : NULL };
-				ss[i] = (struct ibv_sge){ .addr = (uintptr_t)(tx+i*CHUNK), .length = CHUNK, .lkey = tx_mr->lkey };
+				ss[i] = (struct ibv_sge){ .addr = (uintptr_t)(tx+i*CHUNK+xfer_off), .length = xfer_len, .lkey = tx_mr->lkey };
 				sw[i] = (struct ibv_send_wr){ .wr_id = it*16u+8+i, .sg_list = &ss[i], .num_sge = 1,
 					.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
 					.next = i+1 < WINDOW ? &sw[i+1] : NULL };
@@ -571,7 +617,7 @@ int main(int argc, char **argv)
 						fail("SEND WC status/identity");
 					}
 					if (wc[k].opcode == IBV_WC_RECV) {
-						require(slot == next_recv++ && wc[k].byte_len == CHUNK, "ordered full-length RECV");
+						require(slot == next_recv++ && wc[k].byte_len == xfer_len, "ordered full-length RECV");
 						recvs++;
 					} else {
 						require(wc[k].opcode == IBV_WC_SEND && slot >= 8 && slot < 8+WINDOW, "SEND WC opcode/slot");
@@ -586,20 +632,13 @@ int main(int argc, char **argv)
 				unsigned bad_slots = 0;
 
 				for (unsigned i = 0; i < WINDOW; i++) {
-					unsigned j;
-
-					for (j = 0; j < CHUNK; j++)
-						if (hrx[i*CHUNK+j] != pattern(peer.nonce, it, i, j))
-							break;
-					if (j < CHUNK) {
-						report_mismatch(hrx, peer.nonce, local.nonce, it, i, CHUNK, WINDOW);
+					if (!slot_verified(hrx, peer.nonce, local.nonce, it, i))
 						bad_slots++;
-					}
 				}
 				if (bad_slots)
 					fail("SEND payload verification");
 			}
-			verified += (unsigned long long)WINDOW * CHUNK;
+			verified += (unsigned long long)WINDOW * xfer_len;
 		}
 		int64_t elapsed = milliseconds() - t0;
 		struct counters post = stats(argv[2]);
@@ -608,7 +647,7 @@ int main(int argc, char **argv)
 			"native counters prove SEND placements only");
 		barrier(fd, 2); /* both finished */
 		printf("PASS native SEND/RECV verified: %u iters x %u x %u B, wall %lld ms, %.2f MiB/s, %llu bytes placed and verified byte-for-byte (%s)\n",
-		       send_iters, WINDOW, CHUNK, (long long)elapsed,
+		       send_iters, WINDOW, xfer_len, (long long)elapsed,
 		       (double)verified / (1048576.0 * elapsed / 1000.0), verified, argv[3]);
 		printf("%s buffers: transfer-only %.2f MiB/s per direction (post to both directions complete; pattern generation, staging and verification excluded) (%s)\n",
 		       gpu ? "GPU" : "CPU", (double)verified / (1048576.0 * (double)xfer_us / 1e6), argv[3]);
@@ -633,7 +672,7 @@ int main(int argc, char **argv)
 			unsigned done = 0, completed = 0, next = 0;
 			int64_t deadline;
 			for (unsigned i = 0; i < WINDOW; i++) {
-				for (unsigned j = 0; j < CHUNK; j++) hfilled[i*CHUNK+j] = pattern(local.nonce, it, i, j);
+				for (unsigned j = 0; j < xfer_len; j++) hfilled[i*CHUNK+xfer_off+j] = pattern(local.nonce, it, i, j);
 				if (!gpu) memset(landed+i*CHUNK, 0, CHUNK);
 			}
 			buffers_publish(filled, hfilled, landed);
@@ -642,12 +681,12 @@ int main(int argc, char **argv)
 			 * landing buffer before either operation can reach the peer. */
 			barrier(fd, it);
 			for (unsigned i = 0; i < WINDOW; i++) {
-				ss[i] = (struct ibv_sge){ .addr = (uintptr_t)(tx+i*CHUNK), .length = CHUNK, .lkey = tx_mr->lkey };
+				ss[i] = (struct ibv_sge){ .addr = (uintptr_t)(tx+i*CHUNK+xfer_off), .length = xfer_len, .lkey = tx_mr->lkey };
 				sw[i] = (struct ibv_send_wr){ .wr_id = it*16u+i, .sg_list = &ss[i], .num_sge = 1,
 					.opcode = rdma_read ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE,
 					.send_flags = IBV_SEND_SIGNALED,
 					.next = i+1 < WINDOW ? &sw[i+1] : NULL,
-					.wr = { .rdma = { .remote_addr = peer.raddr + i*CHUNK, .rkey = peer.rkey } } };
+					.wr = { .rdma = { .remote_addr = peer.raddr + i*CHUNK + xfer_off, .rkey = peer.rkey } } };
 			}
 			int64_t x0 = microseconds();
 			verb(ibv_post_send(qp, sw, &sbad), rdma_read ? "post RDMA READ window" : "post RDMA WRITE window");
@@ -686,20 +725,13 @@ int main(int argc, char **argv)
 				unsigned bad_slots = 0;
 
 				for (unsigned i = 0; i < WINDOW; i++) {
-					unsigned j;
-
-					for (j = 0; j < CHUNK; j++)
-						if (hlanded[i*CHUNK+j] != pattern(peer.nonce, it, i, j))
-							break;
-					if (j < CHUNK) {
-						report_mismatch(hlanded, peer.nonce, local.nonce, it, i, CHUNK, WINDOW);
+					if (!slot_verified(hlanded, peer.nonce, local.nonce, it, i))
 						bad_slots++;
-					}
 				}
 				if (bad_slots)
 					fail("RDMA payload verification");
 			}
-			verified += (unsigned long long)WINDOW * CHUNK;
+			verified += (unsigned long long)WINDOW * xfer_len;
 		}
 		int64_t elapsed = milliseconds() - t0;
 		struct counters post = stats(argv[2]);
@@ -712,7 +744,7 @@ int main(int argc, char **argv)
 			require(post.write - pre.write == verified && post.read == pre.read &&
 				post.send == pre.send, "native counters prove WRITE placements only");
 		printf("PASS native RDMA %s: %u iters x %u x %u B, wall %lld ms, %.2f MiB/s, %llu bytes placed and verified byte-for-byte (%s)\n",
-		       rdma_read ? "READ" : "WRITE", rdma_iters, WINDOW, CHUNK, (long long)elapsed,
+		       rdma_read ? "READ" : "WRITE", rdma_iters, WINDOW, xfer_len, (long long)elapsed,
 		       (double)verified / (1048576.0 * elapsed / 1000.0), verified, argv[3]);
 		printf("%s buffers: transfer-only %.2f MiB/s per direction (post to both directions complete; pattern generation, staging and verification excluded) (%s)\n",
 		       gpu ? "GPU" : "CPU", (double)verified / (1048576.0 * (double)xfer_us / 1e6), argv[3]);

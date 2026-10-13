@@ -11,6 +11,7 @@
 # as for run-verbs-smoke.sh, plus
 #   OUT_DIR=./verbs-streak   evidence directory (created)
 #   QUIET_COUNTERS=regex     counters left out of the one-line summary
+#   XFER_LEN=N               per-slot transfer length when SMOKE_FLAGS has --len N
 #
 # Per run N, OUT_DIR gets run-N.log (connector output), run-N.listen (the
 # listener's full log), run-N.delta (every native_stats counter that moved, per host) and
@@ -35,8 +36,8 @@ case "${1:-send}" in
 send)
     if [ -n "${2:-}" ]; then
         MODE=(send "$2")
-        bytes=$(($2 * 4 * 2097152))
-        PASS="^PASS native SEND/RECV verified: $2 iters x 4 x 2097152 B, .* $bytes bytes placed and verified byte-for-byte"
+        bytes=$(($2 * 4 * ${XFER_LEN:-2097152}))
+        PASS="^PASS native SEND/RECV verified: $2 iters x 4 x ${XFER_LEN:-2097152} B, .* $bytes bytes placed and verified byte-for-byte"
     else
         MODE=()
         PASS='^PASS native CPU SEND/RECV: '
@@ -47,8 +48,8 @@ write|read)
     MODE=("$1" "$iters")
     op=$(echo "$1" | tr '[:lower:]' '[:upper:]')
     # The smoke tool's RDMA modes move a window of 4 x 2 MiB per iteration.
-    bytes=$((iters * 4 * 2097152))
-    PASS="^PASS native RDMA $op: $iters iters x 4 x 2097152 B, .* $bytes bytes placed and verified byte-for-byte"
+    bytes=$((iters * 4 * ${XFER_LEN:-2097152}))
+    PASS="^PASS native RDMA $op: $iters iters x 4 x ${XFER_LEN:-2097152} B, .* $bytes bytes placed and verified byte-for-byte"
     ;;
 *)
     echo "unknown mode: $1 (send [N] | write N | read N)" >&2
