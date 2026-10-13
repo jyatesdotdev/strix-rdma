@@ -22,7 +22,7 @@ libibverbs with a mismatched scratch build.
   `/bus/thunderbolt/drivers/strix_nhi`. The kernel registers the real service as
   parent. UNKNOWN alone, name alone, GUIDs, netdev names and Hellas devices do
   not match. Renaming the RDMA device outside this prefix is unsupported.
-- Query device/port/QP, PD, CPU MR, CQ, RC QP, state transitions, notification,
+- Query device/port/QP, PD, CPU MR, GPU (DMA-BUF) MR, CQ, RC QP, state transitions, notification,
   SEND/RECV/READ/WRITE and polling all use rdma-core `ibv_cmd_*` helpers.
   `query_gid` uses the normal core interface. Unsupported context operations
   retain rdma-core's explicit unsupported-operation defaults.

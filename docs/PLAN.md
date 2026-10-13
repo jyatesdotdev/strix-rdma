@@ -252,6 +252,7 @@ Compare the paths with identical message shapes:
 | USB4STREAM, native HIP DMA-BUF pools | No | Intended zero payload copies | Import/synchronization experiment only |
 | Native verbs, CPU-copy staging | No | Yes | Compatibility path for unmodified RDMA apps |
 | Native verbs, zero-copy data plane | No | No | Current fastest measured path |
+| Native verbs, GPU memory (DMA-BUF MRs) | No | No | GPU-to-GPU, no CPU payload copy; v1 validated 2026-10-12 |
 
 For each, measure:
 
@@ -296,7 +297,7 @@ is done; hardware READ/WRITE are now validated end to end (zero-copy WRITE at
 zero-copy READ, on by default since 2026-10-12, at 408–418 MiB/s over 20 consecutive
 15.6 GiB-per-direction runs with its timeout recovery forced, `bad_frames` 0); the open work is conformance breadth
 (repeated hot-unplug cycles beyond the first idle and mid-transfer pulls,
-malformed peers) and GPU-direct registration instead of CPU
-staging. Production
+malformed peers) and the remaining GPU-direct gates (a GPU-kernel stale-cache
+gate, hot-unplug with GPU MRs; v1 DMA-BUF MRs work, `GPU_DIRECT_VERBS.md`). Production
 work on any path remains dominated by disconnect/reset cancellation,
 synchronization, security, and compatibility rather than descriptor creation.

@@ -126,8 +126,10 @@ Open:
   recovered automatically with no reboot (2026-10-12, `kernel/verbs/README.md`).
   Repeated cycles, a pull during handshake, peer power-off and the known
   inactive-peer NHI wedge are untested, so there is no recovery guarantee yet.
-- GPU-direct registration for the verbs path (it stages through pinned CPU
-  pages today).
+- GPU-direct beyond v1. GPU memory registers as a DMA-BUF MR and moves
+  GPU-to-GPU byte-for-byte at volume (2026-10-12, `docs/GPU_DIRECT_VERBS.md`).
+  Still open: the stale-cache gate with GPU kernels as producer and consumer,
+  and hot-unplug with GPU MRs registered.
 
 ## Test hosts
 

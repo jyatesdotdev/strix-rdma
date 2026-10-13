@@ -2,7 +2,7 @@
 CC ?= cc
 CFLAGS ?= -O2 -g
 CPPFLAGS ?=
-LDLIBS ?= -libverbs
+LDLIBS ?= -libverbs -ldl
 # Explicit Linux-only opt-in build; root make/check do not build this tool.
 OUTPUT ?= strix-verbs-smoke
 .PHONY: all check clean

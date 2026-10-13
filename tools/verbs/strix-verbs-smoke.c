@@ -5,6 +5,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -33,6 +34,31 @@
  * both are zero in the SEND-only modes. */
 struct endpoint { uint64_t nonce, raddr; uint32_t qpn, psn, rkey; union ibv_gid gid; };
 struct counters { unsigned long long tx, rx, bad, send, write, read; };
+/* --gpu: every registered buffer is GPU memory (hipMalloc), exported as a
+ * DMA-BUF and registered with ibv_reg_dmabuf_mr (docs/GPU_DIRECT_VERBS.md).
+ * HIP is loaded at runtime so the tool keeps building as plain C. Patterns are
+ * built in a host shadow and copied in; results are copied out after a
+ * system-scope acquire and checked on the host. STRIX_GPU_NO_ACQUIRE=1 drops
+ * that acquire, a diagnostic arm for the stale-cache gate. */
+static bool gpu;
+static struct {
+	int (*set_device)(int);
+	int (*malloc)(void **, size_t);
+	int (*free)(void *);
+	int (*memcpy)(void *, const void *, size_t, int);
+	int (*memset)(void *, int, size_t);
+	int (*synchronize)(void);
+	int (*address_range)(void **, size_t *, void *);
+	int (*export)(void *, void *, size_t, int, unsigned long long);
+	int (*event_create)(void **, unsigned);
+	int (*event_record)(void *, void *);
+	const char *(*error)(int);
+	void *acquire;
+} hip;
+#define HIP_H2D 1
+#define HIP_D2H 2
+#define HIP_DMABUF_FD 1
+#define HIP_EVENT_RELEASE_TO_SYSTEM 0x80000000u
 static void fail(const char *what)
 {
 	fprintf(stderr, "FAIL: %s (errno=%d: %s)\n", what, errno, strerror(errno));
@@ -40,6 +66,73 @@ static void fail(const char *what)
 }
 static void require(bool ok, const char *what) { if (!ok) fail(what); }
 static void verb(int ret, const char *what) { if (ret) { errno = ret; fail(what); } }
+static void hip_ok(int ret, const char *what)
+{
+	if (ret) { fprintf(stderr, "FAIL: %s (hip %d: %s)\n", what, ret, hip.error(ret)); exit(1); }
+}
+static void gpu_load(void)
+{
+	void *h = dlopen("libamdhip64.so.7", RTLD_NOW);
+	if (!h) h = dlopen("libamdhip64.so", RTLD_NOW);
+	require(h != NULL, "load the HIP runtime (libamdhip64)");
+#define SYM(f, n) require((*(void **)&hip.f = dlsym(h, n)) != NULL, n)
+	SYM(set_device, "hipSetDevice"); SYM(malloc, "hipMalloc"); SYM(free, "hipFree");
+	SYM(memcpy, "hipMemcpy"); SYM(memset, "hipMemset");
+	SYM(synchronize, "hipDeviceSynchronize"); SYM(address_range, "hipMemGetAddressRange");
+	SYM(export, "hipMemGetHandleForAddressRange"); SYM(event_create, "hipEventCreateWithFlags");
+	SYM(event_record, "hipEventRecord"); SYM(error, "hipGetErrorString");
+#undef SYM
+	hip_ok(hip.set_device(0), "hipSetDevice(0)");
+	/* Timing-enabled, system-scope: recording it emits the acquire. */
+	hip_ok(hip.event_create(&hip.acquire, HIP_EVENT_RELEASE_TO_SYSTEM), "acquire event");
+}
+/* A registered buffer and the host memory its contents are staged through.
+ * Without --gpu they are the same allocation. */
+static void buffer_alloc(unsigned char **buf, unsigned char **host)
+{
+	verb(posix_memalign((void **)host, 4096, POOL), "host buffer allocation");
+	if (gpu) hip_ok(hip.malloc((void **)buf, POOL), "hipMalloc");
+	else *buf = *host;
+}
+static struct ibv_mr *buffer_register(struct ibv_pd *pd, unsigned char *buf, int access)
+{
+	void *base = NULL; size_t size = 0; int dmabuf = -1;
+	struct ibv_mr *mr;
+
+	if (!gpu) return ibv_reg_mr(pd, buf, POOL, access);
+	/* The exported fd names the whole backing allocation, so the MR's offset
+	 * into it is the pointer's distance from that allocation's base. */
+	hip_ok(hip.address_range(&base, &size, buf), "hipMemGetAddressRange");
+	hip_ok(hip.export(&dmabuf, buf, POOL, HIP_DMABUF_FD, 0), "export hipMalloc as DMA-BUF");
+	mr = ibv_reg_dmabuf_mr(pd, (uintptr_t)buf - (uintptr_t)base, POOL, (uintptr_t)buf, dmabuf, access);
+	if (mr)
+		fprintf(stderr, "GPU MR: hipMalloc %p (allocation %zu B, offset %zu), DMA-BUF fd %d, lkey %u\n",
+			(void *)buf, size, (size_t)((uintptr_t)buf - (uintptr_t)base), dmabuf, mr->lkey);
+	close(dmabuf);	/* the MR holds its own reference to the DMA-BUF */
+	return mr;
+}
+static void buffer_free(unsigned char *buf, unsigned char *host)
+{
+	if (gpu && buf) hip_ok(hip.free(buf), "hipFree");
+	free(host);
+}
+/* Make a host-built pattern the buffer's content and clear a landing buffer,
+ * then release: the NHI must not race dirty GPU cache lines (a later write-back
+ * of the cleared lines would overwrite received data). */
+static void buffers_publish(unsigned char *src, const unsigned char *src_host, unsigned char *dst)
+{
+	if (!gpu) return;
+	hip_ok(hip.memcpy(src, src_host, POOL, HIP_H2D), "publish pattern to GPU buffer");
+	hip_ok(hip.memset(dst, 0, POOL), "clear GPU landing buffer");
+	hip_ok(hip.synchronize(), "system-scope release");
+}
+static void buffer_collect(unsigned char *host, const unsigned char *buf)
+{
+	if (!gpu) return;
+	if (!getenv("STRIX_GPU_NO_ACQUIRE"))
+		hip_ok(hip.event_record(hip.acquire, NULL), "system-scope acquire");
+	hip_ok(hip.memcpy(host, buf, POOL, HIP_D2H), "collect GPU landing buffer");
+}
 static unsigned iterations(const char *text, unsigned long limit, const char *what)
 {
 	char *end = NULL; unsigned long v = strtoul(text, &end, 10);
@@ -270,6 +363,8 @@ int main(int argc, char **argv)
 	struct ibv_device_attr dev; struct ibv_port_attr port;
 	struct ibv_pd *pd; struct ibv_cq *cq; struct ibv_qp *qp;
 	struct ibv_mr *tx_mr, *rx_mr, *rd_mr = NULL; unsigned char *tx, *rx, *rd = NULL;
+	unsigned char *htx, *hrx, *hrd = NULL;
+	int64_t xfer_us = 0;
 	struct endpoint local = {}, peer; struct counters before, after;
 	struct ibv_qp_attr attr = {};
 	struct ibv_qp_init_attr init = { .qp_type = IBV_QPT_RC,
@@ -279,9 +374,13 @@ int main(int argc, char **argv)
 	unsigned bench_iters = 0, ping_iters = 0, rdma_iters = 0, send_iters = 0;
 	int count, fd; bool listening, rdma_read = false;
 	if (argc == 2 && !strcmp(argv[1], "--selftest")) { selftest(); return 0; }
+	if (argc >= 2 && !strcmp(argv[1], "--gpu")) {
+		gpu = true;
+		argv[1] = argv[0]; argv++; argc--;
+	}
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n", argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n       %s --gpu --live ... send|write|read iters   (all buffers in GPU memory)\n", argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	if (argc >= 7 && !strcmp(argv[6], "ping")) {
@@ -320,17 +419,22 @@ int main(int argc, char **argv)
 	cq = ibv_create_cq(ctx, 8, NULL, NULL, 0); require(cq != NULL && cq->cqe >= 8, "create shared CQ8");
 	init.send_cq = init.recv_cq = cq;
 	qp = ibv_create_qp(pd, &init); require(qp != NULL, "create RC QP4/4");
-	verb(posix_memalign((void **)&tx, 4096, POOL), "TX allocation");
-	verb(posix_memalign((void **)&rx, 4096, POOL), "RX allocation");
-	tx_mr = ibv_reg_mr(pd, tx, POOL, IBV_ACCESS_LOCAL_WRITE);
-	rx_mr = ibv_reg_mr(pd, rx, POOL, IBV_ACCESS_LOCAL_WRITE);
+	if (gpu) {
+		require(send_iters || rdma_iters, "--gpu needs send, write or read with an iteration count");
+		gpu_load();
+	}
+	buffer_alloc(&tx, &htx);
+	buffer_alloc(&rx, &hrx);
+	tx_mr = buffer_register(pd, tx, IBV_ACCESS_LOCAL_WRITE);
+	rx_mr = buffer_register(pd, rx, IBV_ACCESS_LOCAL_WRITE);
 	require(tx_mr && rx_mr, "two LOCAL_WRITE-only 8MiB MRs / memlock");
 	if (rdma_iters) {
 		/* The RDMA target is the only remotely accessible buffer. It exists
 		 * solely for the WRITE/READ modes so the SEND modes keep proving that
 		 * remote access is not granted by default. */
-		verb(posix_memalign((void **)&rd, RDMA_ALIGN, POOL), "RDMA allocation");
-		rd_mr = ibv_reg_mr(pd, rd, POOL, IBV_ACCESS_LOCAL_WRITE |
+		buffer_alloc(&rd, &hrd);
+		require(!((uintptr_t)rd & (RDMA_ALIGN - 1)), "RDMA target alignment");
+		rd_mr = buffer_register(pd, rd, IBV_ACCESS_LOCAL_WRITE |
 			IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
 		require(rd_mr != NULL, "remotely accessible 8MiB RDMA MR / memlock");
 		local.rkey = rd_mr->rkey; local.raddr = (uintptr_t)rd;
@@ -433,8 +537,8 @@ int main(int argc, char **argv)
 			unsigned sends = 0, recvs = 0, next_recv = 0;
 			int64_t deadline;
 			for (unsigned i = 0; i < WINDOW; i++) {
-				for (unsigned j = 0; j < CHUNK; j++) tx[i*CHUNK+j] = pattern(local.nonce, it, i, j);
-				memset(rx+i*CHUNK, 0, CHUNK);
+				for (unsigned j = 0; j < CHUNK; j++) htx[i*CHUNK+j] = pattern(local.nonce, it, i, j);
+				if (!gpu) memset(rx+i*CHUNK, 0, CHUNK);
 				rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx+i*CHUNK), .length = CHUNK, .lkey = rx_mr->lkey };
 				rw[i] = (struct ibv_recv_wr){ .wr_id = it*16u+i, .sg_list = &rs[i], .num_sge = 1,
 					.next = i+1 < WINDOW ? &rw[i+1] : NULL };
@@ -443,10 +547,12 @@ int main(int argc, char **argv)
 					.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
 					.next = i+1 < WINDOW ? &sw[i+1] : NULL };
 			}
+			buffers_publish(tx, htx, rx);
 			verb(ibv_post_recv(qp, rw, &rbad), "post SEND window receives");
 			atomic_thread_fence(memory_order_release);
 			/* Both sides' receives are posted before either side sends. */
 			barrier(fd, it);
+			int64_t x0 = microseconds();
 			verb(ibv_post_send(qp, sw, &sbad), "post SEND window");
 			deadline = milliseconds() + TIMEOUT_MS;
 			while (sends != WINDOW || recvs != WINDOW) {
@@ -473,7 +579,9 @@ int main(int argc, char **argv)
 					}
 				}
 			}
+			xfer_us += microseconds() - x0;
 			atomic_thread_fence(memory_order_acquire);
+			buffer_collect(hrx, rx);
 			{
 				unsigned bad_slots = 0;
 
@@ -481,10 +589,10 @@ int main(int argc, char **argv)
 					unsigned j;
 
 					for (j = 0; j < CHUNK; j++)
-						if (rx[i*CHUNK+j] != pattern(peer.nonce, it, i, j))
+						if (hrx[i*CHUNK+j] != pattern(peer.nonce, it, i, j))
 							break;
 					if (j < CHUNK) {
-						report_mismatch(rx, peer.nonce, local.nonce, it, i, CHUNK, WINDOW);
+						report_mismatch(hrx, peer.nonce, local.nonce, it, i, CHUNK, WINDOW);
 						bad_slots++;
 					}
 				}
@@ -502,6 +610,8 @@ int main(int argc, char **argv)
 		printf("PASS native SEND/RECV verified: %u iters x %u x %u B, wall %lld ms, %.2f MiB/s, %llu bytes placed and verified byte-for-byte (%s)\n",
 		       send_iters, WINDOW, CHUNK, (long long)elapsed,
 		       (double)verified / (1048576.0 * elapsed / 1000.0), verified, argv[3]);
+		printf("%s buffers: transfer-only %.2f MiB/s per direction (post to both directions complete; pattern generation, staging and verification excluded) (%s)\n",
+		       gpu ? "GPU" : "CPU", (double)verified / (1048576.0 * (double)xfer_us / 1e6), argv[3]);
 		goto done;
 	}
 	if (rdma_iters) { /* Verified bidirectional RDMA WRITE or READ, window 4 x 2 MiB. */
@@ -514,6 +624,8 @@ int main(int argc, char **argv)
 		 * `landed` is the buffer this side verifies afterwards. */
 		unsigned char *filled = rdma_read ? rd : tx;
 		unsigned char *landed = rdma_read ? tx : rd;
+		unsigned char *hfilled = rdma_read ? hrd : htx;
+		unsigned char *hlanded = rdma_read ? htx : hrd;
 		struct counters pre = stats(argv[2]);
 		unsigned long long verified = 0;
 		int64_t t0 = milliseconds();
@@ -521,9 +633,10 @@ int main(int argc, char **argv)
 			unsigned done = 0, completed = 0, next = 0;
 			int64_t deadline;
 			for (unsigned i = 0; i < WINDOW; i++) {
-				for (unsigned j = 0; j < CHUNK; j++) filled[i*CHUNK+j] = pattern(local.nonce, it, i, j);
-				memset(landed+i*CHUNK, 0, CHUNK);
+				for (unsigned j = 0; j < CHUNK; j++) hfilled[i*CHUNK+j] = pattern(local.nonce, it, i, j);
+				if (!gpu) memset(landed+i*CHUNK, 0, CHUNK);
 			}
+			buffers_publish(filled, hfilled, landed);
 			atomic_thread_fence(memory_order_release);
 			/* Both sides must have published their source and cleared their
 			 * landing buffer before either operation can reach the peer. */
@@ -536,6 +649,7 @@ int main(int argc, char **argv)
 					.next = i+1 < WINDOW ? &sw[i+1] : NULL,
 					.wr = { .rdma = { .remote_addr = peer.raddr + i*CHUNK, .rkey = peer.rkey } } };
 			}
+			int64_t x0 = microseconds();
 			verb(ibv_post_send(qp, sw, &sbad), rdma_read ? "post RDMA READ window" : "post RDMA WRITE window");
 			deadline = milliseconds() + TIMEOUT_MS;
 			while (done != WINDOW) {
@@ -562,9 +676,12 @@ int main(int argc, char **argv)
 				}
 			}
 			/* A READ completion orders only this side's landing buffer; a remote
-			 * WRITE into it is ordered by this barrier instead. */
+			 * WRITE into it is ordered by this barrier instead. Timing to the
+			 * barrier covers both directions, so both sides measure the same. */
 			barrier(fd, 1000 + it);
+			xfer_us += microseconds() - x0;
 			atomic_thread_fence(memory_order_acquire);
+			buffer_collect(hlanded, landed);
 			{
 				unsigned bad_slots = 0;
 
@@ -572,10 +689,10 @@ int main(int argc, char **argv)
 					unsigned j;
 
 					for (j = 0; j < CHUNK; j++)
-						if (landed[i*CHUNK+j] != pattern(peer.nonce, it, i, j))
+						if (hlanded[i*CHUNK+j] != pattern(peer.nonce, it, i, j))
 							break;
 					if (j < CHUNK) {
-						report_mismatch(landed, peer.nonce, local.nonce, it, i, CHUNK, WINDOW);
+						report_mismatch(hlanded, peer.nonce, local.nonce, it, i, CHUNK, WINDOW);
 						bad_slots++;
 					}
 				}
@@ -597,6 +714,8 @@ int main(int argc, char **argv)
 		printf("PASS native RDMA %s: %u iters x %u x %u B, wall %lld ms, %.2f MiB/s, %llu bytes placed and verified byte-for-byte (%s)\n",
 		       rdma_read ? "READ" : "WRITE", rdma_iters, WINDOW, CHUNK, (long long)elapsed,
 		       (double)verified / (1048576.0 * elapsed / 1000.0), verified, argv[3]);
+		printf("%s buffers: transfer-only %.2f MiB/s per direction (post to both directions complete; pattern generation, staging and verification excluded) (%s)\n",
+		       gpu ? "GPU" : "CPU", (double)verified / (1048576.0 * (double)xfer_us / 1e6), argv[3]);
 		goto done;
 	}
 	if (bench_iters) { /* Timed window-4 x 2MiB bidirectional loop; no verification. */
@@ -715,7 +834,8 @@ int main(int argc, char **argv)
 	verb(ibv_destroy_qp(qp), "synchronous QP destroy");
 	verb(ibv_dereg_mr(tx_mr), "TX deregistration"); verb(ibv_dereg_mr(rx_mr), "RX deregistration");
 	if (rd_mr) verb(ibv_dereg_mr(rd_mr), "RDMA deregistration");
-	free(tx); free(rx); free(rd); verb(ibv_destroy_cq(cq), "CQ destroy"); verb(ibv_dealloc_pd(pd), "PD free");
+	buffer_free(tx, htx); buffer_free(rx, hrx); if (rd) buffer_free(rd, hrd);
+	verb(ibv_destroy_cq(cq), "CQ destroy"); verb(ibv_dealloc_pd(pd), "PD free");
 	verb(ibv_close_device(ctx), "context close"); close(fd);
 	if (!bench_iters && !ping_iters && !rdma_iters && !send_iters)
 		printf("PASS native CPU SEND/RECV: %llu bytes received, window4 x 2MiB setup, ERR flush; not complete RC qualification\n", expected);

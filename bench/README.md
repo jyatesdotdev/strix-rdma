@@ -124,7 +124,16 @@ scripts/verbs-streak.sh 1 20 read 2000     # stop at the first failure
 scripts/verbs-streak.sh 1 5 write 2000
 scripts/verbs-streak.sh 1 5 send 2000      # verified bulk SEND/RECV
 scripts/verbs-streak.sh 1 5 send           # the SEND/RECV smoke
+SMOKE_FLAGS=--gpu scripts/verbs-streak.sh 1 5 write 2000   # all buffers in GPU memory
 ```
+
+`strix-verbs-smoke --gpu` allocates every buffer with `hipMalloc` (HIP is
+`dlopen`ed at runtime) and registers it with `ibv_reg_dmabuf_mr`
+(`docs/GPU_DIRECT_VERBS.md`). Every verified mode also prints a
+**transfer-only** rate, from post until both directions complete. Use that, not
+the wall rate, as the link figure: the wall rate includes the tool's own pattern
+generation and checking, which caps it near 410–490 MiB/s while the link moves
+about 1.0–1.3 GB/s per direction (2026-10-12).
 
 `verbs-streak.sh` passes a run only if both sides print PASS with the exact
 expected byte count. Under `OUT_DIR` (default `./verbs-streak`) it keeps each

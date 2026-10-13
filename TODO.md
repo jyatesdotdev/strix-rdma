@@ -37,8 +37,12 @@ continue. Evidence and background live in the linked docs.
   mixed pairs cleanly at handshake. The same bump could add a READ_ACK probe,
   which would close the remaining limit (ok 24): a zero-copy READ whose READ_ACK
   is lost, followed by an idle connection, fails the responder.
-- [ ] **GPU-direct registration.** Register GPU memory as verbs MRs (DMA-BUF
-  via `ib_umem_dmabuf`, ROCm export on the hosts, IOMMU mapping for the NHI)
-  instead of staging through pinned CPU pages. This is a project in its own
-  right (see `docs/PLAN.md`, "Remaining effort"). Write a design doc before
-  any code.
+- [x] **GPU-direct registration, v1 (2026-10-12).** DMA-BUF MRs from
+  `hipMalloc` (`docs/GPU_DIRECT_VERBS.md`): GPU-to-GPU write/read/send verified
+  at volume, forced READ fallbacks through GPU memory, kill -9 releases cleanly.
+- [ ] **GPU-direct, remaining gates.** G4: a stale-cache gate in which GPU
+  kernels produce and consume hot buffers, run with and without the
+  system-scope acquire (needs a small HIP program; the v1 test consumes through
+  `hipMemcpy`). G5: hot-unplug with GPU MRs registered (needs someone at the
+  machines). G3 remainder: small and unaligned operations on GPU MRs, which use
+  the staged path through the CPU mapping.

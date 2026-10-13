@@ -22,7 +22,8 @@ implemented in software over its DMA rings. This implementation is a real Linux
 `ib_device`/uverbs device plus ordinary rdma-core provider, **not** a verbs-lookalike
 API or library interposer. The first path is **CPU-copy staging**: pinned CPU MR
 pages -> coherent NHI staging -> cable -> staging -> pinned CPU MR pages. There
-is no IP/TCP payload fallback, and no GPU-direct or DMA-BUF registration. Zero
+is no IP/TCP payload fallback. GPU memory (`hipMalloc`) can be registered as a
+DMA-BUF MR since 2026-10-12 (`GPU_DIRECT_VERBS.md`). Zero
 copy is not a property of *this* first path — it is a separate,
 capability-negotiated data plane (`SN_CAP_ZDATA`) that carries large SEND and
 WRITE payloads directly between MR pages; see
@@ -41,10 +42,10 @@ and [provider interface/build](../providers/strix_nhi/README.md).
 | Port | one; ACTIVE only with same-XDomain thunderbolt-net carrier and reciprocal native readiness; Ethernet metadata, zero protocol capability bits, unknown speed/width |
 | Addressing | native nonzero GID0, cached type IB by core classification, **not RoCEv2/IB packet interoperability**; port1/PKey0 |
 | Objects | one context/PD/RC QP, SQ4/RQ4, exactly one SGE per WR; two CQs up to64 each |
-| CPU memory | four MRs, each <=8MiB, page-rounded aggregate32MiB plus normal memlock; fresh nonreused keys |
+| Memory | four MRs, each <=8MiB, page-rounded aggregate32MiB plus normal memlock; fresh nonreused keys; CPU pages (`ibv_reg_mr`) or GPU memory as a pinned DMA-BUF (`ibv_reg_dmabuf_mr`, page-aligned offset and iova) |
 | Operations | SEND/RECV, bounded software WRITE/READ <=2MiB; one real requester/responder READ resource; signaled/unsignaled and serialized FENCE |
 | Setup | MTU4096 only, 24-bit PSNs, global exact peer GID, SGID0/hop64; timeout14, min_rnr_timer12, retry/rnr_retry0..6, read depths0..1 |
-| Unsupported | GPU/DMA-BUF/ODP/relaxed ordering, inline/solicited send, IMM/invalidation, atomics, SRQ/MW, other QP types, CM/MAD, alternate routes, infinite retries, other MTUs/timer policies |
+| Unsupported | ODP, revocable DMA-BUF, relaxed ordering, inline/solicited send, IMM/invalidation, atomics, SRQ/MW, other QP types, CM/MAD, alternate routes, infinite retries, other MTUs/timer policies |
 
 Unsupported operations are rejected; they are not reported as successes. Local
 NHI TX completion returns only staging ownership. Successful verbs SEND/WRITE

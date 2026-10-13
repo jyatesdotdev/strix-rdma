@@ -1,6 +1,34 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — GPU-direct v1: GPU memory as verbs MRs, GPU-to-GPU byte-for-byte
+- **What:** `ibv_reg_dmabuf_mr` on `hipMalloc` memory now works.
+  - **Kernel:** `reg_user_mr_dmabuf` imports through
+    `ib_umem_dmabuf_get_pinned_with_dma_device`, attached to the NHI (this IB
+    device has no DMA device of its own). The data path uses the exporter's
+    mapping as is, with no re-map and no sync. A `dma_buf_vmap` gives the
+    staged paths CPU access.
+  - **Provider:** `reg_dmabuf_mr` forwards to `ibv_cmd_reg_dmabuf_mr`.
+  - **Smoke tool:** `--gpu` mode, with HIP `dlopen`ed.
+  - Design in `docs/GPU_DIRECT_VERBS.md`.
+- **Validated:**
+  - GPU-to-GPU `write`/`read`/`send 2000` byte-for-byte.
+  - Forced READ fallbacks through GPU memory: 18 fallbacks, all byte-for-byte.
+  - Three NHI attachments per host while live, zero after about 30 runs (no
+    leaks).
+  - `kill -9` mid-transfer releases cleanly.
+  - Offline: object tests ok 5/6 with mutation checks, and the provider test
+    on the hosts' rdma-core 58.
+- **Throughput:** transfer-only is now printed by every verified mode. GPU
+  memory WRITE median is 1,289 MiB/s per direction against 1,008 for CPU
+  memory (5 runs each, non-overlapping ranges); SEND is 1,183 against 1,052
+  (overlapping).
+- **Finding:** earlier verified-mode wall rates (410–490 MiB/s) were bound by
+  the test tool's own pattern work. The link moves about 1.0–1.3 GB/s per
+  direction.
+- **Open:** G4 (GPU-kernel stale-cache gate), hot-unplug with GPU MRs, and
+  small/unaligned operations on GPU MRs. All are in `TODO.md`.
+
 ## 2026-10-12 — first hot-unplug test: two pulls, both recovered automatically
 - **Idle pull:** both hosts removed the verbs device cleanly. Replugging,
   the XDomain was found again and the driver re-probed and reached ACTIVE about

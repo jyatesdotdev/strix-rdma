@@ -13,6 +13,7 @@
 #   PORT=19476           TCP rendezvous port; must be open in LISTEN's firewall
 #   DEV=strix_nhi0       native verbs device on both hosts
 #   TOOL_DIR=~/strix-rdma/tools/verbs   built strix-verbs-smoke on both hosts
+#   SMOKE_FLAGS=--gpu    flags placed before --live (e.g. GPU-memory buffers)
 #
 # Prints the connector's tail, then the listener's log, and exits with the
 # connector's status. The listener log stays on LISTEN at $LISTEN_LOG.
@@ -31,8 +32,8 @@ SSH=(ssh -o BatchMode=yes)
 smoke() { # host role
     local user
     user=$("${SSH[@]}" "$1" id -un)
-    printf "sudo sh -c 'ulimit -l unlimited; exec sudo -u %s sh -c \"cd %s && exec ./strix-verbs-smoke --live %s %s %s %s %s\"'" \
-        "$user" "$TOOL_DIR" "$DEV" "$2" "$LISTEN_IP" "$PORT" "$MODE"
+    printf "sudo sh -c 'ulimit -l unlimited; exec sudo -u %s sh -c \"cd %s && exec ./strix-verbs-smoke %s --live %s %s %s %s %s\"'" \
+        "$user" "$TOOL_DIR" "${SMOKE_FLAGS:-}" "$DEV" "$2" "$LISTEN_IP" "$PORT" "$MODE"
 }
 
 listen_cmd=$(smoke "$LISTEN" listen)
