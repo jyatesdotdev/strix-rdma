@@ -458,7 +458,7 @@ static ssize_t native_stats_show(struct device *dev, struct device_attribute *at
 	ssize_t n;
 
 	mutex_lock(&d->lock);
-	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\nzc_send_ops %llu\nzc_send_fault_injected %llu\nzc_desc_dup %llu\nzc_ack_probe %llu\nmax_pass_gap_us %llu\nack_dropped %llu\n",
+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\nzc_send_ops %llu\nzc_send_fault_injected %llu\nzc_desc_dup %llu\nzc_ack_probe %llu\nmax_pass_gap_us %llu\nack_dropped %llu\nzc_send_refused %llu\nzc_send_fallback %llu\n",
 		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_retries, d->zc_aborts,
 		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
@@ -471,7 +471,7 @@ static ssize_t native_stats_show(struct device *dev, struct device_attribute *at
 		d->zc_read_ops, d->zc_read_fault_injected,
 		d->zc_send_ops, d->zc_send_fault_injected, d->zc_desc_dup,
 		d->zc_ack_probe, div_u64(d->max_pass_gap_ns, NSEC_PER_USEC),
-		d->ack_dropped);
+		d->ack_dropped, d->zc_send_refused, d->zc_send_fallback);
 	n += sysfs_emit_at(buf, n,
 		"zdata %d\ndata_tx_head %u\ndata_tx_tail %u\ndata_rx_head %u\n"
 		"data_rx_tail %u\nzdata_posted %u\n",

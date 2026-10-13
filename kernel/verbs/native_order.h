@@ -20,11 +20,16 @@ static inline int sn_same_operation(const struct sn_header *a,
 {
 	/* SN_ZC_READ and SN_READ are one operation class: a timed-out zero-copy READ
 	 * is retransmitted as a staged SN_READ under the same sequence, and the two
-	 * must replay as the same operation. Every other opcode compares exactly. */
+	 * must replay as the same operation. SN_ZC_SEND and SN_SEND likewise: a
+	 * zero-copy SEND the receiver refused (SN_STAGED) is resent staged, and a
+	 * late duplicate of its descriptor must replay. Every other opcode compares
+	 * exactly. */
 	int read_class = (a->opcode == SN_READ || a->opcode == SN_ZC_READ) &&
 			 (b->opcode == SN_READ || b->opcode == SN_ZC_READ);
+	int send_class = (a->opcode == SN_SEND || a->opcode == SN_ZC_SEND) &&
+			 (b->opcode == SN_SEND || b->opcode == SN_ZC_SEND);
 
-	return (a->opcode == b->opcode || read_class) && a->sequence == b->sequence &&
+	return (a->opcode == b->opcode || read_class || send_class) && a->sequence == b->sequence &&
 	       a->total == b->total && a->address == b->address && a->rkey == b->rkey;
 }
 /* Binding and wire validation MUST precede this operation-level check. */

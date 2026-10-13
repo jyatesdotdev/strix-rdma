@@ -124,7 +124,8 @@ static void test_opcodes(void)
 	h.address = ~(sn_u64)0; h.total = 1; assert(!sn_header_valid(&h));
 	h = header(); h.opcode = SN_CREDIT; h.total = 5; assert(!sn_header_valid(&h));
 	h = header(); h.opcode = SN_ACK; h.sequence = 0;
-	h.status = SN_PROTOCOL + 1; assert(!sn_header_valid(&h));
+	h.status = SN_STAGED; assert(sn_header_valid(&h));
+	h.status = SN_STAGED + 1; assert(!sn_header_valid(&h));
 	h = header(); h.rkey = 1; assert(!sn_header_valid(&h));
 	h = header(); h.total = 1; assert(!sn_header_valid(&h));
 	puts("ok 6 - all opcodes roundtrip with canonical operation-specific fields");

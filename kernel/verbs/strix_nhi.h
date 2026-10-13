@@ -136,6 +136,8 @@ struct sn_qp {
 	/* The staged reply of a fallen-back zero-copy READ is assembled and waits for
 	 * the abandoned burst to finish landing before the READ completes. */
 	bool zc_read_reply_ready;
+	/* This SEND was refused for zero-copy (SN_STAGED) and is resent staged. */
+	bool send_staged;
 	/* zc_send_fault selection for this SEND/WRITE (SN_FAULT_*), and a ZC_READY
 	 * held back to be applied right after the descriptor retransmit. */
 	u8 zc_send_fault;
@@ -245,6 +247,9 @@ struct sn_device {
 	u64 zc_ack_probe;
 	/* ACK/READ_ACKs sent (counted only while ack_drop is set) and dropped. */
 	u64 ack_seen, ack_dropped;
+	/* Zero-copy SENDs refused for an unaligned receive (receiver), and SENDs
+	 * resent staged after such a refusal (sender). */
+	u64 zc_send_refused, zc_send_fallback;
 	struct sn_stall_snap snap_drain, snap_err, snap_tmo;
 	/* Poller timing for stall diagnosis: when a data frame was last harvested,
 	 * when the last pass started and whether it left work outstanding, and the

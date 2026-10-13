@@ -199,7 +199,7 @@ void sn_engine_reset(struct sn_qp *q)
 	q->zc_read_armed = false; q->zc_held = false;
 	q->zc_read_staged = false; q->response_fallback = false;
 	q->zc_read_reply_ready = false;
-	q->zc_send_fault = 0; q->zc_ready_held = false;
+	q->zc_send_fault = 0; q->zc_ready_held = false; q->send_staged = false;
 	memset(&q->receive, 0, sizeof(q->receive));
 	memset(&q->read_receive, 0, sizeof(q->read_receive));
 	/* Reclaim the data rings so this aborted burst cannot leave posted RX
@@ -250,6 +250,24 @@ static void sn_response_release(struct sn_qp *q)
 		q->remote_mr = NULL;
 	}
 }
+/* The receiver refused this zero-copy SEND (SN_STAGED): its receive buffer is not
+ * frame aligned. Resend the same operation, same sequence, on the staged path.
+ * Only a SEND still waiting for ZC_READY can be redirected -- nothing has been
+ * burst -- so a repeated or late refusal is ignored. */
+static void sn_zc_send_fallback(struct sn_qp *q)
+{
+	struct sn_wqe *w = &q->sq[q->sq_head];
+
+	if (w->opcode != SN_SEND || q->send_staged || q->zc_state != SN_ZC_WAIT)
+		return;
+	if (sn_mr_copy(w->mr, w->address, q->outgoing, w->length, false)) {
+		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
+	}
+	q->send_staged = true;
+	sn_dev(q->ib.device)->zc_send_fallback++;
+	q->zc_state = SN_ZC_NONE;
+	q->outgoing_sent = false; q->outgoing_offset = 0;
+}
 static void sn_receive_ack(struct sn_qp *q, const struct sn_header *h)
 {
 	if (h->opcode == SN_READ_ACK) {
@@ -269,6 +287,8 @@ static void sn_receive_ack(struct sn_qp *q, const struct sn_header *h)
 		q->rnr_wait = true;
 		q->outgoing_sent = true;
 		q->deadline = ktime_get_ns() + sn_rnr_timeout_ns(q->attr.min_rnr_timer);
+	} else if (h->status == SN_STAGED) {
+		sn_zc_send_fallback(q);
 	} else if (h->status != SN_OK) {
 		sn_qp_error(q, h->status == SN_ACCESS ? IB_WC_REM_ACCESS_ERR : IB_WC_REM_INV_REQ_ERR);
 	} else if (q->sq[q->sq_head].opcode != SN_READ) {
@@ -532,7 +552,17 @@ static void sn_receive_zc(struct sn_qp *q, const struct sn_header *h)
 	} else {
 		if (!q->rq_count) { d->rnr_sent++; sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
 		w = &q->rq[q->rq_head];
-		if (h->total > w->length || (w->address & (SN_FRAME - 1))) {
+		if (w->address & (SN_FRAME - 1) && h->total <= w->length) {
+			/* Legal in verbs, but header-less frames cannot land in a receive
+			 * buffer that is not frame aligned, and only the receiver knows
+			 * where its buffer is. Ask the sender to resend this operation on
+			 * the staged path; nothing is committed and the receive stays
+			 * posted for it. A repeated descriptor is refused again. */
+			d->zc_send_refused++;
+			sn_ack(q, SN_ACK, h->sequence, SN_STAGED);
+			return;
+		}
+		if (h->total > w->length) {
 			sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
 			sn_mr_put(w->mr); w->mr = NULL;
 			q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
@@ -939,7 +969,7 @@ void sn_engine_progress(struct sn_device *d)
 		}
 		q->active = true; q->outgoing_sent = false;
 		q->outgoing_offset = q->retries = q->rnr_retries = 0;
-		q->zc_send_fault = 0; q->zc_ready_held = false;
+		q->zc_send_fault = 0; q->zc_ready_held = false; q->send_staged = false;
 		if (w->opcode != SN_READ && sn_zc_eligible(d, w)) {
 			/* One read: the parameter is writable at runtime. */
 			unsigned int every = READ_ONCE(sn_zc_send_fault);
@@ -1032,7 +1062,8 @@ void sn_engine_progress(struct sn_device *d)
 	h = sn_out_header(q, w->opcode);
 	h.sequence = q->next_sequence; h.total = w->length;
 	h.address = w->remote_address; h.rkey = w->rkey;
-	if (sn_zc_eligible(d, w) && !(w->opcode == SN_READ && q->zc_read_staged)) {
+	if (sn_zc_eligible(d, w) && !(w->opcode == SN_READ && q->zc_read_staged) &&
+	    !(w->opcode == SN_SEND && q->send_staged)) {
 		switch (q->zc_state) {
 		case SN_ZC_NONE:
 			if (w->opcode == SN_READ) {

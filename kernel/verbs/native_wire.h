@@ -53,7 +53,10 @@ enum sn_opcode {
 #define SN_ZC_THRESHOLD	65536
 enum sn_status {
 	SN_OK = 0, SN_RNR = 1, SN_ACCESS = 2, SN_LENGTH = 3,
-	SN_PROTOCOL = 4
+	SN_PROTOCOL = 4,
+	/* The receive matched by a zero-copy SEND cannot take header-less frames
+	 * (not frame aligned); resend the same operation on the staged path. */
+	SN_STAGED = 5
 };
 struct sn_header {
 	sn_u32 opcode, total, src_qpn, dst_qpn;
@@ -161,7 +164,7 @@ static inline int sn_header_valid(const struct sn_header *h)
 		       !h->address && !h->rkey && !h->sequence && !h->status;
 	case SN_ACK:
 		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
-		       !h->address && !h->rkey && !h->sequence && h->status <= SN_PROTOCOL;
+		       !h->address && !h->rkey && !h->sequence && h->status <= SN_STAGED;
 	case SN_READ_ACK:
 		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
 		       !h->address && !h->rkey && !h->sequence && !h->status;

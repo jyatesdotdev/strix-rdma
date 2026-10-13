@@ -396,7 +396,7 @@ CRC32C Castagnoli uses initial/final complement and treats bytes96..99 as zero,
 covering the complete header and payload. It detects corruption, not an
 unauthorized peer. Opcodes: SEND1, WRITE2, READ3, READ_REPLY4, ACK5, READ_ACK6,
 CREDIT7, HELLO8, HELLO_ACK9, BIND10, BIND_ACK11, ZC_SEND12, ZC_READY13,
-ZC_WRITE14, ZC_READ15. Status: OK0, RNR1, ACCESS2, LENGTH3, PROTOCOL4. Unused fields must be zero.
+ZC_WRITE14, ZC_READ15. Status: OK0, RNR1, ACCESS2, LENGTH3, PROTOCOL4, STAGED5. Unused fields must be zero.
 CREDIT total is available application RQ WQEs, serial its revision; it is only a
 hint. Actual SEND admission checks RQ ownership and returns RNR without consuming
 an absent WQE. Preposted transport RX slots are never application credits.
@@ -412,6 +412,12 @@ responder places the payload in the requester's named MR. A `ZC_WRITE` therefore
 consumes no receive WQE, produces no receive CQE and can never be RNR; a WRITE
 whose length is at or below the zero-copy threshold, or whose local source or
 remote destination is not frame aligned, stays on the staged path instead.
+Only the receiver knows where a SEND will land. If a `ZC_SEND` matches a receive
+buffer that is not frame aligned, the receiver answers `ACK` with status
+`STAGED`. It consumes nothing, and the sender resends the same operation (same
+serial) on the staged path. `SEND` and `ZC_SEND` replay as one operation, so a
+late duplicate descriptor is harmless. Before 2026-10-12 this case failed both
+QPs.
 `ZC_READ` names the responder's source MR. The requester arms its own MR as the
 landing zone before sending it, so it needs no `ZC_READY`, and the responder
 bursts the reply from the source MR, retaining it until `READ_ACK`. The same

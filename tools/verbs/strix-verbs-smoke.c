@@ -47,6 +47,12 @@ static bool gpu;
  * zero-copy path with a partial last frame. The rest of every landing slot must
  * stay zero, so an overrun is caught too. */
 static unsigned xfer_len = CHUNK, xfer_off;
+/* --recv-off N (send mode): post the receive buffers N bytes into their slots
+ * while the sends keep --off, so a frame-aligned (zero-copy) sender can meet an
+ * unaligned receive buffer -- legal in verbs, and common (malloc returns large
+ * buffers 16 bytes past a page). Defaults to --off. */
+static unsigned recv_off;
+static bool recv_off_set;
 static struct {
 	int (*set_device)(int);
 	int (*malloc)(void **, size_t);
@@ -448,29 +454,33 @@ static void selftest(void)
  * iteration and slot, and every byte outside it is still zero (no overrun). On
  * a whole-slot transfer the existing classifier explains a mismatch. */
 static bool slot_verified(const unsigned char *landed, uint64_t nonce, uint64_t own_nonce,
-			  unsigned it, unsigned slot)
+			  unsigned it, unsigned slot, unsigned off)
 {
 	const unsigned char *b = landed + (size_t)slot * CHUNK;
 	unsigned j;
 
 	for (j = 0; j < xfer_len; j++)
-		if (b[xfer_off + j] != pattern(nonce, it, slot, j))
+		if (b[off + j] != pattern(nonce, it, slot, j))
 			break;
 	if (j < xfer_len) {
-		if (!xfer_off && xfer_len == CHUNK)
+		if (!off && xfer_len == CHUNK)
 			report_mismatch(landed, nonce, own_nonce, it, slot, CHUNK, WINDOW);
 		else
 			fprintf(stderr, "MISMATCH iter %u slot %u: first bad byte %u of %u (offset %u): got 0x%02x want 0x%02x\n",
-				it, slot, j, xfer_len, xfer_off, b[xfer_off + j], pattern(nonce, it, slot, j));
+				it, slot, j, xfer_len, off, b[off + j], pattern(nonce, it, slot, j));
 		return false;
 	}
-	for (j = 0; j < CHUNK; j++)
-		if ((j < xfer_off || j >= xfer_off + xfer_len) && b[j]) {
-			fprintf(stderr, "MISMATCH iter %u slot %u: overrun, byte %u outside [%u, %u) is 0x%02x\n",
-				it, slot, j, xfer_off, xfer_off + xfer_len, b[j]);
-			return false;
-		}
+	/* Only the bytes outside the transfer range: a full-slot transfer has none,
+	 * so the default geometry costs nothing extra here. */
+	for (j = 0; j < off; j++)
+		if (b[j]) goto overrun;
+	for (j = off + xfer_len; j < CHUNK; j++)
+		if (b[j]) goto overrun;
 	return true;
+overrun:
+	fprintf(stderr, "MISMATCH iter %u slot %u: overrun, byte %u outside [%u, %u) is 0x%02x\n",
+		it, slot, j, off, off + xfer_len, b[j]);
+	return false;
 }
 int main(int argc, char **argv)
 {
@@ -496,6 +506,11 @@ int main(int argc, char **argv)
 		} else if (argc >= 3 && !strcmp(argv[1], "--gpu-kernels")) {
 			gpu = true; gpu_kernels = argv[2];
 			argv[2] = argv[0]; argv += 2; argc -= 2;
+		} else if (argc >= 3 && !strcmp(argv[1], "--recv-off")) {
+			char *end = NULL; unsigned long v = strtoul(argv[2], &end, 10);
+			require(end && !*end && v < CHUNK, "--recv-off 0..2097151");
+			recv_off = (unsigned)v; recv_off_set = true;
+			argv[2] = argv[0]; argv += 2; argc -= 2;
 		} else if (argc >= 3 && !strcmp(argv[1], "--len")) {
 			xfer_len = iterations(argv[2], CHUNK, "--len 1..2097152");
 			argv[2] = argv[0]; argv += 2; argc -= 2;
@@ -506,7 +521,9 @@ int main(int argc, char **argv)
 			argv[2] = argv[0]; argv += 2; argc -= 2;
 		} else break;
 	}
-	require(xfer_off + (unsigned long)xfer_len <= CHUNK, "--off + --len must fit one 2 MiB slot");
+	if (!recv_off_set) recv_off = xfer_off;
+	require(xfer_off + (unsigned long)xfer_len <= CHUNK && recv_off + (unsigned long)xfer_len <= CHUNK,
+		"--off/--recv-off + --len must fit one 2 MiB slot");
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
 		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] --live ... send|write|read iters\n", argv[0], argv[0], argv[0]);
@@ -669,7 +686,7 @@ int main(int argc, char **argv)
 				if (!gpu_kernels)
 					for (unsigned j = 0; j < xfer_len; j++) htx[i*CHUNK+xfer_off+j] = pattern(local.nonce, it, i, j);
 				if (!gpu) memset(rx+i*CHUNK, 0, CHUNK);
-				rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx+i*CHUNK+xfer_off), .length = xfer_len, .lkey = rx_mr->lkey };
+				rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx+i*CHUNK+recv_off), .length = xfer_len, .lkey = rx_mr->lkey };
 				rw[i] = (struct ibv_recv_wr){ .wr_id = it*16u+i, .sg_list = &rs[i], .num_sge = 1,
 					.next = i+1 < WINDOW ? &rw[i+1] : NULL };
 				ss[i] = (struct ibv_sge){ .addr = (uintptr_t)(tx+i*CHUNK+xfer_off), .length = xfer_len, .lkey = tx_mr->lkey };
@@ -717,7 +734,7 @@ int main(int argc, char **argv)
 				unsigned bad_slots = 0;
 
 				for (unsigned i = 0; i < WINDOW; i++) {
-					if (!slot_verified(hrx, peer.nonce, local.nonce, it, i))
+					if (!slot_verified(hrx, peer.nonce, local.nonce, it, i, recv_off))
 						bad_slots++;
 				}
 				if (bad_slots)
@@ -813,7 +830,7 @@ int main(int argc, char **argv)
 				unsigned bad_slots = 0;
 
 				for (unsigned i = 0; i < WINDOW; i++) {
-					if (!slot_verified(hlanded, peer.nonce, local.nonce, it, i))
+					if (!slot_verified(hlanded, peer.nonce, local.nonce, it, i, xfer_off))
 						bad_slots++;
 				}
 				if (bad_slots)

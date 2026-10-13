@@ -63,6 +63,7 @@ struct sn_qp {
 	u64 zc_address;
 	bool zc_read_armed, zc_held, zc_read_staged, response_fallback, zc_read_fault;
 	bool zc_read_reply_ready;
+	bool send_staged;
 	u8 zc_send_fault;
 	bool zc_ready_held;
 	struct sn_header zc_held_header;
@@ -90,6 +91,7 @@ struct sn_device {
 	u64 zc_read_ops, zc_read_fault_injected;
 	u64 zc_send_ops, zc_send_fault_injected, zc_desc_dup, zc_ack_probe;
 	u64 ack_seen, ack_dropped;
+	u64 zc_send_refused, zc_send_fallback;
 	/* Set when this side's queued burst was stranded by the peer stopping and
 	 * restarting its data RX ring underneath it. Observed on hardware: the ring
 	 * then never drains and its frames never land, for the rest of the boot. */
@@ -1563,9 +1565,64 @@ static void test_ack_drop(void)
 	release(a); release(b);
 	puts("ok 36 - ack_drop: every lost ACK/READ_ACK is recovered, every operation completes once");
 }
+/* A zero-copy SEND matched to a receive buffer that is not frame aligned --
+ * legal in verbs, and what malloc returns for large buffers. Header-less frames
+ * cannot land there, so the receiver asks for the staged path (ACK status
+ * SN_STAGED) without consuming the receive, and the sender resends the same
+ * operation staged. Also: the refusal ACK lost (the descriptor is refused again),
+ * and a late duplicate zero-copy descriptor after the staged SEND committed
+ * (replays as the same operation instead of failing the QP). */
+static void post_receive_at(struct sn_device *d, u64 address, u32 length)
+{
+	struct sn_qp *q = d->qp;
+	struct sn_wqe *w = &q->rq[(q->rq_head + q->rq_count++) % SN_QUEUE_DEPTH];
+
+	*w = (struct sn_wqe){ .mr = &d->mr[1], .id = 100 + q->rq_count, .address = address,
+			      .length = length };
+	w->mr->users++;
+}
+static void test_zc_send_unaligned_receive(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	int drop_ack = SN_ACK;
+	struct sn_header desc;
+	const struct packet *p;
+	unsigned int i;
+
+	memset(a->mr[0].data, 0x6d, SN_MESSAGE);
+	post_receive_at(b, b->mr[1].base + 16, SN_MESSAGE);
+	post(a, SN_SEND, SN_MESSAGE);
+	sn_engine_progress(a);
+	p = &a->packets[(a->head + a->count - 1) % SN_RING_SIZE];
+	assert(!sn_decode(&desc, p->data, p->bytes) && desc.opcode == SN_ZC_SEND);
+	for (i = 0; i < 2000 && !a->sends && !a->errors; i++) step(a, b, NULL, NULL);
+	assert(a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data + 16, SN_MESSAGE));
+	assert(!a->zc_tx_bursts && b->zc_send_refused == 1 && a->zc_send_fallback == 1);
+	/* The late duplicate descriptor replays; nothing fails. */
+	inject_header(b, &desc);
+	for (i = 0; i < 5; i++) step(a, b, NULL, NULL);
+	assert(!a->errors && !b->errors && b->recvs == 1);
+	/* An aligned receive still takes the zero-copy path afterwards. */
+	zc_op(a, b, SN_SEND, 0x7e, 2);
+	assert(a->zc_tx_bursts == 1);
+	release(a); release(b);
+
+	/* The refusal is lost: the descriptor is retransmitted and refused again. */
+	a = zc_pair(&b);
+	memset(a->mr[0].data, 0x3a, SN_MESSAGE);
+	post_receive_at(b, b->mr[1].base + 16, SN_MESSAGE);
+	post(a, SN_SEND, SN_MESSAGE);
+	for (i = 0; i < 2000 && !a->sends && !a->errors; i++) step(a, b, NULL, &drop_ack);
+	assert(!drop_ack && a->sends == 1 && b->recvs == 1 && !a->errors && !b->errors);
+	assert(!memcmp(a->mr[0].data, b->mr[1].data + 16, SN_MESSAGE));
+	assert(b->zc_send_refused == 2 && a->zc_send_fallback == 1 && !a->zc_tx_bursts);
+	release(a); release(b);
+	puts("ok 37 - zero-copy SEND into an unaligned receive buffer falls back to staged; lost refusal and late duplicate are safe");
+}
 int main(void)
 {
-	puts("1..36");
+	puts("1..37");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1589,6 +1646,7 @@ int main(void)
 	test_zc_late_ready_mid_burst();
 	test_zc_send_fault_injection();
 	test_ack_drop();
+	test_zc_send_unaligned_receive();
 	assert(!warnings);
 	return 0;
 }

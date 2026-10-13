@@ -54,7 +54,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/native_wire.h b/drivers/infiniband/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/native_wire.h
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,289 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_NATIVE_WIRE_H
 +#define STRIX_NHI_NATIVE_WIRE_H
@@ -110,7 +110,10 @@ new file mode 100644
 +#define SN_ZC_THRESHOLD	65536
 +enum sn_status {
 +	SN_OK = 0, SN_RNR = 1, SN_ACCESS = 2, SN_LENGTH = 3,
-+	SN_PROTOCOL = 4
++	SN_PROTOCOL = 4,
++	/* The receive matched by a zero-copy SEND cannot take header-less frames
++	 * (not frame aligned); resend the same operation on the staged path. */
++	SN_STAGED = 5
 +};
 +struct sn_header {
 +	sn_u32 opcode, total, src_qpn, dst_qpn;
@@ -218,7 +221,7 @@ new file mode 100644
 +		       !h->address && !h->rkey && !h->sequence && !h->status;
 +	case SN_ACK:
 +		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
-+		       !h->address && !h->rkey && !h->sequence && h->status <= SN_PROTOCOL;
++		       !h->address && !h->rkey && !h->sequence && h->status <= SN_STAGED;
 +	case SN_READ_ACK:
 +		return sn_qp_fields_valid(h) && !h->total && !h->length && !h->offset &&
 +		       !h->address && !h->rkey && !h->sequence && !h->status;
@@ -345,7 +348,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/native_order.h b/drivers/infiniband
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/native_order.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,96 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_NATIVE_ORDER_H
 +#define STRIX_NHI_NATIVE_ORDER_H
@@ -368,11 +371,16 @@ new file mode 100644
 +{
 +	/* SN_ZC_READ and SN_READ are one operation class: a timed-out zero-copy READ
 +	 * is retransmitted as a staged SN_READ under the same sequence, and the two
-+	 * must replay as the same operation. Every other opcode compares exactly. */
++	 * must replay as the same operation. SN_ZC_SEND and SN_SEND likewise: a
++	 * zero-copy SEND the receiver refused (SN_STAGED) is resent staged, and a
++	 * late duplicate of its descriptor must replay. Every other opcode compares
++	 * exactly. */
 +	int read_class = (a->opcode == SN_READ || a->opcode == SN_ZC_READ) &&
 +			 (b->opcode == SN_READ || b->opcode == SN_ZC_READ);
++	int send_class = (a->opcode == SN_SEND || a->opcode == SN_ZC_SEND) &&
++			 (b->opcode == SN_SEND || b->opcode == SN_ZC_SEND);
 +
-+	return (a->opcode == b->opcode || read_class) && a->sequence == b->sequence &&
++	return (a->opcode == b->opcode || read_class || send_class) && a->sequence == b->sequence &&
 +	       a->total == b->total && a->address == b->address && a->rkey == b->rkey;
 +}
 +/* Binding and wire validation MUST precede this operation-level check. */
@@ -459,7 +467,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/strix_nhi.h b/drivers/infiniband/hw
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/strix_nhi.h
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,348 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_H
 +#define STRIX_NHI_H
@@ -598,6 +606,8 @@ new file mode 100644
 +	/* The staged reply of a fallen-back zero-copy READ is assembled and waits for
 +	 * the abandoned burst to finish landing before the READ completes. */
 +	bool zc_read_reply_ready;
++	/* This SEND was refused for zero-copy (SN_STAGED) and is resent staged. */
++	bool send_staged;
 +	/* zc_send_fault selection for this SEND/WRITE (SN_FAULT_*), and a ZC_READY
 +	 * held back to be applied right after the descriptor retransmit. */
 +	u8 zc_send_fault;
@@ -707,6 +717,9 @@ new file mode 100644
 +	u64 zc_ack_probe;
 +	/* ACK/READ_ACKs sent (counted only while ack_drop is set) and dropped. */
 +	u64 ack_seen, ack_dropped;
++	/* Zero-copy SENDs refused for an unaligned receive (receiver), and SENDs
++	 * resent staged after such a refusal (sender). */
++	u64 zc_send_refused, zc_send_fallback;
 +	struct sn_stall_snap snap_drain, snap_err, snap_tmo;
 +	/* Poller timing for stall diagnosis: when a data frame was last harvested,
 +	 * when the last pass started and whether it left work outstanding, and the
@@ -2440,7 +2453,7 @@ new file mode 100644
 +	ssize_t n;
 +
 +	mutex_lock(&d->lock);
-+	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\nzc_send_ops %llu\nzc_send_fault_injected %llu\nzc_desc_dup %llu\nzc_ack_probe %llu\nmax_pass_gap_us %llu\nack_dropped %llu\n",
++	n = sysfs_emit(buf, "tx_frames %llu\nrx_frames %llu\nbad_frames %llu\nplaced_send_bytes %llu\nplaced_write_bytes %llu\nplaced_read_bytes %llu\nzc_bursts %llu\nzc_retries %llu\nzc_aborts %llu\npoll_passes %llu\npoll_sleeps %llu\npoll_wake_kick %llu\npoll_wake_tick %llu\nsched_calls %llu\nrnr_sent %llu\nzc_read_retx %llu\nzc_read_dup_inflight %llu\nzc_read_rearm %llu\nzc_seq_ahead %llu\nzc_seq_stale %llu\nzc_read_dup_posting %llu\nzc_read_dup_undrained %llu\nzc_read_fallback %llu\nzc_read_fallback_served %llu\nzc_fb_wait_midpost %llu\nzc_fb_wait_drain %llu\nzc_fb_reserve %llu\nzc_read_req_drop %llu\nzc_resp_retry_exc %llu\nzc_resp_start_exc %llu\nzc_read_ops %llu\nzc_read_fault_injected %llu\nzc_send_ops %llu\nzc_send_fault_injected %llu\nzc_desc_dup %llu\nzc_ack_probe %llu\nmax_pass_gap_us %llu\nack_dropped %llu\nzc_send_refused %llu\nzc_send_fallback %llu\n",
 +		d->tx_frames, d->rx_frames, d->bad_frames, d->send_bytes,
 +		d->write_bytes, d->read_bytes, d->zc_bursts, d->zc_retries, d->zc_aborts,
 +		d->poll_passes, d->poll_sleeps, d->poll_wake_kick, d->poll_wake_tick,
@@ -2453,7 +2466,7 @@ new file mode 100644
 +		d->zc_read_ops, d->zc_read_fault_injected,
 +		d->zc_send_ops, d->zc_send_fault_injected, d->zc_desc_dup,
 +		d->zc_ack_probe, div_u64(d->max_pass_gap_ns, NSEC_PER_USEC),
-+		d->ack_dropped);
++		d->ack_dropped, d->zc_send_refused, d->zc_send_fallback);
 +	n += sysfs_emit_at(buf, n,
 +		"zdata %d\ndata_tx_head %u\ndata_tx_tail %u\ndata_rx_head %u\n"
 +		"data_rx_tail %u\nzdata_posted %u\n",
@@ -2827,7 +2840,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/protocol.c b/drivers/infiniband/hw/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/protocol.c
-@@ -0,0 +1,1114 @@
+@@ -0,0 +1,1145 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "strix_nhi.h"
 +
@@ -3029,7 +3042,7 @@ new file mode 100644
 +	q->zc_read_armed = false; q->zc_held = false;
 +	q->zc_read_staged = false; q->response_fallback = false;
 +	q->zc_read_reply_ready = false;
-+	q->zc_send_fault = 0; q->zc_ready_held = false;
++	q->zc_send_fault = 0; q->zc_ready_held = false; q->send_staged = false;
 +	memset(&q->receive, 0, sizeof(q->receive));
 +	memset(&q->read_receive, 0, sizeof(q->read_receive));
 +	/* Reclaim the data rings so this aborted burst cannot leave posted RX
@@ -3080,6 +3093,24 @@ new file mode 100644
 +		q->remote_mr = NULL;
 +	}
 +}
++/* The receiver refused this zero-copy SEND (SN_STAGED): its receive buffer is not
++ * frame aligned. Resend the same operation, same sequence, on the staged path.
++ * Only a SEND still waiting for ZC_READY can be redirected -- nothing has been
++ * burst -- so a repeated or late refusal is ignored. */
++static void sn_zc_send_fallback(struct sn_qp *q)
++{
++	struct sn_wqe *w = &q->sq[q->sq_head];
++
++	if (w->opcode != SN_SEND || q->send_staged || q->zc_state != SN_ZC_WAIT)
++		return;
++	if (sn_mr_copy(w->mr, w->address, q->outgoing, w->length, false)) {
++		sn_qp_error(q, IB_WC_LOC_PROT_ERR); return;
++	}
++	q->send_staged = true;
++	sn_dev(q->ib.device)->zc_send_fallback++;
++	q->zc_state = SN_ZC_NONE;
++	q->outgoing_sent = false; q->outgoing_offset = 0;
++}
 +static void sn_receive_ack(struct sn_qp *q, const struct sn_header *h)
 +{
 +	if (h->opcode == SN_READ_ACK) {
@@ -3099,6 +3130,8 @@ new file mode 100644
 +		q->rnr_wait = true;
 +		q->outgoing_sent = true;
 +		q->deadline = ktime_get_ns() + sn_rnr_timeout_ns(q->attr.min_rnr_timer);
++	} else if (h->status == SN_STAGED) {
++		sn_zc_send_fallback(q);
 +	} else if (h->status != SN_OK) {
 +		sn_qp_error(q, h->status == SN_ACCESS ? IB_WC_REM_ACCESS_ERR : IB_WC_REM_INV_REQ_ERR);
 +	} else if (q->sq[q->sq_head].opcode != SN_READ) {
@@ -3362,7 +3395,17 @@ new file mode 100644
 +	} else {
 +		if (!q->rq_count) { d->rnr_sent++; sn_ack(q, SN_ACK, h->sequence, SN_RNR); return; }
 +		w = &q->rq[q->rq_head];
-+		if (h->total > w->length || (w->address & (SN_FRAME - 1))) {
++		if (w->address & (SN_FRAME - 1) && h->total <= w->length) {
++			/* Legal in verbs, but header-less frames cannot land in a receive
++			 * buffer that is not frame aligned, and only the receiver knows
++			 * where its buffer is. Ask the sender to resend this operation on
++			 * the staged path; nothing is committed and the receive stays
++			 * posted for it. A repeated descriptor is refused again. */
++			d->zc_send_refused++;
++			sn_ack(q, SN_ACK, h->sequence, SN_STAGED);
++			return;
++		}
++		if (h->total > w->length) {
 +			sn_complete(q, w, true, IB_WC_LOC_LEN_ERR, 0);
 +			sn_mr_put(w->mr); w->mr = NULL;
 +			q->rq_head = (q->rq_head + 1) % SN_QUEUE_DEPTH; q->rq_count--;
@@ -3769,7 +3812,7 @@ new file mode 100644
 +		}
 +		q->active = true; q->outgoing_sent = false;
 +		q->outgoing_offset = q->retries = q->rnr_retries = 0;
-+		q->zc_send_fault = 0; q->zc_ready_held = false;
++		q->zc_send_fault = 0; q->zc_ready_held = false; q->send_staged = false;
 +		if (w->opcode != SN_READ && sn_zc_eligible(d, w)) {
 +			/* One read: the parameter is writable at runtime. */
 +			unsigned int every = READ_ONCE(sn_zc_send_fault);
@@ -3862,7 +3905,8 @@ new file mode 100644
 +	h = sn_out_header(q, w->opcode);
 +	h.sequence = q->next_sequence; h.total = w->length;
 +	h.address = w->remote_address; h.rkey = w->rkey;
-+	if (sn_zc_eligible(d, w) && !(w->opcode == SN_READ && q->zc_read_staged)) {
++	if (sn_zc_eligible(d, w) && !(w->opcode == SN_READ && q->zc_read_staged) &&
++	    !(w->opcode == SN_SEND && q->send_staged)) {
 +		switch (q->zc_state) {
 +		case SN_ZC_NONE:
 +			if (w->opcode == SN_READ) {

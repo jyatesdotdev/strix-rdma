@@ -1,6 +1,23 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-12 — zero-copy SEND into an unaligned receive buffer no longer fails both QPs
+- **Bug:** a zero-copy SEND (aligned source, more than 64 KiB) matched to a
+  receive buffer that is not frame aligned failed both QPs. That is legal in
+  verbs and common, because `malloc` returns +16. Reproduced with the new
+  `--recv-off`: the first iteration failed with "remote invalid request".
+- **Fix:** the receiver answers with the new ACK status `STAGED` (5),
+  consuming nothing. The sender resends the same operation staged. `SEND` and
+  `ZC_SEND` replay as one class, so a late duplicate is harmless.
+- **Tests:** ok 37 failed first (37/37 isolated), and the identity mutation
+  is caught.
+- **Hardware:** +16 and +4097, on CPU and GPU memory, all byte-for-byte, with
+  400 refusals and 400 staged resends per side per run. Regressions pass and
+  throughput is unchanged.
+- **Tool:** the overrun check now scans only the bytes outside the range. It
+  had been costing default-geometry runs about 15% of their wall rate.
+- `docs/ZEROCOPY_VERBS.md`, round fifteen.
+
 ## 2026-10-12 — GPU-direct G3 and G4: staged paths through GPU memory; the release is required
 - **G3:** `strix-verbs-smoke --len/--off` sets per-slot transfer geometry.
   WRITE, READ and SEND on CPU and GPU memory, at 3,000 B (staged), 1 MiB at

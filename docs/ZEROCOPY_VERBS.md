@@ -1288,3 +1288,44 @@ The natural timeouts are round twelve's withheld last frame. This boot was a
 prone one for READ. WRITE is now visibly hit too: 5 ACK probes after drained
 timeouts, each recovered. `max_pass_gap_us` reached 14,967 and 28,829 over the
 boot.
+
+## Round fifteen (2026-10-12): zero-copy SEND into an unaligned receive buffer
+
+The sender alone decides that a SEND goes zero-copy: its own buffer must be
+frame aligned and larger than 64 KiB. The receiver, though, failed the
+operation with `LOC_LEN_ERR` if its *matched receive buffer* was not frame
+aligned, and that took both QPs down. Receive buffers can have any alignment
+in verbs, and the case is common: glibc `malloc` returns large buffers 16 bytes
+past a page boundary.
+
+**Reproduced** with the new `strix-verbs-smoke --recv-off N`, which posts the
+receive buffers N bytes into their slots while the sends stay aligned. A
+1 MiB SEND into a receive buffer at +16 failed on its first iteration, with
+"remote invalid request" on the sender and both QPs in error. The aligned
+control passed.
+
+**Fix.**
+- **Receiver:** answers a `ZC_SEND` that matches an unaligned (but large
+  enough) receive with `ACK` status `STAGED` (5, a new value). It commits
+  nothing and the receive stays posted.
+- **Sender:** if still waiting for `ZC_READY`, it copies the payload and resends
+  the same operation, under the same serial, on the staged path. A repeated or
+  late refusal is ignored.
+- **Identity:** `SEND` and `ZC_SEND` now replay as one operation class (as
+  `READ` and `ZC_READ` already did), so a late duplicate descriptor after the
+  staged SEND committed is re-acknowledged rather than failing the QP.
+- A message longer than the receive buffer still fails with `LOC_LEN_ERR`, as
+  verbs requires.
+
+**Offline.** ok 37 covers the plain case, a lost refusal (the descriptor is
+refused again) and a late duplicate after commit. It failed first. Mutating the
+new operation class away fails only its late-duplicate part. Isolated, the
+engine suite passes 37/37. The wire test (ok 6) checks that `STAGED` is valid
+and `STAGED + 1` is not.
+
+**Hardware.** Fresh boot. A 1 MiB SEND ×100 into a receive at +16 and at +4097,
+on CPU memory and on GPU memory: all PASS byte-for-byte. Each run makes 400
+refusals per side, each followed by exactly one staged resend, with no QP
+error. The default-geometry regressions (send, write and read 500, plus the SEND
+smoke) pass. Transfer-only throughput is unchanged (WRITE about 995, SEND about
+1,021 MiB/s).
