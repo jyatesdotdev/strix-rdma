@@ -1379,3 +1379,154 @@ should catch it: never sending the probe (ok 24, ok 38), not recording
 zero-copy completions (ok 38), and counting a version mismatch as corruption
 (ok 39). The wire tests cover the new opcode's field rules and the version
 check (ok 10, ok 11).
+
+**Hardware (2026-10-12), both hosts on version 2 unless stated.**
+
+- **The probe.** The probe only runs on an idle connection, so the smoke tool
+  gained `--linger-ms N`, which keeps the connection up and idle for N ms
+  after the last transfer. With `ack_drop=100` on both hosts,
+  `SMOKE_FLAGS="--linger-ms 500" verbs-streak.sh 1 1 read 25` (100 READs per
+  side) loses the READ_ACK for each side's last READ just before the idle.
+  The run passed byte-for-byte. Each host showed `ack_dropped` 1,
+  `zc_read_probe` 1 and `err_count` 0. Before the probe, that lost READ_ACK
+  failed the responder's QP once its retry budget ran out.
+- **A mixed pair.** Version 2 ran on max and the version-1 module on max2,
+  both freshly booted. The port stayed DOWN on both. max counted every frame
+  it received as `version_mismatch` (1016, with `bad_frames` 0) and logged
+  "peer speaks wire version 1, this build speaks 2; refusing the session".
+  max2, which cannot know about versions, counted all 1032 as `bad_frames`.
+  Both hosts were then returned to version 2.
+
+## Round seventeen (2026-10-12 to 2026-10-14): control-ring E2E A/B, and a reboot that hung
+
+### Control-ring E2E off: no effect on the stalls
+
+Round twelve's suspect for the withheld last frame was running two E2E ring
+pairs per host. `ctl_e2e` (bool, 0444, default 1, diagnostic) allocates the
+control ring pair without `RING_FLAG_E2E`, which leaves the data pair as each
+host's only E2E pair. The data rings always keep E2E.
+
+**Method.** `bench/scripts/verbs-e2e-ab.sh`, two boots per arm in the order A,
+B, A, B. Both hosts reboot for every arm, because the parameter is read-only
+and the module is never reloaded. Each boot runs six `read 2000`, two
+`write 2000`, two `send 2000` and the SEND smoke through the streak runner,
+then 2000-iteration 256 B RTT probes (one on the first boots, three on the
+second). All faults were 0 and `data_throttle_ns` was 128000. A READ run counts
+as stalled if it recorded any natural timeout recovery (`zc_read_fallback`,
+`zc_read_retx`, `zc_read_probe`, `zc_fb_wait_drain`, `zc_ack_probe` or
+`zc_retries`). Rates are the streak runner's verified wall rates per direction.
+
+| Boot | Control-ring E2E | Runs passed | READ runs stalled | READ MiB/s | WRITE MiB/s | SEND MiB/s | RTT avg (µs) | RTT worst max (µs) |
+|---|---|---|---|---|---|---|---|---|
+| A1 | on | 11/11 | 2 of 6 | 383–395 | 414–418 | 405–407 | 35.5 | 64 |
+| B1 | off | 11/11 | 2 of 6 | 390–398 | 418–419 | 404–413 | 35.3 | 260 |
+| A2 | on | 11/11 | 2 of 6 | 401–403 | 433–437 | 414–421 | 35.4–36.0 | 1,483 |
+| B2 | off | 11/11 | 1 of 6 | 401–404 | 424–431 | 416–417 | 36.1–38.1 | 1,332 |
+
+With control-ring E2E on, 4 of 12 READ runs stalled; with it off, 3 of 12.
+One WRITE or SEND run (in A1) recorded a recovery, none in the other boots.
+There were no `bad_frames`, version mismatches or QP errors on either host in
+any boot. The RTT tails are noise: the worst one came with E2E on.
+
+**Result.** No measurable difference, so a second E2E pair is not what makes
+the NHI withhold the frame. The data ring's own E2E is still untested, and
+testing it needs the software credit scheme of TODO option (c). Leave
+`ctl_e2e` on.
+
+**Caveat on these four boots.** The runner's readback was broken: the remote
+command was single-quoted, so it printed the literal `$(cat …)` and the arm in
+effect was never read back. The evidence that each arm applied is indirect but
+consistent:
+
+- The sudo journal on max shows the modprobe.d file written before each B boot
+  and removed before each A boot.
+- The bring-up loads the module with `modprobe`, which applies modprobe.d
+  options. `data_throttle_ns=128000` is set the same way, and read back as
+  128000 on 2026-10-14.
+- No boot logged an unknown-parameter warning.
+
+The committed runner reads `ctl_e2e` back on both hosts and stops on a
+mismatch. It also fixes a run counter that ran in a pipeline subshell. That
+numbered every run 1 and overwrote the per-run evidence; the summary lines,
+which the table is built from, were unaffected.
+
+### A reboot that hung in late shutdown
+
+On 2026-10-12, max booted 22 times. The first 21 reboots out of those boots
+were clean and the 22nd hung. It was the simultaneous reboot of both hosts
+after boot B2, issued at 19:26:56 to restore the default:
+
+- **max2 came back. max never did.** It stayed hung until it was power-cycled
+  by hand on 2026-10-13 at 19:04. Its journal ends normally, at "Journal
+  stopped" after systemd-shutdown's SIGTERM.
+- **max's kernel was still running.** max answered ping and refused every TCP
+  port, which is a kernel network stack with no user space left: the state
+  after systemd-shutdown has killed everything.
+- **Its Thunderbolt domain still worked.** At 19:33:37, max2's bring-up
+  reloaded max2's thunderbolt driver. At 19:33:45 max2 rediscovered max's
+  XDomain and read its hostname, which max's kernel has to answer. So 6.8
+  minutes into its reboot, max had not torn down the domain. On this kernel
+  that teardown is the NHI's PCI shutdown (`nhi_pci_remove`), which removes
+  the whole domain and runs `sn_remove()` under the core lock. Either that
+  shutdown had not run, or it had not reached the point where the control
+  channel stops.
+- **The watchdog did not fire.** systemd-shutdown had armed the SP5100 TCO
+  watchdog for 10 minutes. It did not reset the machine.
+
+Nothing direct is known about the cause. It lies after journald stopped and
+before the domain teardown completed. `strix_nhi` was loaded with its session
+up and idle, and that boot ran `ctl_e2e=0`. One earlier reboot from a
+`ctl_e2e=0` boot (B1 to A2) was clean.
+
+**Change 1: a shutdown hook.** `strix_nhi` had none. Its poller and both ring
+pairs kept running through `device_shutdown()` until the NHI's own shutdown
+removed them. `sn_shutdown()` now does what `thunderbolt_net`'s hook does: it
+stops the poller, then the rings. Its wait on the core lock is bounded, and it
+logs one line saying how the path release ended. `sn_remove()` still runs later
+and finds both already stopped. This removes one candidate cause; it is not a
+demonstrated fix. A source contract in `test-native-verbs.sh` covers it
+(`make check-native-verbs`: 67). Three mutations are each caught: the hook not
+registered, the wait unbounded, and the rings stopped before the poller.
+
+**Change 2: a capture.** journald stops before the late shutdown steps, so the
+hung reboot left nothing behind. `tools/scripts/arm-shutdown-capture.sh` arms
+netconsole and `initcall_debug` for one boot, and
+`tools/scripts/netconsole-listen.py` records both hosts on a third machine. The
+A/B runner takes `NETCONSOLE="IFACE IP [MAC]"` to arm both hosts before its
+reboot. The script was verified on both routes: through the router, with the
+gateway's MAC, and on the same LAN, with the listener's own MAC.
+
+**Hardware, 2026-10-14.** The hook build was installed on both hosts as a
+first load after the power cycle. The default-path gates passed byte-for-byte:
+
+- `write 200`, `read 500` and the SEND smoke
+- `send 2000` ×5: 411.8–418.6 MiB/s, median 417.1
+- `ping 500`: 35.7 µs average
+
+Then both hosts were rebooted simultaneously with sessions up and idle and the
+capture armed. Both were back in under 2.5 minutes. max's record follows;
+max2's is the same:
+
+```text
+dracut: Disassembling device-mapper devices
+strix_nhi 1-2.0: shutdown
+strix_nhi 1-2.0: shutdown: poller and rings stopped, path release 0
+thunderbolt 1-2: shutdown
+...
+thunderbolt 0000:c4:00.6: shutdown        <- the NHI: domain teardown, sn_remove()
+thunderbolt 1-0:2.2: retimer disconnected
+thunderbolt 1-0:2.1: retimer disconnected
+thunderbolt 0000:c4:00.5: shutdown
+...
+mt7925e 0000:c0:00.0: shutdown            <- last line; the r8169 NIC is next
+```
+
+The hook took 0.5 ms and the NHI's teardown about 1 ms. The record runs past
+all Thunderbolt devices, so a hang anywhere up to and including the domain
+teardown will now be located. After the reboot, bring-up and `write 200`, the
+SEND smoke and `read 500` all passed.
+
+**Not done: a reboot soak.** One clean reboot shows that the hook does not
+break shutdown. It does not show that the hang is gone, since the rate was 1
+in 22. Every hang needs a manual power cycle, because the watchdog does not
+fire. A soak is therefore an owner decision (TODO).

@@ -131,7 +131,15 @@ SMOKE_ENV='STRIX_GPU_HOT=1' \
   SMOKE_FLAGS='--gpu-kernels ./strix-verbs-gpu-kernels.hsaco --len 262144' \
   XFER_LEN=262144 scripts/verbs-streak.sh 1 1 write 300
                                             # GPU kernels produce/check (make -C ../tools/verbs gpu-kernels)
+scripts/verbs-e2e-ab.sh B /tmp/ab-B1       # reboots both hosts into one arm of the
+scripts/verbs-e2e-ab.sh A /tmp/ab-A1       #   control-ring E2E A/B; end with arm A
 ```
+
+`verbs-e2e-ab.sh` reboots both hosts and runs bring-up itself (BRINGUP is the
+script's path on the hosts). It reads `ctl_e2e` back and stops if the arm is
+not in effect. With `NETCONSOLE="IFACE IP [MAC]"` it first arms
+`tools/scripts/arm-shutdown-capture.sh` on both hosts, so a reboot that hangs
+leaves a record with `tools/scripts/netconsole-listen.py` on this machine.
 
 `strix-verbs-smoke --gpu` allocates every buffer with `hipMalloc` (HIP is
 `dlopen`ed at runtime) and registers it with `ibv_reg_dmabuf_mr`

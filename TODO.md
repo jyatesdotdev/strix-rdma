@@ -13,6 +13,14 @@ continue. Evidence and background live in the linked docs.
   during bring-up or handshake; powering a peer off instead of pulling; a long
   disconnect (minutes); a pull during staged-only traffic. Each needs someone at
   the machines, and the inactive-peer wedge can still need a power cycle.
+- [ ] **Reboot soak.** On 2026-10-12 one reboot in 22 hung in late shutdown
+  on max: kernel alive, no user space, Thunderbolt domain not yet torn down. The
+  hardware watchdog did not reset it, so it took a power cycle. The cause was
+  not captured. `strix_nhi` now quiesces at shutdown, and one simultaneous
+  reboot with the capture armed was clean (`docs/ZEROCOPY_VERBS.md`, round
+  seventeen). A soak of 20 or more reboots with `arm-shutdown-capture.sh` armed
+  would either show the hang is gone or locate it, but every hang needs someone
+  to power-cycle the host.
 
 ## Needs a design decision
 
@@ -23,10 +31,10 @@ continue. Evidence and background live in the linked docs.
   (`docs/ZEROCOPY_VERBS.md`, round twelve). Recovery handles it today, at under
   1% of throughput. Options:
   - (a) Leave it as is (current recommendation).
-  - (b) A/B test with E2E off on the control rings only, which leaves one E2E
-    pair per host. The control ring then becomes lossy whenever a receiver's
-    poller stalls (gaps of up to 30 ms have been measured). Boot-to-boot
-    variance means several reboot cycles per arm.
+  - [x] (b) Done 2026-10-12: control-ring E2E off (`ctl_e2e=0`), two boots per
+    arm. No difference: 4 of 12 READ runs stalled with it on, 3 of 12 with it
+    off, and throughput was the same (round seventeen). So a second E2E pair is
+    not the cause. `ctl_e2e` stays on.
   - (c) Replace hardware E2E on the data ring with a software credit scheme,
     as thunderbolt-ibverbs does on AMD. This is a redesign: the zero-copy
     recovery design currently relies on E2E being lossless.

@@ -30,6 +30,7 @@
  * new value takes effect on the next module load) so the knee can be measured
  * on hardware without a rebuild. Defined in main.c, consumed in ring.c. */
 extern unsigned int sn_data_throttle_ns;
+extern bool sn_ctl_e2e;
 
 /* Zero-copy RDMA WRITE kill-switch (default on), defined in main.c and latched
  * into sn_device::zc_write by ring.c when the data plane comes up. */

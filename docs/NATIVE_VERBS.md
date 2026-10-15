@@ -203,7 +203,9 @@ The native kernel configuration defaults off; its module has no autoload alias
 and requires explicit enable. Its approved core lifetime extension is conditional
 on the native config (apart from three behavior-preserving refactors listed in
 the kernel README) and changes XDomain layout when enabled: rebuild all
-Thunderbolt modules together. Suspend is rejected while bound. Do not change
+Thunderbolt modules together. Suspend is rejected while bound; on reboot or
+power-off the driver stops its poller and DMA rings before the NHI shuts down.
+Do not change
 existing series20 deployment, configfs, networking, IOMMU, permissions, or host
 services as part of a provider build/test. The native and existing stream wire
 protocols are different, and neither endpoint can silently interoperate with

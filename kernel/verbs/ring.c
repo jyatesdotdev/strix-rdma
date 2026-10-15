@@ -163,6 +163,7 @@ static void sn_slots_free(struct tb_ring *r, struct sn_slot *slots)
 int sn_rings_start(struct sn_device *d)
 {
 	struct tb_xdomain *xd = tb_service_parent(d->service);
+	unsigned int flags;
 	int ret, i;
 
 	/* A previous nonblocking teardown may still own the exact path tuple. */
@@ -170,13 +171,15 @@ int sn_rings_start(struct sn_device *d)
 		ret = sn_rings_stop(d);
 		if (ret) return ret;
 	}
-	d->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, SN_RING_SIZE,
-				     RING_FLAG_FRAME | RING_FLAG_E2E);
+	/* ctl_e2e=0 drops E2E from this pair only, leaving one E2E pair per host
+	 * (rounds twelve and seventeen). The hop is still passed: the core only
+	 * consults it when the flag is set. */
+	flags = RING_FLAG_FRAME | (sn_ctl_e2e ? RING_FLAG_E2E : 0);
+	d->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, SN_RING_SIZE, flags);
 	if (!d->tx_ring)
 		return -ENOMEM;
-	d->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, SN_RING_SIZE,
-		RING_FLAG_FRAME | RING_FLAG_E2E, d->tx_ring->hop,
-		BIT(1), BIT(2), NULL, NULL);
+	d->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, SN_RING_SIZE, flags,
+		d->tx_ring->hop, BIT(1), BIT(2), NULL, NULL);
 	if (!d->rx_ring) {
 		ret = -ENOMEM;
 		goto fail;

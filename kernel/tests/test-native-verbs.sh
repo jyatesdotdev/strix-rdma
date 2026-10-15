@@ -48,6 +48,18 @@ awk '
  END { if (!passed) exit 1 }
 ' "$main"
 printf 'ok - netdev released on NETDEV_UNREGISTER; poller stopped before ring teardown (source contract)\n'
+# A reboot must quiesce the poller and the DMA rings before the NHI below them
+# shuts down (thunderbolt_net does the same), and must never wait on the core
+# lock without bound: a 2026-10-12 reboot hung in that path.
+grep -q '\.shutdown = sn_shutdown' "$main"
+awk '
+ /^static void sn_shutdown\(/ { f=1 }
+ f && /kthread_stop\(d->thread\)/ { stopped=1 }
+ f && /sn_rings_stop\(d\)/ { if (!stopped || $0 !~ /--tries/) exit 1; rings=1 }
+ f && /^}/ { if (rings) passed=1; exit }
+ END { if (!passed) exit 1 }
+' "$main"
+printf 'ok - reboot quiesces the poller and the rings first, with a bounded wait (source contract)\n'
 # sn_rings_stop() is retried on EAGAIN (hot unplug makes that routine), so it
 # must stop each ring pair only while that pair runs: tb_ring_stop() WARNs on
 # a ring already stopped (seen on hardware, 2026-10-12 hot-unplug test).

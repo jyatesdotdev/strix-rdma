@@ -1,6 +1,29 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-14 — control-ring E2E A/B: no effect; reboot hang; shutdown hook
+- **E2E A/B (round seventeen).** `ctl_e2e=0` runs the control rings without
+  E2E, leaving one E2E pair per host. Two boots per arm (A, B, A, B), 11 runs
+  each, all passed. READ runs with a natural stall: 4 of 12 with control-ring
+  E2E on, 3 of 12 off. Throughput was the same, with no bad frames or QP
+  errors. So a second E2E pair is not why the NHI withholds a burst's last
+  frame. `ctl_e2e` stays on.
+- **The A/B runner never read the arm back** (a quoting bug). The arm is
+  supported by the journal, the modprobe route and the throttle readback.
+  `bench/scripts/verbs-e2e-ab.sh` now reads it back and stops on a mismatch.
+- **A reboot hung on max** (1 in 22 that day): kernel alive, no user space,
+  Thunderbolt domain still answering 6.8 minutes in. The watchdog did not fire,
+  so it needed a power cycle. The cause was not captured.
+- **`sn_shutdown()`:** stops the poller, then the rings, before the NHI's
+  shutdown tears the domain down. The wait is bounded. It is one candidate
+  removed, not a demonstrated fix. Source contract added (67 green, three
+  mutations caught).
+- **Capture:** `tools/scripts/arm-shutdown-capture.sh` (netconsole plus
+  `initcall_debug`) and `netconsole-listen.py`. One simultaneous reboot with
+  sessions up was clean. The record shows the hook (0.5 ms) and the NHI's
+  domain teardown (about 1 ms). Gates before and after it passed: `write 200`,
+  `read 500`, the SEND smoke, `send 2000` ×5 at 411.8–418.6 MiB/s.
+
 ## 2026-10-12 — wire version 2: mixed pairs refused at the first frame; READ_ACK probe
 - **`SN_VERSION` is 2.** Correlation is that version 2 adds the `SN_STAGED`
   status and the `SN_READ_PROBE` frame. A frame from another version is refused

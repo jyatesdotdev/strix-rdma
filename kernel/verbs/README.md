@@ -50,6 +50,9 @@ USB4/USB4_NET. It defaults off. `strix_nhi.ko` has **no autoload device alias**
 and refuses initialization without its explicit `enable=1` parameter. Loading
 or installing it is not part of these build instructions. System suspend is
 rejected while the service is bound; resume is not an implemented operation.
+On reboot or power-off, `sn_shutdown()` stops the poller and then the DMA rings
+before the NHI's own shutdown tears the domain down (docs/ZEROCOPY_VERBS.md,
+round seventeen).
 
 ## Reproduce on the lab nodes (max / max2)
 
@@ -644,9 +647,10 @@ strix_nhi: peer speaks wire version N, this build speaks 2; refusing the session
 
 The port stays down. Before the bump, a mixed pair formed a session and then
 failed mid-operation with a trail of `bad_frames`, which read as corruption
-rather than as two incompatible builds.
-
-
+rather than as two incompatible builds. On hardware (2026-10-12, version 2 on
+one host and version 1 on the other), the version-2 host counted every frame as
+`version_mismatch` and logged the line above, and the port never came up
+(docs/ZEROCOPY_VERBS.md, round sixteen).
 
 All new code here is GPL-2.0-only, authored for this implementation against the
 pinned Linux API. No Hellas source was copied. The experimental Hellas repository

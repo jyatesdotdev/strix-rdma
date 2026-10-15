@@ -80,6 +80,18 @@ bool sn_zc_read = true;
 module_param_named(zc_read, sn_zc_read, bool, 0444);
 MODULE_PARM_DESC(zc_read,
 	"Let eligible RDMA READs take the zero-copy data ring (default on; 0 is the kill-switch that forces the staged READ path)");
+/* End-to-end flow control on the control ring pair. The data rings always keep
+ * it: the zero-copy recovery design relies on E2E being lossless. The control
+ * ring can be run without it, as a diagnostic: this platform's NHI withholds the
+ * last frame of a burst for tens of milliseconds (docs/ZEROCOPY_VERBS.md, round
+ * twelve), and more than one active E2E ring pair was the suspect. A two-boot
+ * A/B per arm found no difference (round seventeen), so leave it on.
+ * Read-only: the rings are allocated once, at bring-up. */
+bool sn_ctl_e2e = true;
+module_param_named(ctl_e2e, sn_ctl_e2e, bool, 0444);
+MODULE_PARM_DESC(ctl_e2e,
+	"End-to-end flow control on the control rings (default on; 0 is a diagnostic that runs them without it)");
+
 /* Fault injection for diagnosing zero-copy READ recovery: every Nth zero-copy
  * READ this host requests has its retransmit window expired the moment its reply
  * is within 32 frames of landing, so the requester falls back to a staged
@@ -546,6 +558,37 @@ static int sn_suspend(struct device *dev)
 {
 	return -EBUSY;
 }
+/* System shutdown or reboot. Nothing stops this device before the NHI's own
+ * shutdown, which removes the whole domain and only then runs sn_remove(), under
+ * the core lock; until that point the poller and the DMA rings kept running
+ * through device_shutdown(). Quiesce them first, as thunderbolt_net does: the
+ * poller, then the rings. The IB device stays registered and sn_remove() still
+ * runs later, finding both already stopped. Bounded, because a reboot must never
+ * wait on the core lock without limit; sn_rings_stop() stops the rings before it
+ * can return -EAGAIN, so DMA is quiet even if the path release is left to
+ * sn_remove(). Added after a reboot hung in late shutdown with this driver
+ * active (2026-10-12, docs/ZEROCOPY_VERBS.md round seventeen). The hang's cause
+ * was not captured: this removes one candidate, it is not a demonstrated fix. */
+static void sn_shutdown(struct tb_service *svc)
+{
+	struct sn_device *d = tb_service_get_drvdata(svc);
+	int ret, tries = 1000;
+
+	mutex_lock(&d->lock);
+	d->dead = true; d->ready.peer_ready = 0;
+	if (d->qp) sn_qp_error(d->qp, IB_WC_GENERAL_ERR);
+	mutex_unlock(&d->lock);
+	/* As in sn_remove(): the poller goes first, and never under d->lock. */
+	if (d->thread) {
+		wake_up(&d->poll_wait);
+		kthread_stop(d->thread);
+		d->thread = NULL;
+	}
+	while ((ret = sn_rings_stop(d)) == -EAGAIN && --tries)
+		msleep(1);
+	/* One line per reboot, so a capture shows the hook ran and how it ended. */
+	dev_info(&svc->dev, "shutdown: poller and rings stopped, path release %d\n", ret);
+}
 static const struct dev_pm_ops sn_pm_ops = {
 	.suspend = sn_suspend, .freeze = sn_suspend, .poweroff = sn_suspend,
 };
@@ -553,7 +596,8 @@ static const struct tb_service_id sn_ids[] = {{ TB_SERVICE(SN_SERVICE, 1) }, {}}
 /* Intentionally no module-device alias: never auto-load from a peer advert. */
 static struct tb_service_driver sn_driver = {
 	.driver = {.owner = THIS_MODULE, .name = "strix_nhi", .pm = &sn_pm_ops},
-	.probe = sn_probe, .remove = sn_remove, .id_table = sn_ids,
+	.probe = sn_probe, .remove = sn_remove, .shutdown = sn_shutdown,
+	.id_table = sn_ids,
 };
 static int __init sn_init(void)
 {
