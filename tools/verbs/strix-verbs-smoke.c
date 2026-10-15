@@ -53,6 +53,10 @@ static unsigned xfer_len = CHUNK, xfer_off;
  * buffers 16 bytes past a page). Defaults to --off. */
 static unsigned recv_off;
 static bool recv_off_set;
+/* --linger-ms N: stay idle (connection up, no traffic) for N ms after the last
+ * transfer, so the recovery paths that only run while a connection idles -- a
+ * lost READ_ACK answered by SN_READ_PROBE -- can be exercised. */
+static unsigned linger_ms;
 static struct {
 	int (*set_device)(int);
 	int (*malloc)(void **, size_t);
@@ -506,6 +510,9 @@ int main(int argc, char **argv)
 		} else if (argc >= 3 && !strcmp(argv[1], "--gpu-kernels")) {
 			gpu = true; gpu_kernels = argv[2];
 			argv[2] = argv[0]; argv += 2; argc -= 2;
+		} else if (argc >= 3 && !strcmp(argv[1], "--linger-ms")) {
+			linger_ms = iterations(argv[2], 60000, "--linger-ms 1..60000");
+			argv[2] = argv[0]; argv += 2; argc -= 2;
 		} else if (argc >= 3 && !strcmp(argv[1], "--recv-off")) {
 			char *end = NULL; unsigned long v = strtoul(argv[2], &end, 10);
 			require(end && !*end && v < CHUNK, "--recv-off 0..2097151");
@@ -526,7 +533,7 @@ int main(int argc, char **argv)
 		"--off/--recv-off + --len must fit one 2 MiB slot");
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] --live ... send|write|read iters\n", argv[0], argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] [--linger-ms N] --live ... send|write|read iters\n", argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	if (argc >= 7 && !strcmp(argv[6], "ping")) {
@@ -754,6 +761,16 @@ int main(int argc, char **argv)
 		       (double)verified / (1048576.0 * elapsed / 1000.0), verified, argv[3]);
 		printf("%s buffers: transfer-only %.2f MiB/s per direction (post to both directions complete; pattern generation, staging and verification excluded) (%s)\n",
 		       gpu ? "GPU" : "CPU", (double)verified / (1048576.0 * (double)xfer_us / 1e6), argv[3]);
+		if (linger_ms) {
+			/* Idle with the connection up: let a responder whose last
+			 * READ_ACK was lost probe for it, and this side answer. */
+			struct timespec ts = { .tv_sec = linger_ms / 1000,
+					       .tv_nsec = (long)(linger_ms % 1000) * 1000000 };
+
+			printf("linger: idle %u ms with the connection up (%s)\n", linger_ms, argv[3]);
+			fflush(stdout);
+			require(!nanosleep(&ts, NULL), "linger");
+		}
 		goto done;
 	}
 	if (rdma_iters) { /* Verified bidirectional RDMA WRITE or READ, window 4 x 2 MiB. */
@@ -854,6 +871,16 @@ int main(int argc, char **argv)
 		       (double)verified / (1048576.0 * elapsed / 1000.0), verified, argv[3]);
 		printf("%s buffers: transfer-only %.2f MiB/s per direction (post to both directions complete; pattern generation, staging and verification excluded) (%s)\n",
 		       gpu ? "GPU" : "CPU", (double)verified / (1048576.0 * (double)xfer_us / 1e6), argv[3]);
+		if (linger_ms) {
+			/* Idle with the connection up: let a responder whose last
+			 * READ_ACK was lost probe for it, and this side answer. */
+			struct timespec ts = { .tv_sec = linger_ms / 1000,
+					       .tv_nsec = (long)(linger_ms % 1000) * 1000000 };
+
+			printf("linger: idle %u ms with the connection up (%s)\n", linger_ms, argv[3]);
+			fflush(stdout);
+			require(!nanosleep(&ts, NULL), "linger");
+		}
 		goto done;
 	}
 	if (bench_iters) { /* Timed window-4 x 2MiB bidirectional loop; no verification. */
