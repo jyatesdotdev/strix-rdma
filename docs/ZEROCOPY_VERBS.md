@@ -59,11 +59,13 @@ Throughput, window-4 x 2 MiB bidirectional (`... 200`):
   reboot plus bring-up the same stack measures 1127-1191 MiB/s (mean 1158 over
   5 runs, `bad_frames` 0), which is at or above the 1070-1156 MiB/s recorded for
   previous script-brought-up post-reboot runs -- so a post-reboot number in the
-  1130s is normal for this stack, not a regression. That is the practical link ceiling: iperf3 over
-  `thunderbolt-net` on the same pair tops out at 9.49-9.51 Gbit/s one-way
-  (measured 2026-09-18) against a 20 Gb/s per-direction nominal rate, and
-  raising `thunderbolt.dma_credits` above its default 14 did not lift it. It is
-  also above the USB4STREAM zero-copy path's 1146 MB/s.
+  1130s is normal for this stack, not a regression. That is the practical
+  single-ring ceiling: iperf3 over `thunderbolt-net` on the same pair tops out
+  at 9.49-9.51 Gbit/s one-way (measured 2026-09-18), and raising
+  `thunderbolt.dma_credits` above its default 14 did not lift it. It is also
+  above the USB4STREAM zero-copy path's 1146 MB/s. The link itself is two bonded
+  20 Gb/s lanes (40 Gb/s per direction); the limit is one NHI DMA ring's, and
+  two rings in parallel reached ~19 Gbit/s (round eighteen).
 - Earlier builds were **bimodal** (18-1313 MiB/s run to run); root cause and
   fix below.
 
@@ -1530,3 +1532,109 @@ SEND smoke and `read 500` all passed.
 break shutdown. It does not show that the hang is gone, since the rate was 1
 in 22. Every hang needs a manual power cycle, because the watchdog does not
 fire. A soak is therefore an owner decision (TODO).
+
+## Round eighteen (2026-10-14 to 2026-10-15): BIOS 3.06, and the per-ring ceiling
+
+### Firmware
+
+Until now the pair ran mismatched firmware, so every earlier figure in this
+document was measured on it: max had BIOS 3.05 with EC 3.0.5, and max2 had BIOS
+3.04 with EC 3.0.4. Both now run **BIOS 3.06 with EC 3.0.6** (Framework release
+2026-08-03), installed from LVFS with `fwupdmgr` as a capsule-on-disk update:
+max2 on 2026-10-14 and max on 2026-10-15.
+
+**After an EC update, cut power to both hosts.** After max's flash, neither
+host's USB-C controller detected the cable. UCSI `GET_CONNECTOR_STATUS`
+returned all zeros on both connectors of both hosts, and VBUS read 0 mV. A
+reboot of max2 and a cable replug changed nothing, and the replug did not even
+produce a USB-C event. Powering both hosts off, unplugging AC for 30 seconds
+and powering them on again restored the link: a USB-C partner on port 0, USB4
+up, and two bonded lanes of 20 Gb/s each way.
+
+The 3.06 boot no longer logs "RDSEED32 is broken" (3.06 fixes
+CVE-2025-62626).
+
+**Checks on 3.06 (one boot).** Everything passed byte-for-byte, with no
+`bad_frames` and no QP errors:
+
+- `write 200`: 430 MiB/s
+- `read 500`: 400 MiB/s
+- the SEND smoke
+- `send 2000` ×5: 407–414 MiB/s, median 411.5
+- `read 2000` ×6: 393–400 MiB/s
+- `write 2000` ×2: 427 MiB/s
+- RTT probes: 36–41 µs average
+
+Two figures are worse than on the last boots before the update, but this is
+one boot, and boot-to-boot variance is large:
+
+- 4 of the 6 `read 2000` runs had a natural stall, against at most 2 of 6 per
+  boot in round seventeen.
+- The worst RTT reached 3.3 ms, against at most 1.5 ms before.
+
+`gufo.service`, a GPU model server, has started at every boot on both hosts
+since 2026-09-27. It holds about 85 GiB of GTT and uses about 1.4% CPU when
+idle. It was therefore present for every measurement in rounds twelve to
+eighteen.
+
+### Why throughput stops near 10 Gbit/s: one DMA ring
+
+The link is two bonded lanes of 20 Gb/s, which is 40 Gb/s per direction
+(`rx_speed`/`rx_lanes` on the XDomain). The debugfs hop tables put both DMA
+paths on lane adapter 0, with no hops on lane 1, which is how a bonded link
+looks. The NHI's own PCIe link is 16 GT/s ×16. Yet every path measured on this
+pair stops near 10 Gbit/s per direction:
+
+- iperf3 over `thunderbolt-net`: 9.5 Gbit/s
+- USB4STREAM: about 1.15 GB/s
+- these verbs: 1.0–1.3 GB/s
+
+Earlier work ruled out copies, the credit window, ring size and interrupt
+throttling. What the three paths share is one NHI DMA ring per direction.
+
+**The NHI has two usable ring pairs.** With verbs up, loading
+`thunderbolt_stream` and opening a stream endpoint failed with
+`TBSTREAM_ZC_ENABLE: Cannot allocate memory`. With `nhi.c` dynamic debug on,
+the cause showed: `allocating TX ring -1` was followed by `invalid hop: -1`, so
+the automatic search found no free ring. strix_nhi holds rings 1 and 2 (hops 1
+and 2 on the NHI adapter in the path table), so `hop_count` is 3. Ring 0 is
+the control channel, which leaves two ring pairs. `ENOMEM` is how the stream
+driver reports a failed `tb_ring_alloc()`. Reading `REG_CAPS` directly was
+refused, because the BAR is claimed by the driver.
+
+**Measured, 2026-10-15.** Both hosts were booted with verbs not loaded, with
+two stream endpoints (HopIDs 8 and 9), using `pingpong ztx`/`zrx` at 8,000 ×
+1 MiB (8.39 GB) per stream. Receivers were opened before any sender started.
+Every run delivered the exact byte count on both sides:
+
+| Arrangement | Per stream (MB/s) | Total |
+|---|---|---|
+| One ring, one way (3 runs) | 1,333.5; 1,437.1; 1,432.3 | 1.33–1.44 GB/s (10.7–11.5 Gbit/s) |
+| Two rings, same direction (2 runs) | 1,190.6 + 1,190.6; 1,211.5 + 1,211.4 | **2.38–2.42 GB/s (19.0–19.4 Gbit/s)** |
+| One ring each way at once (2 runs) | 1,260.9 / 1,248.7; 1,322.7 / 1,322.5 | 1.25–1.32 GB/s each way |
+
+So the ceiling is **per ring, not per link**. A second ring adds about 70%.
+The two rings contend somewhat: each lost about 15% when sharing, and the
+contention point is not identified. The two directions barely interfere. The
+verbs figure of 1.0–1.3 GB/s per direction, measured with both directions
+busy, is close to what one ring does under the same conditions.
+
+The single-ring figure (1.33–1.44 GB/s) is above the 1.08–1.15 GB/s recorded
+for this path on 2026-09-18 and 2026-10-06, both on the older firmware. The
+cause is not isolated; 3.06 is one difference.
+
+**Not measured:** two rings in each direction at once. `pingpong` cannot drive
+one zero-copy stream in both directions, and there is no third ring pair. A
+third concurrent endpoint was deliberately not opened: if it had unexpectedly
+succeeded, closing it would have sent a CLOSE toward a peer endpoint that was
+not open, which breaks the first wedge rule in
+`tools/systemd/tbstream-lifecycle.md`.
+
+**What it means for verbs.** Bulk zero-copy traffic uses one data ring. The
+only other ring pair is the control pair. Carrying bulk data on both could
+approach 2.4 GB/s per direction, about 1.7–1.8× today, but it is a design
+change (TODO):
+
+- small control frames would queue behind data bursts
+- the zero-copy landing order and the recovery design assume a single data ring
+- both data-carrying rings would need E2E

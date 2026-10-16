@@ -74,9 +74,11 @@ payload into NHI ring pages.
 
 Measured on the lab pair: iperf3 over `thunderbolt-net` reaches 9.49–9.51
 Gbit/s one-way at the default `thunderbolt.dma_credits=14`, and raising the
-credit window did not raise it (2026-09-18). The nominal link rate is
-20 Gb/s per direction, so the practical ceiling for any path is well under
-that, and the copies plus the network stack are what a direct ring path avoids.
+credit window did not raise it (2026-09-18). The link is two bonded 20 Gb/s
+lanes (40 Gb/s per direction), but one NHI DMA ring tops out near 10 Gbit/s,
+which is where every single-ring path stops. Two rings in parallel reached
+~19 Gbit/s (2026-10-15, `docs/ZEROCOPY_VERBS.md` round eighteen). The copies
+plus the network stack are what a direct ring path avoids.
 
 ## Upstream USB4STREAM support
 

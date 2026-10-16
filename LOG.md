@@ -1,6 +1,24 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-15 — BIOS 3.06 on both hosts; throughput ceiling is per DMA ring
+- **Firmware.** Both hosts were on mismatched firmware for every measurement so
+  far: max on BIOS 3.05 / EC 3.0.5, max2 on 3.04 / 3.0.4. Both now run BIOS
+  3.06 / EC 3.0.6, installed from LVFS (`fwupdmgr`, capsule-on-disk).
+- **EC update needs a power cut.** After max's flash, neither USB-C controller
+  detected the cable: zero connector status, 0 mV VBUS, and no event even on a
+  replug. Cutting AC power to both hosts for 30 s fixed it.
+- **3.06 checks pass** with throughput unchanged. 4 of 6 `read 2000` runs
+  stalled (at most 2 of 6 per boot before) and the worst RTT was 3.3 ms; that
+  is one boot.
+- **The ~10 Gbit/s ceiling is one NHI DMA ring's, not the link's.** The link
+  is two bonded 20 Gb/s lanes (40 Gb/s per direction); the docs' "20 Gb/s
+  nominal" counted one lane, and is corrected.
+  - The NHI has two usable ring pairs (`hop_count` 3), and verbs holds both.
+  - USB4STREAM with verbs unloaded: one ring 1.33–1.44 GB/s, two rings in
+    parallel 2.38–2.42 GB/s, one ring each way 1.25–1.32 GB/s each way.
+  - Carrying bulk data on both ring pairs is now a TODO design decision.
+
 ## 2026-10-14 — control-ring E2E A/B: no effect; reboot hang; shutdown hook
 - **E2E A/B (round seventeen).** `ctl_e2e=0` runs the control rings without
   E2E, leaving one E2E pair per host. Two boots per arm (A, B, A, B), 11 runs

@@ -24,6 +24,19 @@ continue. Evidence and background live in the linked docs.
 
 ## Needs a design decision
 
+- [ ] **Bulk data on both NHI ring pairs.** The Strix Halo NHI has two usable
+  DMA ring pairs, and one ring tops out near 10 Gbit/s per direction. Two rings
+  in parallel carried ~19 Gbit/s (`docs/ZEROCOPY_VERBS.md`, round eighteen).
+  Verbs uses one pair for control and one for data. Carrying zero-copy bursts
+  on both could raise bulk throughput by up to about 1.7×. The costs:
+  - control frames queue behind data bursts, which hurts small-operation
+    latency (256 B RTT is about 36 µs today)
+  - transfers have to be put back in order across rings, because the landing
+    order and the recovery design assume one data ring
+  - two E2E data rings (round twelve)
+
+  Not yet measured: two rings each way at once.
+
 - [ ] **E2E flow control on AMD.** Natural zero-copy timeouts are the NHI
   holding a burst's last frame for more than 67 ms while the peer has a buffer
   posted for it. That points to a withheld E2E credit, consistent with upstream

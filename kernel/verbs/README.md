@@ -58,7 +58,10 @@ round seventeen).
 
 End-to-end bring-up, assuming the nodes run Fedora 43 / 7.2.8 with
 the rebased zero-copy series and patch1 (`0001-thunderbolt-native-path-lifetime`)
-already installed (they are; see `kernel/README.md` for the kernel-side recipe):
+already installed (they are; see `kernel/README.md` for the kernel-side recipe).
+Both run Framework BIOS 3.06 / EC 3.0.6 since 2026-10-15. After any EC update,
+power both hosts off and unplug AC for 30 s: until then the USB-C controllers
+may not detect the cable at all (docs/ZEROCOPY_VERBS.md, round eighteen).
 
 ```sh
 # On each node, in the prepared tree ~/src/linux-stable (7.2.8 + zc01..20 + 0001):
@@ -480,7 +483,8 @@ pre-reboot; the like-for-like post-reboot band for this stack is 1127-1191 MiB/s
 (see "Gated build re-validated" below), so do not read a post-reboot number in
 the 1130s as a regression. Both are at or
 above the USB4STREAM zero-copy figures (1146 MB/s, 3837 us bidirectional p50)
-and at the ~9.5 Gbit/s per-direction link ceiling, so the keep-native-vs-stream
+and at the ~10 Gbit/s per-direction ceiling of one NHI DMA ring
+(docs/ZEROCOPY_VERBS.md, round eighteen), so the keep-native-vs-stream
 decision now favours native on both axes. These figures are quoted here rather
 than linked: the dated result files that originally recorded the runs were
 removed when this repository stopped being workload-specific, so the numbers

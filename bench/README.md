@@ -38,8 +38,10 @@ Measured 2026-09-18 on the lab pair: iperf3 (MTU 65520) reaches
 **9.49–9.51 Gbit/s one-way** and 9.41 + 9.40 Gbit/s full duplex at the default
 `thunderbolt.dma_credits=14`. The credit sweep is the interesting part: 1 gives
 3333 Mbit/s, 4 already gives 9489, and 8/14/64 are indistinguishable — so the
-XDomain DMA-tunnel credit window is *not* the limiter above 4, and the nominal
-20 Gb/s per-direction link rate is not reachable by any path measured so far.
+XDomain DMA-tunnel credit window is *not* the limiter above 4. The link itself
+is two bonded 20 Gb/s lanes, 40 Gb/s per direction (`rx_speed` × `rx_lanes` on
+the XDomain). The ~10 Gbit/s that every path reaches is the limit of one NHI
+DMA ring (Step 3, "Two rings").
 
 ## Step 2 — Stock USB4STREAM
 
@@ -83,6 +85,22 @@ Measured 2026-08-04 on the lab pair, one-way verified sender rates:
 512 × 1 MiB run reached 955.9 MB/s with 24 aggregate Thunderbolt interrupts
 per host. Measured 2026-09-18: 1078–1117 MB/s one-way at 1 MiB, and
 1146 MB/s at 2 MiB (2026-10-06).
+
+**Two rings (2026-10-15, BIOS 3.06 on both hosts).** The Strix Halo NHI has
+two usable DMA ring pairs, and verbs holds both, so boot without strix_nhi.
+Reload the updates/ thunderbolt core as `strix-verbs-bringup.sh` does, then
+`modprobe thunderbolt_stream`. Create two endpoints on both hosts
+(`TBSTREAM_SETUP_FORCE=1 tbstream-setup.sh link2` for the second). Open every
+`zrx` before any `ztx`:
+
+| 1 MiB × 8,000 per stream | Total |
+|---|---|
+| one ring, one way | 1.33–1.44 GB/s |
+| two rings, same direction | **2.38–2.42 GB/s** (~19 Gbit/s) |
+| one ring each way at once | 1.25–1.32 GB/s each way |
+
+The ~10 Gbit/s ceiling is per ring. Details and caveats are in
+`../docs/ZEROCOPY_VERBS.md`, round eighteen.
 
 ## Step 4 — ROCm mapping gate
 

@@ -97,9 +97,11 @@ Done and measured on the lab host pair:
   after a clean reboot plus bring-up the same stack measures 1127–1191 MiB/s
   (mean 1158 over 5 runs), which is at or above the 1070–1156 MiB/s previously
   recorded for script-brought-up post-reboot runs — so compare post-reboot
-  numbers against post-reboot numbers. For scale, the same pair's practical
-  link ceiling is ~9.5 Gbit/s per direction (iperf3 over `thunderbolt-net`,
-  measured 2026-09-18) against a 20 Gb/s per-direction nominal rate.
+  numbers against post-reboot numbers. For scale, every path on this pair
+  stops near 10 Gbit/s per direction (iperf3 over `thunderbolt-net`: ~9.5
+  Gbit/s, 2026-09-18). That is one NHI DMA ring's limit, not the link's: the
+  link is two bonded 20 Gb/s lanes (40 Gb/s per direction), and two rings in
+  parallel carried ~19 Gbit/s (`docs/ZEROCOPY_VERBS.md`, round eighteen).
 - RDMA WRITE and READ validated end to end on hardware (2026-10-10), including
   **zero-copy WRITE at 356–456 MiB/s**: 15.6 GiB (16,000 MiB) per direction verified
   byte-for-byte in a single `write 2000` run, `bad_frames` 0, 10,400 zero-copy
