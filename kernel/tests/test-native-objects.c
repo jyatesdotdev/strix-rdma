@@ -17,6 +17,11 @@ typedef uint64_t u64;
 #define lockdep_assert_held(p) assert(*(p) == 1)
 #define WARN_ON(v) assert(!(v))
 #define WRITE_ONCE(x, v) ((x) = (v))
+#define READ_ONCE(x) (x)
+/* cq->lock: a held/not-held flag, like the d->lock fake; never nested. */
+#define spin_lock_init(l) (*(l) = 0)
+#define spin_lock_irqsave(l, f) do { (void)(f); assert(!*(l)); *(l) = 1; } while (0)
+#define spin_unlock_irqrestore(l, f) do { (void)(f); assert(*(l) == 1); *(l) = 0; } while (0)
 #define kfree free
 #define IB_QPS_RESET 0
 #define IB_QPS_RTS 3
@@ -116,7 +121,7 @@ struct sn_mr { struct ib_mr ib; struct list_head entry; u64 base, size, pinned;
 	struct ib_umem_dmabuf *dmabuf; struct iosys_map vmap;
 	struct scatterlist *cur_sg; unsigned cur_idx; u64 cur_off; };
 struct sn_wqe { struct sn_mr *mr; u64 id, address, remote_address; u32 length, flags, opcode, rkey; };
-struct sn_cq { struct ib_cq ib; struct ib_wc entries[SN_MAX_CQE]; unsigned head, count, notify; bool failed; };
+struct sn_cq { struct ib_cq ib; int lock; struct ib_wc entries[SN_MAX_CQE]; unsigned head, count, notify; bool failed; };
 struct sn_qp { struct ib_qp ib; struct { int qp_state; unsigned max_rd_atomic; } attr;
 	struct { struct { unsigned max_send_wr, max_recv_wr; } cap; } init;
 	struct sn_wqe sq[4], rq[4]; unsigned sq_head, sq_count, rq_head, rq_count;

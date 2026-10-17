@@ -900,7 +900,12 @@ void sn_engine_progress(struct sn_device *d)
 	if (q->receive.active && now >= q->assembly_deadline) {
 		sn_qp_error(q, IB_WC_RETRY_EXC_ERR); return;
 	}
-	if (!q->credit_sent || q->last_credit != q->rq_count) {
+	/* No receiver acts on SN_CREDIT (every wire version ignores it), so it
+	 * goes out once per binding, not on every RQ change: one per post_recv
+	 * cost a frame ahead of the data it raced (round nineteen). keepalive_us
+	 * reuses it as a frame the peer is guaranteed to ignore. */
+	if (!q->credit_sent || READ_ONCE(d->keepalive_due)) {
+		WRITE_ONCE(d->keepalive_due, false);
 		if (q->credit_revision == U64_MAX) {
 			sn_qp_error(q, IB_WC_GENERAL_ERR); return;
 		}

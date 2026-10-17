@@ -1644,52 +1644,172 @@ change (TODO):
 TP sends a few KiB per exchange, about 96 times per decode step. For
 Qwen3.8 Flash Next (hidden size 2,560) that is 10 KiB per exchange at fp32, or
 40 KiB when verifying three MTP drafts. Context length does not change the
-size. So per-exchange latency and its tail are the figures that matter.
+size. Between exchanges the GPU computes for roughly 100-300 µs per layer. So
+the figures that matter are per-exchange latency, its tail, and above all the
+latency of an exchange that follows an idle gap.
 
-**Tooling.** `strix-verbs-smoke` gained two things:
+### Tooling
+
+`strix-verbs-smoke` gained:
 
 - `--len N` for `ping` (default 256 B)
 - an `exchange` mode: both sides send N bytes at once and each waits for the
-  peer's N bytes, which is the TP all-reduce swap. Messages carry a sequence
-  tag, so any loss or reordering fails the run.
+  peer's, which is the TP all-reduce swap. Messages carry a sequence tag, so
+  any loss or reordering fails the run.
+- `--gap-us N`: idle between iterations
+- `--gap-spin`: busy-wait the gap instead of sleeping
 
-Both modes record every sample in nanoseconds and report min, avg, p50, p90,
+Every sample is kept in nanoseconds, and the report gives min, avg, p50, p90,
 p99, p99.9 and max. With 1,000 samples or more, the first 100 are excluded as
 warm-up.
 
-**The copy path cost about 65 µs per extra 4 KiB frame.** At TP sizes the
-exchange looked stop-and-wait: 92 µs at 4 KiB, 167 at 10 KiB, 678 at 40 KiB.
-An ftrace of `sn_ring_send` and the ring callbacks showed the sender queueing
-one frame every ~27 µs. Each `sn_ring_send()` call took that long to return
-because `sn_crc` was a bit-serial CRC-32C: eight dependent shift/xor steps per
-byte, about 25 µs per 4 KiB frame. That cost was paid in `sn_encode()` on every
-send and in `sn_decode()` on every receive.
+Two scripts were added:
+
+- `bench/scripts/verbs-latency.sh` sweeps sizes × gaps.
+- `run-verbs-smoke.sh` takes `SMOKE_PREFIX` (e.g. `taskset -c 6`).
+
+All figures below are 20,000 iterations unless stated, measured on 2026-10-16
+with BIOS 3.06 on both hosts.
+
+### 1. The frame CRC cost ~25 µs per 4 KiB frame
+
+At TP sizes the copy-path exchange looked stop-and-wait: 92 µs at 4 KiB, 167 at
+10 KiB, 678 at 40 KiB. An ftrace of `sn_ring_send` and the ring callbacks showed
+the sender queueing one frame every ~27 µs. Each `sn_ring_send()` call took that
+long to return because `sn_crc` was a bit-serial CRC-32C, with eight dependent
+shift/xor steps per byte. It ran in `sn_encode()` on every send and in
+`sn_decode()` on every receive.
 
 The CRC is now the kernel's arch-accelerated `crc32c()`, computing the same
-value. The wire format is unchanged, so no version bump is needed. The
+value. The wire format is unchanged, so there is no version bump. The
 bit-serial loop stays as `sn_crc_reference`: the offline tests use it, pinned
 to the standard CRC-32C check value. `sn_init()` compares the two at every
 length class the wire uses, with the CRC field both clear and set, and refuses
 to load if they differ.
 
-| p50 (µs), 20,000 iterations | Before | After |
+| p50 (µs) | Before | After |
 |---|---|---|
-| exchange 64 B | 24.0 | 18.7 |
 | exchange 256 B | 26.6 | 19.6 |
-| exchange 4 KiB | 92.4 | 23.3 |
 | exchange 10 KiB | 167.2 | 26.1 |
-| exchange 20 KiB | 339.0 | 34.2 |
 | exchange 40 KiB | 677.5 | 51.1 |
 | ping round trip 256 B | 35.1 | 19.2 |
-| ping round trip 10 KiB | 225.5 | 36.3 |
 
-The tails are now the larger problem. p99.9 is 120–220 µs at 64 B, 256 B,
-4 KiB and 10 KiB, with maxima of 1–6 ms.
+### 2. Control RX ring polling (`ctl_rx_poll`, opt-in)
 
-**Regression gates on the new build** all passed byte-for-byte, with no
-`bad_frames` and no QP errors: `write 200`, `read 500`, the SEND smoke,
-`send 2000` ×5 (424–436 MiB/s wall) and staged 3,000 B at offset 64.
-Transfer-only READ (812–859 MiB/s) and SEND (976–1036) match the previous boot.
-WRITE came in lower, at 723–962 MiB/s against 994–1020 on the previous boot.
-Some of those runs are inside the historical 954–1073 range; whether it is
-boot variance or this change needs a comparison across boots.
+A received control frame used to reach the poller through the NHI interrupt,
+then the core's `ring_work` workqueue, then `sn_ring_callback()`. With
+`ctl_rx_poll=1` (0444, default 0) the control RX ring is allocated in the core's
+polling mode:
+
+- The core masks the ring interrupt and calls `sn_rx_start_poll()` instead.
+- The spinning poller reaps completed descriptors itself with `tb_ring_poll()`,
+  marking slots exactly as the callback did.
+- Before sleeping, the poller unmasks the interrupt and polls once more, so a
+  frame that completed during the unmask still gets reaped.
+- Cancellation at ring stop still runs through the callbacks.
+
+The 256 B round trip falls from ~17 to ~12 µs, and the 10 KiB exchange from ~25
+to ~19 µs.
+
+It is **off by default** because it changes bulk behaviour in ways that are not
+yet understood:
+
+| transfer-only MiB/s, same build | callback, defaults | polling, defaults | polling, profile |
+|---|---|---|---|
+| SEND 2000 | 954-1,016 | 809-848 | 1,095-1,109 |
+| WRITE 2000 | 927-952 | 598-621 | 1,086-1,098 |
+| READ 2000 | 860-873 | 665-690 | 318-327 |
+
+Zero-copy READ falls back far more often with polling: 15-18 times per run
+under defaults and 54-107 with the profile, against none with callbacks. That
+is round twelve's withheld final frame. The best guess is that faster
+control-ring handling changes when receive buffers are re-posted, and so how
+E2E credits are granted. It has not been shown.
+
+### 3. Smaller cuts
+
+Neither of these moved the median measurably. Both are kept because they are
+sound and remove work.
+
+- **The CQ has its own spinlock**, and `poll_cq` answers an empty CQ without
+  any lock. The app no longer waits for the poller's pass, which holds
+  `d->lock`, just to learn that nothing has arrived. `test-native-objects`
+  covers the lock discipline.
+- **`SN_CREDIT` is sent once per binding**, not on every RQ change. Every
+  receiver ignores it, so a ping no longer has a CREDIT frame queued ahead of
+  its data.
+
+### 4. The transmit path goes cold within ~50 µs
+
+Back-to-back numbers hid this. After a 200 µs gap, a 256 B round trip took
+~40 µs, against ~12 hot. A trace with a 200 µs gap showed the first frame
+queued at 2 µs but its TX completion at 24 µs, against ~4 µs hot. Ruled out:
+
+- **The app's CPU idling:** a busy-wait gap costs the same.
+- **The poller sleeping:** a 2 ms spin costs the same.
+- **USB4 CLx:** `thunderbolt clx=0` tightens the tail but leaves the median.
+- **Control-ring E2E:** `ctl_e2e=0` gives 36.5 against 40.0 µs.
+
+`keepalive_us` (0644, default 0) has the poller send one `SN_CREDIT`, which
+every receiver ignores, once the control TX ring has been idle that long while
+a session is up. The path cools between 20 and 100 µs:
+
+| ping 256 B p50 / p99 (µs) | gap 200 µs | gap 1 ms |
+|---|---|---|
+| keepalive off | 39.2 / 41.7 | 48.4 / 52.2 |
+| 20 µs | 12.8 / 14.4 | 12.9 / 14.7 |
+| 50 µs | 16.8 / 24.7 | 12.5 / 26.4 |
+| 100 µs | 22.4 / 42.7 | 24.4 / 47.7 |
+
+What goes cold is hardware below the driver: the NHI's DMA engine, or the
+SoC's I/O-clock or data-fabric power management. Neither is visible or
+controllable from Linux here. With back-to-back traffic the keepalive never
+fires, and its measured cost is about 1 µs or less.
+
+### 5. Scheduling
+
+Under defaults the poller is an unpinned SCHED_OTHER thread. Its scheduling
+gives millisecond maxima: 5.2 ms worst on 20,000 pings, and p99.9 around
+200 µs. The profile pins the poller to its own core at SCHED_FIFO 50 and steers
+the NHI's interrupts to another core. That removes them: the worst ping over
+20,000 was 26 µs. The `latency-performance` tuned profile on its own did
+nothing measurable.
+
+### Results: defaults and the low-latency profile
+
+The **low-latency profile** is `ctl_rx_poll=1` and `thunderbolt clx=0` from
+modprobe.d, then `tools/scripts/strix-verbs-latency-profile.sh apply` after
+bring-up, with the application pinned to a third core:
+
+| p50 / p99 (µs) | defaults | profile |
+|---|---|---|
+| ping 256 B, back-to-back | 15.7 / 20.0 | 11.7 / 12.5 |
+| ping 256 B, gap 200 µs | 43.5 / 50.7 | 11.4 / 13.2 |
+| ping 256 B, gap 1 ms | 63.4 / 239.7 | 13.3 / 16.0 |
+| exchange 10 KiB, back-to-back | 24.2 / 27.7 | 17.8 / 20.1 |
+| exchange 10 KiB, gap 200 µs | 43.6 / 67.1 | 18.6 / 54.2 |
+
+Both configurations passed the regression gates byte-for-byte, with no
+`bad_frames` and no QP errors.
+
+| Bulk, transfer-only MiB/s | Defaults | Profile |
+|---|---|---|
+| SEND 2000 ×5 | 1,046-1,085 (median 1,076) | 1,105-1,107 |
+| WRITE 2000 | 1,040 | 1,086-1,095 |
+| READ 2000 | 874 ×2, zero fallbacks | see table 2 |
+
+**The profile's caveat:** zero-copy READ degrades, to ~320 MiB/s with frequent
+fallbacks. TP uses SEND and WRITE.
+
+Before this round, by comparison: a 256 B round trip of 35.1 µs and a 10 KiB
+exchange of 167 µs, both back-to-back. Donnerkeule's published 64 B figure
+(perftest half round trip, IOMMU off) is 7.4 µs one-way, a ~15 µs round trip.
+Our own stream path's floor is 9.8 µs at 4 KiB.
+
+### Open
+
+- **Why polling hurts bulk under defaults, and READ in both configurations.**
+  Fixing this would let `ctl_rx_poll` become the default.
+- **The 10 KiB exchange's p99 after a gap (54 µs) with the profile.**
+- **What exactly goes cold in the transmit path.** A cheaper warm-up than a
+  frame every 20 µs may exist.

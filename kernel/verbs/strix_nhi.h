@@ -31,6 +31,7 @@
  * on hardware without a rebuild. Defined in main.c, consumed in ring.c. */
 extern unsigned int sn_data_throttle_ns;
 extern bool sn_ctl_e2e;
+extern bool sn_ctl_rx_poll;
 
 /* Zero-copy RDMA WRITE kill-switch (default on), defined in main.c and latched
  * into sn_device::zc_write by ring.c when the data plane comes up. */
@@ -79,6 +80,10 @@ struct sn_mr {
 };
 struct sn_cq {
 	struct ib_cq ib;
+	/* Guards entries/head/count/notify/failed. Completion takes it inside
+	 * d->lock; poll_cq takes only this, so a polling application never waits
+	 * for the poller's pass to finish (round nineteen). */
+	spinlock_t lock;
 	struct ib_wc entries[SN_MAX_CQE];
 	unsigned int head, count, notify;
 	bool failed;
@@ -184,6 +189,19 @@ struct sn_device {
 	 * Ring callbacks only set slot flags under ring_lock; never take lock. */
 	struct mutex lock;
 	spinlock_t ring_lock;
+	/* The control RX ring runs in the core's polling mode: its interrupt only
+	 * wakes a sleeping poller, and the poller reaps completed descriptors
+	 * itself (sn_ring_reap). Set from interrupt context when the core masks
+	 * the ring interrupt; the poller unmasks it before it sleeps. */
+	bool rx_poll_masked;
+	/* The current control RX ring was allocated in polling mode (ctl_rx_poll
+	 * at its start). tb_ring_poll() must never touch a callback-mode ring:
+	 * it would race the core's ring_work for the same frames. */
+	bool rx_polling;
+	/* keepalive_us: when the control TX ring last sent, and a pending request
+	 * for the engine to send one ignored SN_CREDIT (round nineteen). */
+	u64 last_tx_ns;
+	bool keepalive_due;
 	/* Resident poller: replaces the delayed_work whose dispatch latency
 	 * (ring_work then the work item) dominated receive latency.
 	 * poll_kick is the explicit wake latch: wait_event re-tests its
@@ -316,6 +334,7 @@ int sn_rings_stop(struct sn_device *d);
 void sn_peer_version_mismatch(struct sn_device *d, unsigned int version);
 void sn_ring_receive(struct sn_device *d);
 bool sn_ring_pending(struct sn_device *d);
+void sn_ring_poll_rearm(struct sn_device *d);
 void sn_data_receive(struct sn_device *d);
 dma_addr_t sn_mr_dma(struct sn_mr *m, u64 address, u32 *max_len);
 

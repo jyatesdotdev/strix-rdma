@@ -28,6 +28,16 @@ module_param(idle_spin_us, uint, 0644);
 MODULE_PARM_DESC(idle_spin_us,
 	"Microseconds the poller busy-polls while cold before sleeping (default 128)");
 
+/* Keepalive, a diagnostic (default 0, off): while a session is up and the
+ * poller is awake, send one SN_CREDIT -- which every receiver ignores -- once
+ * the control TX ring has been idle this many microseconds. Tests whether the
+ * ~20 us that the first frame after an idle gap costs comes from the transmit
+ * path going cold (round nineteen). */
+static unsigned int keepalive_us;
+module_param(keepalive_us, uint, 0644);
+MODULE_PARM_DESC(keepalive_us,
+	"Diagnostic: send an ignored control frame after this many us of TX idle while a session is up (default 0, off)");
+
 /* Defined here, consumed by sn_data_rings_start(). See strix_nhi.h for the
  * throughput/latency trade this dial controls. */
 unsigned int sn_data_throttle_ns = SN_DATA_THROTTLE_NS;
@@ -87,6 +97,19 @@ MODULE_PARM_DESC(zc_read,
  * twelve), and more than one active E2E ring pair was the suspect. A two-boot
  * A/B per arm found no difference (round seventeen), so leave it on.
  * Read-only: the rings are allocated once, at bring-up. */
+/* Control RX ring polling mode (round nineteen), part of the low-latency
+ * profile (tools/scripts/strix-verbs-latency-profile.sh). A spinning poller then
+ * reaps control frames straight from the descriptors instead of waiting for
+ * interrupt -> ring_work -> sn_ring_callback: the 256 B round trip falls from
+ * ~17 to ~12 us. Off by default because, without the profile's pinned FIFO
+ * poller, bulk zero-copy throughput drops 15-35%, and zero-copy READ falls back
+ * far more often in either configuration; the cause is not yet understood.
+ * Read-only: a ring's mode is fixed when it is allocated. */
+bool sn_ctl_rx_poll;
+module_param_named(ctl_rx_poll, sn_ctl_rx_poll, bool, 0444);
+MODULE_PARM_DESC(ctl_rx_poll,
+	"Poll the control RX ring instead of a callback per frame; low-latency profile (default off)");
+
 bool sn_ctl_e2e = true;
 module_param_named(ctl_e2e, sn_ctl_e2e, bool, 0444);
 MODULE_PARM_DESC(ctl_e2e,
@@ -334,6 +357,17 @@ static int sn_thread(void *arg)
 			/* No progress: fall through to the bounded cold path so a
 			 * pending hint the pass cannot act on does not pin the CPU. */
 		}
+		/* keepalive_us: the engine checks the QP is bound before sending. */
+		{
+			unsigned int ka = READ_ONCE(keepalive_us);
+
+			if (ka && sn_ready(&d->ready) && !READ_ONCE(d->keepalive_due) &&
+			    ktime_get_ns() - READ_ONCE(d->last_tx_ns) >= (u64)ka * 1000) {
+				WRITE_ONCE(d->keepalive_due, true);
+				WRITE_ONCE(d->poll_kick, true);
+				continue;
+			}
+		}
 		/* Cold: hold the CPU briefly so an imminent frame (a ping-pong
 		 * reply lands tens of microseconds away) is caught without a
 		 * sleep/wake round trip, then sleep on the 1 ms maintenance tick. */
@@ -346,6 +380,14 @@ static int sn_thread(void *arg)
 			if (!(idle & 31))
 				cond_resched();
 			udelay(1);
+			continue;
+		}
+		/* Polling mode: unmask the RX interrupt so the next frame wakes
+		 * us, then look once more -- a frame that completed before the
+		 * unmask is already in the ring and may raise nothing. */
+		sn_ring_poll_rearm(d);
+		if (sn_ring_pending(d)) {
+			idle = 0;
 			continue;
 		}
 		d->poll_sleeps++;

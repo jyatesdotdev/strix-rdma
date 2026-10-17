@@ -73,6 +73,7 @@ union ib_gid { u8 raw[16]; };
 struct sn_device {
 	struct sn_qp *qp;
 	struct sn_readiness ready;
+	bool keepalive_due; /* keepalive_us request (main.c) */
 	union ib_gid peer_gid;
 	u64 next_hello;
 	bool dead;
@@ -197,6 +198,7 @@ unsigned int sn_zc_read_fault;
 unsigned int sn_zc_send_fault;
 unsigned int sn_ack_drop;
 #define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
+#define WRITE_ONCE(x, v) (*(volatile __typeof__(x) *)&(x) = (v))
 #include "../verbs/protocol.c"
 /* Modeled zero-copy data plane: one burst copies payload from an explicit source
  * MR straight into the peer's expected-burst landing zone and feeds the engine's

@@ -24,6 +24,20 @@ continue. Evidence and background live in the linked docs.
 
 ## Needs a design decision
 
+- [ ] **Low-latency profile as the default for TP deployments?** With it, a
+  256 B round trip is 11-13 µs even after idle gaps (16-63 µs under defaults),
+  and a 10 KiB exchange is ~18 µs. Zero-copy SEND/WRITE run at ~1.1 GB/s. The
+  costs:
+  - zero-copy READ degrades (~320 MiB/s)
+  - one core spins per host, with a pinned FIFO poller
+  - a 20 µs keepalive frame flows while a session is up
+
+  `docs/ZEROCOPY_VERBS.md`, round nineteen.
+- [ ] **Make `ctl_rx_poll` safe as a default.** Polling the control RX ring cuts
+  ~5 µs per round trip. Under the default scheduler it costs 15-35% of bulk
+  throughput, and it raises zero-copy READ fallbacks in every configuration.
+  The cause is not understood.
+
 - [ ] **Bulk data on both NHI ring pairs.** The Strix Halo NHI has two usable
   DMA ring pairs, and one ring tops out near 10 Gbit/s per direction. Two rings
   in parallel carried ~19 Gbit/s (`docs/ZEROCOPY_VERBS.md`, round eighteen).

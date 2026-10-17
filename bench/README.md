@@ -142,9 +142,9 @@ scripts/verbs-streak.sh 1 20 read 2000     # stop at the first failure
 scripts/verbs-streak.sh 1 5 write 2000
 scripts/verbs-streak.sh 1 5 send 2000      # verified bulk SEND/RECV
 scripts/verbs-streak.sh 1 5 send           # the SEND/RECV smoke
-SMOKE_FLAGS='--len 10240' scripts/run-verbs-smoke.sh exchange 20000
-                                            # TP-shaped swap, both sides at once; percentiles
-SMOKE_FLAGS='--len 256' scripts/run-verbs-smoke.sh ping 20000   # round trip; percentiles
+SMOKE_FLAGS='--len 10240 --gap-us 200' scripts/run-verbs-smoke.sh exchange 20000
+                                            # TP-shaped swap after a 200 us idle gap; percentiles
+scripts/verbs-latency.sh                   # exchange + ping, sizes x gaps (SIZES, GAPS, MODES)
 SMOKE_FLAGS=--gpu scripts/verbs-streak.sh 1 5 write 2000   # all buffers in GPU memory
 SMOKE_FLAGS='--len 3000 --off 64' XFER_LEN=3000 scripts/verbs-streak.sh 1 1 send 200
                                             # small/unaligned: the staged path
@@ -155,6 +155,15 @@ SMOKE_ENV='STRIX_GPU_HOT=1' \
 scripts/verbs-e2e-ab.sh B /tmp/ab-B1       # reboots both hosts into one arm of the
 scripts/verbs-e2e-ab.sh A /tmp/ab-A1       #   control-ring E2E A/B; end with arm A
 ```
+
+For latency, the rows with an idle gap are the ones that predict tensor
+parallelism, which computes between exchanges. A hot, back-to-back loop hides a
+transmit path that goes cold within ~50 µs (`../docs/ZEROCOPY_VERBS.md`, round
+nineteen). The low-latency profile is two modprobe.d options
+(`strix_nhi ctl_rx_poll=1`, `thunderbolt clx=0`) plus
+`../tools/scripts/strix-verbs-latency-profile.sh apply` on both hosts, with the
+application pinned elsewhere (`SMOKE_PREFIX='taskset -c 6'`). It trades
+zero-copy READ throughput for latency.
 
 `verbs-e2e-ab.sh` reboots both hosts and runs bring-up itself (BRINGUP is the
 script's path on the hosts). It reads `ctl_e2e` back and stops if the arm is

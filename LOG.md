@@ -1,6 +1,36 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-16 — latency for TP: 256 B round trip 35 -> 16 us by default, ~12 us in the low-latency profile
+- **Measure what TP does.** `strix-verbs-smoke` gained an `exchange` mode (both
+  sides send at once, sequence-tagged), `--len` for ping, idle gaps
+  (`--gap-us`, `--gap-spin`) and p50 through p99.9.
+  `bench/scripts/verbs-latency.sh` sweeps sizes × gaps.
+- **Frame CRC:** bit-serial CRC-32C cost ~25 µs per 4 KiB frame on both send
+  and receive. It now uses the kernel's accelerated `crc32c()` (same value, wire
+  unchanged, checked against the reference at load). A 10 KiB exchange went
+  from 167 to 26 µs.
+- **Control RX polling (`ctl_rx_poll`, opt-in):** the poller reaps descriptors
+  itself, with no interrupt → workqueue → callback. Round trip ~17 → ~12 µs.
+  Off by default: under the default scheduler it costs 15-35% of bulk
+  throughput and raises zero-copy READ fallbacks.
+- **The transmit path goes cold within ~50 µs of idle:** the first frame after
+  a gap took ~20 µs longer, which is not CLx, not E2E, not a sleeping poller and
+  not the app's CPU. `keepalive_us=20` (one ignored `SN_CREDIT` while idle)
+  removes it: ping after a 200 µs gap went from 39 to 13 µs.
+- **CQ** got its own lock and a lock-free empty poll. **`SN_CREDIT`** is sent
+  once per binding (receivers ignore it). Neither moved the median measurably.
+- **Low-latency profile:**
+  - `tools/scripts/strix-verbs-latency-profile.sh`: pinned FIFO poller, steered
+    IRQs, 2 ms spin, 20 µs keepalive
+  - plus `ctl_rx_poll=1` and `clx=0`
+
+  Ping 11.4-13.3 µs p50 at gaps of 0, 200 µs and 1 ms. 10 KiB exchange 17.8-18.6
+  µs. SEND/WRITE ~1.1 GB/s. READ degrades.
+- **Defaults** (callback mode): ping 15.7 µs, 10 KiB exchange 24.2 µs, SEND
+  median 1,076 MiB/s, WRITE 1,040, READ 874 with zero fallbacks. All gates
+  pass in both configurations.
+
 ## 2026-10-15 — BIOS 3.06 on both hosts; throughput ceiling is per DMA ring
 - **Firmware.** Both hosts were on mismatched firmware for every measurement so
   far: max on BIOS 3.05 / EC 3.0.5, max2 on 3.04 / 3.0.4. Both now run BIOS

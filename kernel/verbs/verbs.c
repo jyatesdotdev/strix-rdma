@@ -26,15 +26,18 @@ int sn_complete(struct sn_qp *q, struct sn_wqe *w, bool receive,
 {
 	struct sn_cq *cq = sn_cq(receive ? q->ib.recv_cq : q->ib.send_cq);
 	struct ib_wc *wc;
+	unsigned long flags;
 	bool notify;
 
 	lockdep_assert_held(&sn_dev(q->ib.device)->lock);
 	if (!receive && status == IB_WC_SUCCESS && !q->all_signaled &&
 	    !(w->flags & IB_SEND_SIGNALED))
 		return 0;
-	if (cq->failed) return -ENOSPC;
+	spin_lock_irqsave(&cq->lock, flags);
+	if (cq->failed) { spin_unlock_irqrestore(&cq->lock, flags); return -ENOSPC; }
 	if (cq->count == cq->ib.cqe) {
-		cq->failed = true;
+		WRITE_ONCE(cq->failed, true);
+		spin_unlock_irqrestore(&cq->lock, flags);
 		sn_event(&cq->ib, IB_EVENT_CQ_ERR);
 		return -ENOSPC;
 	}
@@ -46,14 +49,16 @@ int sn_complete(struct sn_qp *q, struct sn_wqe *w, bool receive,
 	wc->opcode = receive ? IB_WC_RECV : w->opcode == SN_READ ? IB_WC_RDMA_READ :
 		     w->opcode == SN_WRITE ? IB_WC_RDMA_WRITE : IB_WC_SEND;
 	wc->byte_len = length;
-	cq->count++;
-	/* d->lock orders completed placement before CQ publication/polling. */
+	/* d->lock orders completed placement before CQ publication; cq->lock
+	 * orders the entry before the count a lockless poll_cq reads. */
+	WRITE_ONCE(cq->count, cq->count + 1);
 	notify = cq->notify == IB_CQ_NEXT_COMP ||
 		 (cq->notify && status != IB_WC_SUCCESS);
-	if (notify) {
+	if (notify)
 		cq->notify = 0;
-		if (cq->ib.comp_handler) cq->ib.comp_handler(&cq->ib, cq->ib.cq_context);
-	}
+	spin_unlock_irqrestore(&cq->lock, flags);
+	if (notify && cq->ib.comp_handler)
+		cq->ib.comp_handler(&cq->ib, cq->ib.cq_context);
 	return 0;
 }
 static void sn_flush_qp(struct sn_qp *q, enum ib_wc_status status, bool notify)
@@ -202,6 +207,7 @@ static int sn_create_cq(struct ib_cq *ib, const struct ib_cq_init_attr *a,
 
 	if (!udata || a->flags || udata->inlen || udata->outlen) return -EOPNOTSUPP;
 	if (a->cqe < 1 || a->cqe > SN_MAX_CQE || a->comp_vector) return -EINVAL;
+	spin_lock_init(&sn_cq(ib)->lock);
 	mutex_lock(&d->lock);
 	if (d->dead) ret = -ENODEV;
 	else if (d->cq_count == 2) ret = -ENOMEM;
@@ -217,36 +223,42 @@ static int sn_destroy_cq(struct ib_cq *ib, struct ib_udata *udata)
 }
 static int sn_poll_cq(struct ib_cq *ib, int n, struct ib_wc *wc)
 {
-	struct sn_device *d = sn_dev(ib->device);
 	struct sn_cq *cq = sn_cq(ib);
 	int i = 0;
 
+	unsigned long flags;
+
 	if (n < 0) return -EINVAL;
-	mutex_lock(&d->lock);
+	/* Busy-polling applications mostly find the CQ empty: answer that
+	 * without any lock. A completion published just after this read is
+	 * returned by the next poll. */
+	if (!READ_ONCE(cq->count) && !READ_ONCE(cq->failed)) return 0;
+	spin_lock_irqsave(&cq->lock, flags);
 	while (i < n && cq->count) {
 		wc[i++] = cq->entries[cq->head];
-		cq->head = (cq->head + 1) % ib->cqe; cq->count--;
+		cq->head = (cq->head + 1) % ib->cqe;
+		WRITE_ONCE(cq->count, cq->count - 1);
 	}
 	if (!i && cq->failed) i = -EIO;
-	mutex_unlock(&d->lock);
+	spin_unlock_irqrestore(&cq->lock, flags);
 	return i;
 }
 static int sn_notify_cq(struct ib_cq *ib, enum ib_cq_notify_flags flags)
 {
-	struct sn_device *d = sn_dev(ib->device);
 	struct sn_cq *cq = sn_cq(ib);
 	int notify = flags & IB_CQ_SOLICITED_MASK, ret;
+	unsigned long irq;
 
 	if ((flags & ~(IB_CQ_SOLICITED_MASK | IB_CQ_REPORT_MISSED_EVENTS)) ||
 	    (notify != IB_CQ_NEXT_COMP && notify != IB_CQ_SOLICITED)) return -EINVAL;
-	mutex_lock(&d->lock);
+	spin_lock_irqsave(&cq->lock, irq);
 	if (cq->failed) ret = -EIO;
 	else {
 		/* Re-arming with SOLICITED cannot weaken an outstanding NEXT arm. */
 		if (cq->notify != IB_CQ_NEXT_COMP) cq->notify = notify;
 		ret = !!((flags & IB_CQ_REPORT_MISSED_EVENTS) && cq->count);
 	}
-	mutex_unlock(&d->lock);
+	spin_unlock_irqrestore(&cq->lock, irq);
 	return ret;
 }
 static int sn_create_qp(struct ib_qp *ib, struct ib_qp_init_attr *a, struct ib_udata *udata)
@@ -291,14 +303,18 @@ free:
 static void sn_cq_remove_qp(struct sn_cq *cq, struct ib_qp *qp)
 {
 	struct ib_qp *identity = sn_wc_qp(sn_dev(cq->ib.device), qp->qp_num);
-	unsigned int i, count = cq->count, kept = 0;
+	unsigned int i, count, kept = 0;
+	unsigned long flags;
 
+	spin_lock_irqsave(&cq->lock, flags);
+	count = cq->count;
 	/* Only one QP exists at a time, so the identity selects its CQEs. */
 	for (i = 0; i < count; i++) {
 		struct ib_wc wc = cq->entries[(cq->head + i) % cq->ib.cqe];
 		if (wc.qp != identity) cq->entries[(cq->head + kept++) % cq->ib.cqe] = wc;
 	}
-	cq->count = kept;
+	WRITE_ONCE(cq->count, kept);
+	spin_unlock_irqrestore(&cq->lock, flags);
 }
 static int sn_destroy_qp(struct ib_qp *ib, struct ib_udata *udata)
 {

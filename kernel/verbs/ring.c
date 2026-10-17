@@ -26,6 +26,52 @@ static bool sn_slot_done(struct sn_device *d, struct sn_slot *s)
 	spin_unlock_irqrestore(&d->ring_lock, flags);
 	return done;
 }
+/* Control RX ring polling mode (round nineteen). Instead of scheduling
+ * ring_work, which then calls sn_ring_callback() per frame, the core masks the
+ * ring interrupt and calls this in interrupt context; the completed frames stay
+ * in the descriptors until sn_ring_reap() takes them. A spinning poller so
+ * harvests a frame as soon as its descriptor completes, without the interrupt
+ * -> workqueue -> callback hop (about 2-3 us per frame, measured), and the
+ * interrupt only matters for waking a poller that sleeps. */
+static void sn_rx_start_poll(void *data)
+{
+	struct sn_device *d = data;
+
+	WRITE_ONCE(d->rx_poll_masked, true);
+	sn_schedule(d);
+}
+/* Take every completed control RX descriptor and mark its slot done, exactly
+ * as sn_ring_callback() would. Runs only in the poller thread, which alone
+ * starts and stops the rings, so the ring cannot go away underneath it; frames
+ * still in flight at a ring stop are cancelled through the callback as before. */
+static void sn_ring_reap(struct sn_device *d)
+{
+	struct ring_frame *f;
+
+	if (!READ_ONCE(d->rings_started) || !d->rx_ring || !d->rx_polling)
+		return;
+	while ((f = tb_ring_poll(d->rx_ring))) {
+		struct sn_slot *s = container_of(f, struct sn_slot, frame);
+		unsigned long flags;
+
+		spin_lock_irqsave(&d->ring_lock, flags);
+		s->canceled = false;
+		s->done = true;
+		spin_unlock_irqrestore(&d->ring_lock, flags);
+	}
+}
+/* Before the poller sleeps: unmask the RX interrupt so the next frame wakes
+ * it. The flag is cleared first, so an interrupt right after the unmask
+ * re-arms it. The caller then checks once more for frames that completed
+ * before the unmask. */
+void sn_ring_poll_rearm(struct sn_device *d)
+{
+	if (!READ_ONCE(d->rings_started) || !d->rx_ring || !d->rx_polling ||
+	    !READ_ONCE(d->rx_poll_masked))
+		return;
+	WRITE_ONCE(d->rx_poll_masked, false);
+	tb_ring_poll_complete(d->rx_ring);
+}
 /* Advisory scheduling hint only, so it must be lock-free. The poller peeks
  * roughly once per microsecond while cold; taking ring_lock that often
  * contends with the ring callback that sets the flag, and measurably slows
@@ -42,6 +88,7 @@ bool sn_ring_pending(struct sn_device *d)
 {
 	if (!READ_ONCE(d->rings_started))
 		return false;
+	sn_ring_reap(d);
 	/* Only RX completions are latency-critical pending work. A completed TX
 	 * slot is bookkeeping: the send path reaps it before it needs the space.
 	 * Treating it as pending would pin the poller between sends. */
@@ -178,8 +225,11 @@ int sn_rings_start(struct sn_device *d)
 	d->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, SN_RING_SIZE, flags);
 	if (!d->tx_ring)
 		return -ENOMEM;
+	d->rx_poll_masked = false;
+	d->rx_polling = sn_ctl_rx_poll;
 	d->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, SN_RING_SIZE, flags,
-		d->tx_ring->hop, BIT(1), BIT(2), NULL, NULL);
+		d->tx_ring->hop, BIT(1), BIT(2),
+		d->rx_polling ? sn_rx_start_poll : NULL, d);
 	if (!d->rx_ring) {
 		ret = -ENOMEM;
 		goto fail;
@@ -306,7 +356,10 @@ int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *payload, 
 	s->canceled = false;
 	dma_wmb();
 	ret = tb_ring_tx(d->tx_ring, &s->frame);
-	if (!ret) { d->tx_head++; d->tx_frames++; }
+	if (!ret) {
+		d->tx_head++; d->tx_frames++;
+		WRITE_ONCE(d->last_tx_ns, ktime_get_ns());
+	}
 	return ret;
 }
 void sn_ring_receive(struct sn_device *d)
@@ -316,6 +369,7 @@ void sn_ring_receive(struct sn_device *d)
 	lockdep_assert_held(&d->lock);
 	if (!d->rings_started || d->dead)
 		return;
+	sn_ring_reap(d);
 	for (i = 0; i < SN_RING_SIZE; i++) {
 		struct sn_slot *s = &d->rx[d->rx_tail % SN_RING_SIZE];
 
