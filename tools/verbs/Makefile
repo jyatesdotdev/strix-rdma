@@ -5,7 +5,7 @@ CPPFLAGS ?=
 LDLIBS ?= -libverbs -ldl
 # Explicit Linux-only opt-in build; root make/check do not build this tool.
 OUTPUT ?= strix-verbs-smoke
-.PHONY: all check clean gpu-kernels
+.PHONY: all check clean gpu-kernels gpu-sync-bench
 all: $(OUTPUT)
 $(OUTPUT): strix-verbs-smoke.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror $< $(LDFLAGS) $(LDLIBS) -o $@
@@ -16,5 +16,9 @@ GPU_ARCH ?= gfx1151
 gpu-kernels: strix-verbs-gpu-kernels.hsaco
 strix-verbs-gpu-kernels.hsaco: strix-verbs-gpu-kernels.hip
 	hipcc --genco --offload-arch=$(GPU_ARCH) -O2 $< -o $@
+# Opt-in single-host benchmark of the GPU side of a TP exchange (needs hipcc).
+gpu-sync-bench: strix-gpu-sync-bench
+strix-gpu-sync-bench: strix-gpu-sync-bench.hip
+	hipcc --offload-arch=$(GPU_ARCH) -O2 -Wall $< -o $@
 clean:
-	rm -f -- "$(OUTPUT)" strix-verbs-gpu-kernels.hsaco
+	rm -f -- "$(OUTPUT)" strix-verbs-gpu-kernels.hsaco strix-gpu-sync-bench

@@ -116,7 +116,10 @@ while it is registered.
 **Latency (2026-10-16).** GPU MRs measured at least as fast as CPU memory on
 the TP-sized exchange: 10 KiB in 22.0 µs p50 by default and 15.8 µs with the
 low-latency profile (`docs/ZEROCOPY_VERBS.md`, round nineteen). The application's
-own GPU synchronization per exchange comes on top of that.
+own GPU synchronization per exchange comes on top of that: ~11-15 µs with
+launch-and-sync, ~3-6 µs with kernels queued behind stream wait/write values,
+~1.4 µs with a resident kernel polling host memory
+(`tools/verbs/strix-gpu-sync-bench.hip`).
 
 ## Coherency contract (the application's job)
 

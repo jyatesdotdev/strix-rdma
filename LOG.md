@@ -1,6 +1,22 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-17 — GPU-direct keeps the TP latency; the GPU's own hand-off costs 1.4-15 µs per exchange
+- **GPU MRs were faster than CPU memory at every TP size.** 10 KiB exchange:
+  22.0 µs p50 by default, 15.8 with the profile; after a 200 µs gap, 16.2 with
+  a p99 of 18.5. GPU zero-copy WRITE/SEND reached 1.31-1.34 GB/s.
+- **`strix-gpu-sync-bench`** times the GPU side of an exchange, with a 10 KiB
+  write and system-scope release:
+  - launch + stream sync: 7.65 µs
+  - in-kernel flag: 3.98 µs
+  - kernel pre-queued behind `hipStreamWaitValue32`: 3.05 µs
+  - persistent kernel polling host memory: **1.37 µs** round trip
+  - host staging by `hipMemcpy`: 7.4-7.5 µs each way
+- **Per decode step at ~96 exchanges:** launch-and-sync costs ~1.1-1.4 ms of
+  GPU hand-off; a resident kernel ~0.13 ms.
+- **gfx1151 pitfall:** a `__syncthreads()` after a loop that only thread 0 runs
+  deadlocks.
+
 ## 2026-10-16 — latency for TP: 256 B round trip 35 -> 16 us by default, ~12 us in the low-latency profile
 - **Measure what TP does.** `strix-verbs-smoke` gained an `exchange` mode (both
   sides send at once, sequence-tagged), `--len` for ping, idle gaps

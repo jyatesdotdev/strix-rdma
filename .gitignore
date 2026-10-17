@@ -26,6 +26,7 @@ tools/rocm-map/tbstream-hip-map
 tools/rocm-map/tbstream-hip-zc
 tools/dmabuf-probe/tbstream-dmabuf-probe
 tools/verbs/strix-verbs-smoke
+tools/verbs/strix-gpu-sync-bench
 
 # Local agent goal/session state
 .pi/

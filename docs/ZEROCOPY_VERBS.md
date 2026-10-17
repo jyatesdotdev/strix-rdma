@@ -1834,7 +1834,46 @@ each exchange, as with any transport:
   (`docs/GPU_DIRECT_VERBS.md`), and the CPU learning that the kernel finished
 - after the receive, a kernel that reads the data
 
-That cost is not measured here.
+`tools/verbs/strix-gpu-sync-bench.hip` (`make -C tools/verbs gpu-sync-bench`)
+times those hand-offs on one host. Every kernel writes 10 KiB and releases it
+at system scope. 20,000 iterations, p50 / p99 in µs, on max (max2 within
+0.1 µs):
+
+| Hand-off | p50 | p99 |
+|---|---|---|
+| launch + `hipStreamSynchronize` (the usual pattern) | 7.65 | 8.04 |
+| launch an empty kernel + sync (the runtime's floor) | 7.15 | 7.53 |
+| launch + `hipEventSynchronize` | 7.36 | 9.34 |
+| launch, CPU spins on a `hipStreamWriteValue32` flag | 5.93 | 6.27 |
+| launch, CPU spins on a flag stored by the kernel | 3.98 | 4.27 |
+| kernel pre-queued behind `hipStreamWaitValue32`: CPU flag → done flag | 3.05 | 3.32 |
+| **persistent kernel polling host memory: CPU flag → produce → done flag** | **1.37** | **1.63** |
+| for comparison, host staging: `hipMemcpyAsync` 10 KiB D2H / H2D + sync | 7.45 / 7.40 | 7.84 / 7.80 |
+
+`hipDeviceScheduleSpin` made no difference; the runtime already spins on
+waits this short.
+
+Per exchange, these hand-offs cost roughly:
+
+- **launch-and-sync:** ~11-15 µs (a sync before the send, a launch after the
+  receive), comparable to the 16 µs GPU-buffer transport itself
+- **kernels queued ahead behind stream wait/write values:** ~3-6 µs
+- **a resident kernel:** ~1.4 µs, which with the profile's transport makes
+  ~17.5 µs per exchange
+
+Staging through host memory instead would add ~15 µs of copies on top of the
+syncs. At ~96 exchanges per decode step, the choice is worth about 1 ms per
+token.
+
+Two pitfalls found while writing it, both on gfx1151:
+
+- **A barrier after a loop that only some threads run deadlocks.** Thread 0
+  polled while the rest waited at `__syncthreads()`, and the kernel stopped
+  after the first `go`. Every thread now polls.
+- **The CPU→GPU flag itself is fine.** A system-scope atomic load of
+  `hipHostMallocCoherent` memory sees the CPU's store with no flush. So do a
+  fetch-add of 0 and a `glc slc dlc` load (`--poll`), within 0.4 µs of each
+  other.
 
 ### Open
 
