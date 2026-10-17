@@ -15,6 +15,7 @@
 #   TOOL_DIR=~/strix-rdma/tools/verbs   built strix-verbs-smoke on both hosts
 #   SMOKE_FLAGS=--gpu    flags placed before --live (e.g. GPU-memory buffers)
 #   SMOKE_ENV='A=1 B=2'  environment for the remote tool (e.g. STRIX_GPU_NO_ACQUIRE=1)
+#   SMOKE_PREFIX='taskset -c 6'  command the remote tool runs under (e.g. CPU pinning)
 #
 # Prints the connector's tail, then the listener's log, and exits with the
 # connector's status. The listener log stays on LISTEN at $LISTEN_LOG.
@@ -33,8 +34,8 @@ SSH=(ssh -o BatchMode=yes)
 smoke() { # host role
     local user
     user=$("${SSH[@]}" "$1" id -un)
-    printf "sudo sh -c 'ulimit -l unlimited; exec sudo -u %s sh -c \"cd %s && exec env %s ./strix-verbs-smoke %s --live %s %s %s %s %s\"'" \
-        "$user" "$TOOL_DIR" "${SMOKE_ENV:-}" "${SMOKE_FLAGS:-}" "$DEV" "$2" "$LISTEN_IP" "$PORT" "$MODE"
+    printf "sudo sh -c 'ulimit -l unlimited; exec sudo -u %s sh -c \"cd %s && exec env %s %s ./strix-verbs-smoke %s --live %s %s %s %s %s\"'" \
+        "$user" "$TOOL_DIR" "${SMOKE_ENV:-}" "${SMOKE_PREFIX:-}" "${SMOKE_FLAGS:-}" "$DEV" "$2" "$LISTEN_IP" "$PORT" "$MODE"
 }
 
 listen_cmd=$(smoke "$LISTEN" listen)

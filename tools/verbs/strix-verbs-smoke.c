@@ -55,6 +55,13 @@ static unsigned recv_off;
 static bool recv_off_set;
 /* --len given explicitly; ping/exchange default to 256 B otherwise. */
 static bool len_given;
+/* --gap-us N: idle this long between ping/exchange iterations. Real tensor
+ * parallelism computes between exchanges (on the order of 100-300 us per layer),
+ * so the driver's poller has gone cold by the next one; back-to-back
+ * iterations only measure a hot poller. */
+static unsigned gap_us;
+/* --gap-spin: busy-wait the gap instead of sleeping, so this CPU stays awake. */
+static bool gap_spin;
 /* --linger-ms N: stay idle (connection up, no traffic) for N ms after the last
  * transfer, so the recovery paths that only run while a connection idles -- a
  * lost READ_ACK answered by SN_READ_PROBE -- can be exercised. */
@@ -254,6 +261,19 @@ static int64_t nanoseconds(void)
 	struct timespec ts;
 	require(!clock_gettime(CLOCK_MONOTONIC, &ts), "clock_gettime");
 	return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+static void idle_gap(void)
+{
+	struct timespec ts = { .tv_sec = gap_us / 1000000, .tv_nsec = (long)(gap_us % 1000000) * 1000 };
+
+	if (gap_us && gap_spin) {
+		int64_t until = nanoseconds() + (int64_t)gap_us * 1000;
+
+		while (nanoseconds() < until)
+			;
+	} else if (gap_us) {
+		require(!nanosleep(&ts, NULL), "gap");
+	}
 }
 static int compare_i64(const void *a, const void *b)
 {
@@ -543,6 +563,12 @@ int main(int argc, char **argv)
 		} else if (argc >= 3 && !strcmp(argv[1], "--gpu-kernels")) {
 			gpu = true; gpu_kernels = argv[2];
 			argv[2] = argv[0]; argv += 2; argc -= 2;
+		} else if (!strcmp(argv[1], "--gap-spin")) {
+			gap_spin = true;
+			argv[1] = argv[0]; argv++; argc--;
+		} else if (argc >= 3 && !strcmp(argv[1], "--gap-us")) {
+			{ char *end = NULL; unsigned long v = strtoul(argv[2], &end, 10); require(end && !*end && v <= 1000000, "--gap-us 0..1000000"); gap_us = (unsigned)v; }
+			argv[2] = argv[0]; argv += 2; argc -= 2;
 		} else if (argc >= 3 && !strcmp(argv[1], "--linger-ms")) {
 			linger_ms = iterations(argv[2], 60000, "--linger-ms 1..60000");
 			argv[2] = argv[0]; argv += 2; argc -= 2;
@@ -567,7 +593,7 @@ int main(int argc, char **argv)
 		"--off/--recv-off + --len must fit one 2 MiB slot");
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | exchange [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] [--linger-ms N] --live ... send|write|read iters\n       %s [--len N] --live ... ping|exchange iters   (message size, default 256 B; percentiles)\n", argv[0], argv[0], argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | exchange [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] [--linger-ms N] --live ... send|write|read iters\n       %s [--len N] [--gap-us N] --live ... ping|exchange iters   (message size, default 256 B; idle gap between iterations; percentiles)\n", argv[0], argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	if (argc >= 7 && !strcmp(argv[6], "ping")) {
@@ -679,6 +705,7 @@ int main(int argc, char **argv)
 		for (unsigned it = 0; it < exchange_iters; it++) {
 			int64_t start, deadline = milliseconds() + TIMEOUT_MS;
 
+			idle_gap();
 			if (tag) { uint64_t v = it; memcpy(tx, &v, sizeof(v)); }
 			start = nanoseconds();
 			verb(ibv_post_send(qp, &sw, &sbad), "exchange post send");
@@ -708,6 +735,7 @@ int main(int argc, char **argv)
 			samples[it] = nanoseconds() - start;
 		}
 		barrier(fd, 2); /* both finished */
+		if (gap_us) printf("gap: %u us idle before each iteration\n", gap_us);
 		report_latency("exchange", samples, exchange_iters, msg_len, argv[3]);
 		free(samples);
 		goto done;
@@ -750,6 +778,7 @@ int main(int argc, char **argv)
 				}
 			} else {
 				verb(ibv_post_recv(qp, &rw, &rbad), "ping post receive");
+				idle_gap();
 				int64_t start = nanoseconds();
 				verb(ibv_post_send(qp, &sw, &sbad), "ping post send");
 				bool got_echo = false, sent = false;
