@@ -53,6 +53,8 @@ static unsigned xfer_len = CHUNK, xfer_off;
  * buffers 16 bytes past a page). Defaults to --off. */
 static unsigned recv_off;
 static bool recv_off_set;
+/* --len given explicitly; ping/exchange default to 256 B otherwise. */
+static bool len_given;
 /* --linger-ms N: stay idle (connection up, no traffic) for N ms after the last
  * transfer, so the recovery paths that only run while a connection idles -- a
  * lost READ_ACK answered by SN_READ_PROBE -- can be exercised. */
@@ -246,6 +248,37 @@ static int64_t microseconds(void)
 	struct timespec ts;
 	require(!clock_gettime(CLOCK_MONOTONIC, &ts), "clock_gettime");
 	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+static int64_t nanoseconds(void)
+{
+	struct timespec ts;
+	require(!clock_gettime(CLOCK_MONOTONIC, &ts), "clock_gettime");
+	return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+static int compare_i64(const void *a, const void *b)
+{
+	int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+
+	return (x > y) - (x < y);
+}
+/* Nearest-rank percentiles over the samples. With 1000 or more, the first 100
+ * are excluded: they warm caches, page tables and the peer's poller, and would
+ * otherwise own the p99.9. Sorts the samples in place. */
+static void report_latency(const char *mode, int64_t *samples, unsigned n,
+			   unsigned len, const char *side)
+{
+	unsigned skip = n >= 1000 ? 100 : 0, m = n - skip;
+	int64_t *s = samples + skip;
+	double sum = 0;
+
+	qsort(s, m, sizeof(*s), compare_i64);
+	for (unsigned i = 0; i < m; i++)
+		sum += (double)s[i];
+#define PCT(p) ((double)s[(size_t)((p) * (double)(m - 1))] / 1000.0)
+	printf("LATENCY %s %u x %u B (%s, first %u excluded): min %.2f avg %.2f p50 %.2f p90 %.2f p99 %.2f p99.9 %.2f max %.2f us\n",
+	       mode, m, len, side, skip, (double)s[0] / 1000.0, sum / m / 1000.0,
+	       PCT(0.50), PCT(0.90), PCT(0.99), PCT(0.999), (double)s[m - 1] / 1000.0);
+#undef PCT
 }
 static void wait_fd(int fd, short events, int64_t deadline)
 {
@@ -500,7 +533,7 @@ int main(int argc, char **argv)
 		.cap = { .max_send_wr = WINDOW, .max_recv_wr = WINDOW, .max_send_sge = 1, .max_recv_sge = 1 } };
 	unsigned char mine[META_SIZE], theirs[META_SIZE];
 	unsigned long long expected = 0;
-	unsigned bench_iters = 0, ping_iters = 0, rdma_iters = 0, send_iters = 0;
+	unsigned bench_iters = 0, ping_iters = 0, rdma_iters = 0, send_iters = 0, exchange_iters = 0;
 	int count, fd; bool listening, rdma_read = false;
 	if (argc == 2 && !strcmp(argv[1], "--selftest")) { selftest(); return 0; }
 	while (argc >= 2 && strcmp(argv[1], "--live")) {
@@ -520,6 +553,7 @@ int main(int argc, char **argv)
 			argv[2] = argv[0]; argv += 2; argc -= 2;
 		} else if (argc >= 3 && !strcmp(argv[1], "--len")) {
 			xfer_len = iterations(argv[2], CHUNK, "--len 1..2097152");
+			len_given = true;
 			argv[2] = argv[0]; argv += 2; argc -= 2;
 		} else if (argc >= 3 && !strcmp(argv[1], "--off")) {
 			char *end = NULL; unsigned long v = strtoul(argv[2], &end, 10);
@@ -533,12 +567,15 @@ int main(int argc, char **argv)
 		"--off/--recv-off + --len must fit one 2 MiB slot");
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] [--linger-ms N] --live ... send|write|read iters\n", argv[0], argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | exchange [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] [--linger-ms N] --live ... send|write|read iters\n       %s [--len N] --live ... ping|exchange iters   (message size, default 256 B; percentiles)\n", argv[0], argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	if (argc >= 7 && !strcmp(argv[6], "ping")) {
 		if (argc == 8) ping_iters = iterations(argv[7], 1000000, "ping iteration count");
 		else ping_iters = 1000;
+	} else if (argc >= 7 && !strcmp(argv[6], "exchange")) {
+		if (argc == 8) exchange_iters = iterations(argv[7], 1000000, "exchange iteration count");
+		else exchange_iters = 1000;
 	} else if (argc >= 7 && !strcmp(argv[6], "send")) {
 		if (argc == 8) send_iters = iterations(argv[7], 100000, "SEND iteration count");
 		else send_iters = 4;
@@ -619,13 +656,72 @@ int main(int argc, char **argv)
 	verb(ibv_query_qp(qp, &attr, IBV_QP_STATE|IBV_QP_SQ_PSN|IBV_QP_RQ_PSN|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_MAX_QP_RD_ATOMIC|IBV_QP_MAX_DEST_RD_ATOMIC, &init), "query accepted QP attrs");
 	require(attr.qp_state == IBV_QPS_RTS && attr.sq_psn == local.psn && attr.rq_psn == peer.psn &&
 		attr.timeout == 14 && attr.retry_cnt == 3 && attr.rnr_retry == 3 && attr.max_rd_atomic == 1 && attr.max_dest_rd_atomic == 1, "preserved QP attributes");
-	if (ping_iters) { /* Small-message (256 B, staged path) ping-pong RTT. */
-		struct ibv_sge rs = { .addr = (uintptr_t)rx, .length = 256, .lkey = rx_mr->lkey };
-		struct ibv_sge ss = { .addr = (uintptr_t)tx, .length = 256, .lkey = tx_mr->lkey };
+	if (exchange_iters) { /* TP-shaped swap: both sides send msg_len and wait for the peer's. */
+		unsigned msg_len = len_given ? xfer_len : 256;
+		bool tag = !gpu && msg_len >= 8; /* sequence tag: catches loss or reordering */
+		int64_t *samples = calloc(exchange_iters, sizeof(*samples));
+		struct ibv_sge rs[2], ss = { .addr = (uintptr_t)tx, .length = msg_len, .lkey = tx_mr->lkey };
+		struct ibv_recv_wr rw[2], *rbad = NULL;
+		struct ibv_send_wr sw = { .wr_id = 2, .sg_list = &ss, .num_sge = 1,
+			.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED }, *sbad = NULL;
+		unsigned long long recvs = 0, sends = 0;
+
+		require(samples != NULL, "exchange sample buffer");
+		/* The peer finishes an iteration only after receiving ours, so it is
+		 * at most one message ahead: two receives, re-armed on every
+		 * completion, are always enough. */
+		for (unsigned i = 0; i < 2; i++) {
+			rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx + i * CHUNK), .length = msg_len, .lkey = rx_mr->lkey };
+			rw[i] = (struct ibv_recv_wr){ .wr_id = 10 + i, .sg_list = &rs[i], .num_sge = 1 };
+			verb(ibv_post_recv(qp, &rw[i], &rbad), "exchange prime receive");
+		}
+		barrier(fd, 1); /* align start */
+		for (unsigned it = 0; it < exchange_iters; it++) {
+			int64_t start, deadline = milliseconds() + TIMEOUT_MS;
+
+			if (tag) { uint64_t v = it; memcpy(tx, &v, sizeof(v)); }
+			start = nanoseconds();
+			verb(ibv_post_send(qp, &sw, &sbad), "exchange post send");
+			while (recvs <= it || sends <= it) {
+				struct ibv_wc wc[4]; int n = ibv_poll_cq(cq, 4, wc);
+
+				require(n >= 0 && milliseconds() < deadline, "exchange poll/deadline");
+				for (int i = 0; i < n; i++) {
+					require(wc[i].status == IBV_WC_SUCCESS, "exchange WC status");
+					if (wc[i].opcode == IBV_WC_RECV) {
+						unsigned slot = (unsigned)(wc[i].wr_id - 10);
+
+						require(slot < 2 && wc[i].byte_len == msg_len, "exchange receive geometry");
+						if (tag) {
+							uint64_t got;
+
+							memcpy(&got, rx + slot * CHUNK, sizeof(got));
+							require(got == recvs, "exchange message order");
+						}
+						recvs++;
+						verb(ibv_post_recv(qp, &rw[slot], &rbad), "exchange re-arm receive");
+					} else {
+						sends++;
+					}
+				}
+			}
+			samples[it] = nanoseconds() - start;
+		}
+		barrier(fd, 2); /* both finished */
+		report_latency("exchange", samples, exchange_iters, msg_len, argv[3]);
+		free(samples);
+		goto done;
+	}
+	if (ping_iters) { /* Small-message ping-pong RTT (256 B unless --len; staged below 64 KiB). */
+		unsigned msg_len = len_given ? xfer_len : 256;
+		int64_t *samples = calloc(ping_iters, sizeof(*samples));
+		struct ibv_sge rs = { .addr = (uintptr_t)rx, .length = msg_len, .lkey = rx_mr->lkey };
+		struct ibv_sge ss = { .addr = (uintptr_t)tx, .length = msg_len, .lkey = tx_mr->lkey };
 		struct ibv_recv_wr rw = { .wr_id = 1, .sg_list = &rs, .num_sge = 1 }, *rbad = NULL;
 		struct ibv_send_wr sw = { .wr_id = 2, .sg_list = &ss, .num_sge = 1,
 			.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED }, *sbad = NULL;
 		int64_t best = INT64_MAX, worst = 0, total = 0;
+		require(samples != NULL, "ping sample buffer");
 		barrier(fd, 1); /* align start */
 		if (listening)
 			verb(ibv_post_recv(qp, &rw, &rbad), "ping prime receive");
@@ -654,7 +750,7 @@ int main(int argc, char **argv)
 				}
 			} else {
 				verb(ibv_post_recv(qp, &rw, &rbad), "ping post receive");
-				int64_t start = microseconds();
+				int64_t start = nanoseconds();
 				verb(ibv_post_send(qp, &sw, &sbad), "ping post send");
 				bool got_echo = false, sent = false;
 				int64_t deadline = milliseconds() + TIMEOUT_MS;
@@ -666,14 +762,19 @@ int main(int argc, char **argv)
 						if (wc[i].opcode == IBV_WC_RECV) got_echo = true; else sent = true;
 					}
 				}
-				int64_t rtt = microseconds() - start;
+				int64_t rtt = nanoseconds() - start;
+				samples[it] = rtt;
 				total += rtt; if (rtt < best) best = rtt; if (rtt > worst) worst = rtt;
 			}
 		}
 		barrier(fd, 2); /* both finished */
-		if (!listening)
-			printf("PINGPONG %u iters x 256 B: avg %.1f us, min %lld us, max %lld us (round-trip)\n",
-			       ping_iters, (double)total / ping_iters, (long long)best, (long long)worst);
+		if (!listening) {
+			printf("PINGPONG %u iters x %u B: avg %.1f us, min %lld us, max %lld us (round-trip)\n",
+			       ping_iters, msg_len, (double)total / ping_iters / 1000.0,
+			       (long long)(best / 1000), (long long)(worst / 1000));
+			report_latency("ping-rtt", samples, ping_iters, msg_len, argv[3]);
+		}
+		free(samples);
 		goto done;
 	}
 	if (send_iters) { /* Verified bidirectional SEND/RECV, window 4 x 2 MiB. */
@@ -1002,7 +1103,7 @@ int main(int argc, char **argv)
 	buffer_free(tx, htx); buffer_free(rx, hrx); if (rd) buffer_free(rd, hrd);
 	verb(ibv_destroy_cq(cq), "CQ destroy"); verb(ibv_dealloc_pd(pd), "PD free");
 	verb(ibv_close_device(ctx), "context close"); close(fd);
-	if (!bench_iters && !ping_iters && !rdma_iters && !send_iters)
+	if (!bench_iters && !ping_iters && !rdma_iters && !send_iters && !exchange_iters)
 		printf("PASS native CPU SEND/RECV: %llu bytes received, window4 x 2MiB setup, ERR flush; not complete RC qualification\n", expected);
 	return 0;
 }

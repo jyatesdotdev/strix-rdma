@@ -4,6 +4,7 @@ config INFINIBAND_STRIX_NHI
 	depends on INFINIBAND_USER_ACCESS && INFINIBAND_USER_MEM
 	depends on USB4 && USB4_NET && NET && INET && PCI
 	select INFINIBAND_VIRT_DMA
+	select CRC32
 	default n
 	help
 	  CPU-copy software RC SEND/RECV, READ and WRITE using independent

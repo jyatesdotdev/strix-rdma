@@ -1638,3 +1638,58 @@ change (TODO):
 - small control frames would queue behind data bursts
 - the zero-copy landing order and the recovery design assume a single data ring
 - both data-carrying rings would need E2E
+
+## Round nineteen (2026-10-16): latency for tensor parallelism
+
+TP sends a few KiB per exchange, about 96 times per decode step. For
+Qwen3.8 Flash Next (hidden size 2,560) that is 10 KiB per exchange at fp32, or
+40 KiB when verifying three MTP drafts. Context length does not change the
+size. So per-exchange latency and its tail are the figures that matter.
+
+**Tooling.** `strix-verbs-smoke` gained two things:
+
+- `--len N` for `ping` (default 256 B)
+- an `exchange` mode: both sides send N bytes at once and each waits for the
+  peer's N bytes, which is the TP all-reduce swap. Messages carry a sequence
+  tag, so any loss or reordering fails the run.
+
+Both modes record every sample in nanoseconds and report min, avg, p50, p90,
+p99, p99.9 and max. With 1,000 samples or more, the first 100 are excluded as
+warm-up.
+
+**The copy path cost about 65 µs per extra 4 KiB frame.** At TP sizes the
+exchange looked stop-and-wait: 92 µs at 4 KiB, 167 at 10 KiB, 678 at 40 KiB.
+An ftrace of `sn_ring_send` and the ring callbacks showed the sender queueing
+one frame every ~27 µs. Each `sn_ring_send()` call took that long to return
+because `sn_crc` was a bit-serial CRC-32C: eight dependent shift/xor steps per
+byte, about 25 µs per 4 KiB frame. That cost was paid in `sn_encode()` on every
+send and in `sn_decode()` on every receive.
+
+The CRC is now the kernel's arch-accelerated `crc32c()`, computing the same
+value. The wire format is unchanged, so no version bump is needed. The
+bit-serial loop stays as `sn_crc_reference`: the offline tests use it, pinned
+to the standard CRC-32C check value. `sn_init()` compares the two at every
+length class the wire uses, with the CRC field both clear and set, and refuses
+to load if they differ.
+
+| p50 (µs), 20,000 iterations | Before | After |
+|---|---|---|
+| exchange 64 B | 24.0 | 18.7 |
+| exchange 256 B | 26.6 | 19.6 |
+| exchange 4 KiB | 92.4 | 23.3 |
+| exchange 10 KiB | 167.2 | 26.1 |
+| exchange 20 KiB | 339.0 | 34.2 |
+| exchange 40 KiB | 677.5 | 51.1 |
+| ping round trip 256 B | 35.1 | 19.2 |
+| ping round trip 10 KiB | 225.5 | 36.3 |
+
+The tails are now the larger problem. p99.9 is 120–220 µs at 64 B, 256 B,
+4 KiB and 10 KiB, with maxima of 1–6 ms.
+
+**Regression gates on the new build** all passed byte-for-byte, with no
+`bad_frames` and no QP errors: `write 200`, `read 500`, the SEND smoke,
+`send 2000` ×5 (424–436 MiB/s wall) and staged 3,000 B at offset 64.
+Transfer-only READ (812–859 MiB/s) and SEND (976–1036) match the previous boot.
+WRITE came in lower, at 723–962 MiB/s against 994–1020 on the previous boot.
+Some of those runs are inside the historical 954–1073 range; whether it is
+boot variance or this change needs a comparison across boots.

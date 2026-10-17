@@ -142,6 +142,9 @@ scripts/verbs-streak.sh 1 20 read 2000     # stop at the first failure
 scripts/verbs-streak.sh 1 5 write 2000
 scripts/verbs-streak.sh 1 5 send 2000      # verified bulk SEND/RECV
 scripts/verbs-streak.sh 1 5 send           # the SEND/RECV smoke
+SMOKE_FLAGS='--len 10240' scripts/run-verbs-smoke.sh exchange 20000
+                                            # TP-shaped swap, both sides at once; percentiles
+SMOKE_FLAGS='--len 256' scripts/run-verbs-smoke.sh ping 20000   # round trip; percentiles
 SMOKE_FLAGS=--gpu scripts/verbs-streak.sh 1 5 write 2000   # all buffers in GPU memory
 SMOKE_FLAGS='--len 3000 --off 64' XFER_LEN=3000 scripts/verbs-streak.sh 1 1 send 200
                                             # small/unaligned: the staged path

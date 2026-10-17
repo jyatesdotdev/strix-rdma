@@ -3,6 +3,7 @@
 #define STRIX_NHI_NATIVE_WIRE_H
 
 #ifdef __KERNEL__
+#include <linux/crc32.h>
 #include <linux/types.h>
 #include <linux/string.h>
 typedef u8 sn_u8;
@@ -99,8 +100,11 @@ static inline void sn_put64(sn_u8 *p, sn_u64 v)
 {
 	sn_put32(p, v >> 32); sn_put32(p + 4, (sn_u32)v);
 }
-/* CRC field 96..99 is logically zero. No authentication is implied. */
-static inline sn_u32 sn_crc(const sn_u8 *p, size_t n)
+/* Frame CRC: CRC-32C (reflected polynomial 0x82f63b78, inverted at both ends)
+ * over the whole frame, with the CRC field 96..99 logically zero. No
+ * authentication is implied. This bit-serial loop is the definition; the
+ * offline tests use it and pin it to the standard CRC-32C check value. */
+static inline sn_u32 sn_crc_reference(const sn_u8 *p, size_t n)
 {
 	sn_u32 crc = ~0U;
 	size_t i;
@@ -112,6 +116,28 @@ static inline sn_u32 sn_crc(const sn_u8 *p, size_t n)
 			crc = (crc >> 1) ^ (0x82f63b78U & (0U - (crc & 1)));
 	}
 	return ~crc;
+}
+/* The kernel computes the same value with the arch-accelerated crc32c()
+ * library; sn_init() refuses to load if the two ever disagree. The bit-serial
+ * loop cost about 25 us per 4 KiB frame on this hardware, paid on every send
+ * and every receive, which made each additional staged frame cost about 27 us
+ * (docs/ZEROCOPY_VERBS.md, round nineteen). The wire value is unchanged. */
+static inline sn_u32 sn_crc(const sn_u8 *p, size_t n)
+{
+#ifdef __KERNEL__
+	static const sn_u8 zero[4];
+	sn_u32 crc;
+
+	if (n <= 96)
+		return ~crc32c(~0U, p, n);
+	crc = crc32c(~0U, p, 96);
+	crc = crc32c(crc, zero, (n < 100 ? n : 100) - 96);
+	if (n > 100)
+		crc = crc32c(crc, p + 100, n - 100);
+	return ~crc;
+#else
+	return sn_crc_reference(p, n);
+#endif
 }
 static inline int sn_qp_fields_valid(const struct sn_header *h)
 {

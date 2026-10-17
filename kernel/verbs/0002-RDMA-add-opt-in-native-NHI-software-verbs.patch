@@ -28,13 +28,14 @@ diff --git a/drivers/infiniband/hw/strix_nhi/Kconfig b/drivers/infiniband/hw/str
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/Kconfig
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,14 @@
 +# SPDX-License-Identifier: GPL-2.0-only
 +config INFINIBAND_STRIX_NHI
 +	tristate "Experimental native NHI software verbs"
 +	depends on INFINIBAND_USER_ACCESS && INFINIBAND_USER_MEM
 +	depends on USB4 && USB4_NET && NET && INET && PCI
 +	select INFINIBAND_VIRT_DMA
++	select CRC32
 +	default n
 +	help
 +	  CPU-copy software RC SEND/RECV, READ and WRITE using independent
@@ -54,12 +55,13 @@ diff --git a/drivers/infiniband/hw/strix_nhi/native_wire.h b/drivers/infiniband/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/native_wire.h
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,330 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef STRIX_NHI_NATIVE_WIRE_H
 +#define STRIX_NHI_NATIVE_WIRE_H
 +
 +#ifdef __KERNEL__
++#include <linux/crc32.h>
 +#include <linux/types.h>
 +#include <linux/string.h>
 +typedef u8 sn_u8;
@@ -156,8 +158,11 @@ new file mode 100644
 +{
 +	sn_put32(p, v >> 32); sn_put32(p + 4, (sn_u32)v);
 +}
-+/* CRC field 96..99 is logically zero. No authentication is implied. */
-+static inline sn_u32 sn_crc(const sn_u8 *p, size_t n)
++/* Frame CRC: CRC-32C (reflected polynomial 0x82f63b78, inverted at both ends)
++ * over the whole frame, with the CRC field 96..99 logically zero. No
++ * authentication is implied. This bit-serial loop is the definition; the
++ * offline tests use it and pin it to the standard CRC-32C check value. */
++static inline sn_u32 sn_crc_reference(const sn_u8 *p, size_t n)
 +{
 +	sn_u32 crc = ~0U;
 +	size_t i;
@@ -169,6 +174,28 @@ new file mode 100644
 +			crc = (crc >> 1) ^ (0x82f63b78U & (0U - (crc & 1)));
 +	}
 +	return ~crc;
++}
++/* The kernel computes the same value with the arch-accelerated crc32c()
++ * library; sn_init() refuses to load if the two ever disagree. The bit-serial
++ * loop cost about 25 us per 4 KiB frame on this hardware, paid on every send
++ * and every receive, which made each additional staged frame cost about 27 us
++ * (docs/ZEROCOPY_VERBS.md, round nineteen). The wire value is unchanged. */
++static inline sn_u32 sn_crc(const sn_u8 *p, size_t n)
++{
++#ifdef __KERNEL__
++	static const sn_u8 zero[4];
++	sn_u32 crc;
++
++	if (n <= 96)
++		return ~crc32c(~0U, p, n);
++	crc = crc32c(~0U, p, 96);
++	crc = crc32c(crc, zero, (n < 100 ? n : 100) - 96);
++	if (n > 100)
++		crc = crc32c(crc, p + 100, n - 100);
++	return ~crc;
++#else
++	return sn_crc_reference(p, n);
++#endif
 +}
 +static inline int sn_qp_fields_valid(const struct sn_header *h)
 +{
@@ -842,7 +869,7 @@ diff --git a/drivers/infiniband/hw/strix_nhi/main.c b/drivers/infiniband/hw/stri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/infiniband/hw/strix_nhi/main.c
-@@ -0,0 +1,634 @@
+@@ -0,0 +1,664 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/delay.h>
@@ -1444,11 +1471,41 @@ new file mode 100644
 +	.probe = sn_probe, .remove = sn_remove, .shutdown = sn_shutdown,
 +	.id_table = sn_ids,
 +};
++/* The accelerated frame CRC must equal the bit-serial definition at every
++ * length the wire uses, with the CRC field both clear and set, or this build
++ * could not talk to any other. Checked once at load; the reference costs about
++ * 25 us per 4 KiB, so this is well under a millisecond. */
++static int __init sn_crc_selftest(void)
++{
++	static const size_t sizes[] = { 0, 1, 95, 96, 97, 99, 100, 101,
++		SN_HEADER, SN_HEADER + 256, SN_HEADER + 3000, SN_FRAME };
++	size_t i, j;
++	int ret = 0;
++	u8 *buf = kmalloc(SN_FRAME, GFP_KERNEL);
++
++	if (!buf) return -ENOMEM;
++	for (j = 0; j < SN_FRAME; j++)
++		buf[j] = (u8)(j * 131 + 7) ^ (u8)(j >> 5);
++	for (i = 0; i < ARRAY_SIZE(sizes) && !ret; i++) {
++		if (sn_crc(buf, sizes[i]) != sn_crc_reference(buf, sizes[i]))
++			ret = -EINVAL;
++		/* Set the CRC field: both must still treat it as zero. */
++		buf[97] ^= 0x5a;
++		if (sn_crc(buf, sizes[i]) != sn_crc_reference(buf, sizes[i]))
++			ret = -EINVAL;
++	}
++	kfree(buf);
++	if (ret)
++		pr_err("strix_nhi: crc32c() disagrees with the wire CRC; refusing to load\n");
++	return ret;
++}
 +static int __init sn_init(void)
 +{
 +	int ret;
 +
 +	if (!enable) return -EACCES;
++	ret = sn_crc_selftest();
++	if (ret) return ret;
 +	sn_directory = tb_property_create_dir(&sn_uuid);
 +	if (!sn_directory) return -ENOMEM;
 +	ret = tb_property_add_immediate(sn_directory, "prtcid", 1);

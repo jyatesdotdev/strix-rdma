@@ -599,11 +599,41 @@ static struct tb_service_driver sn_driver = {
 	.probe = sn_probe, .remove = sn_remove, .shutdown = sn_shutdown,
 	.id_table = sn_ids,
 };
+/* The accelerated frame CRC must equal the bit-serial definition at every
+ * length the wire uses, with the CRC field both clear and set, or this build
+ * could not talk to any other. Checked once at load; the reference costs about
+ * 25 us per 4 KiB, so this is well under a millisecond. */
+static int __init sn_crc_selftest(void)
+{
+	static const size_t sizes[] = { 0, 1, 95, 96, 97, 99, 100, 101,
+		SN_HEADER, SN_HEADER + 256, SN_HEADER + 3000, SN_FRAME };
+	size_t i, j;
+	int ret = 0;
+	u8 *buf = kmalloc(SN_FRAME, GFP_KERNEL);
+
+	if (!buf) return -ENOMEM;
+	for (j = 0; j < SN_FRAME; j++)
+		buf[j] = (u8)(j * 131 + 7) ^ (u8)(j >> 5);
+	for (i = 0; i < ARRAY_SIZE(sizes) && !ret; i++) {
+		if (sn_crc(buf, sizes[i]) != sn_crc_reference(buf, sizes[i]))
+			ret = -EINVAL;
+		/* Set the CRC field: both must still treat it as zero. */
+		buf[97] ^= 0x5a;
+		if (sn_crc(buf, sizes[i]) != sn_crc_reference(buf, sizes[i]))
+			ret = -EINVAL;
+	}
+	kfree(buf);
+	if (ret)
+		pr_err("strix_nhi: crc32c() disagrees with the wire CRC; refusing to load\n");
+	return ret;
+}
 static int __init sn_init(void)
 {
 	int ret;
 
 	if (!enable) return -EACCES;
+	ret = sn_crc_selftest();
+	if (ret) return ret;
 	sn_directory = tb_property_create_dir(&sn_uuid);
 	if (!sn_directory) return -ENOMEM;
 	ret = tb_property_add_immediate(sn_directory, "prtcid", 1);
