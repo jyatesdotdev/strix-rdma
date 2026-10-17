@@ -1806,6 +1806,36 @@ exchange of 167 µs, both back-to-back. Donnerkeule's published 64 B figure
 (perftest half round trip, IOMMU off) is 7.4 µs one-way, a ~15 µs round trip.
 Our own stream path's floor is 9.8 µs at 4 KiB.
 
+### GPU buffers
+
+GPU-direct MRs (`hipMalloc`, DMA-BUF) keep all of this. At TP sizes the staged
+path copies through the buffer's `dma_buf_vmap` mapping, and that copy is no
+slower than for CPU memory. `strix-verbs-smoke --gpu` now runs `ping` and
+`exchange` too. GPU buffers measured faster than CPU buffers on every row. A
+likely reason is that GPU allocations are larger physically contiguous pieces,
+so there are fewer pages to walk in the copy and the IOMMU; that is not proven.
+
+| p50 / p99 (µs), 10,000 iterations | defaults, CPU | defaults, GPU | profile, CPU | profile, GPU |
+|---|---|---|---|---|
+| exchange 256 B | 19.5 / 22.4 | 16.0 / 17.7 | 11.4 / 14.0 | 9.2 / 10.9 |
+| exchange 10 KiB | 26.5 / 30.9 | 22.0 / 24.9 | 17.9 / 20.2 | 15.8 / 18.2 |
+| exchange 10 KiB, gap 200 µs | 53.5 / 190.6 | 49.2 / 167.8 | 18.7 / 54.8 | 16.2 / 18.5 |
+| exchange 40 KiB, gap 200 µs | – | – | 48.1 / 92.8 | 39.9 / 54.1 |
+| ping 256 B, gap 200 µs | – | – | 12.8 / 14.4 | 10.8 / 12.9 |
+
+The defaults columns are 5,000 iterations. GPU zero-copy bulk with the profile
+ran at WRITE 1,308-1,311 and SEND 1,326-1,338 MiB/s transfer-only, the highest
+measured.
+
+These figures cover the transport only. A TP step also pays the GPU's side of
+each exchange, as with any transport:
+
+- before the send, a system-scope release, which G4 showed is required
+  (`docs/GPU_DIRECT_VERBS.md`), and the CPU learning that the kernel finished
+- after the receive, a kernel that reads the data
+
+That cost is not measured here.
+
 ### Open
 
 - **Why polling hurts bulk under defaults, and READ in both configurations.**

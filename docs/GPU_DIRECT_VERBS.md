@@ -113,6 +113,11 @@ path.
 fixed-pinning RDMA importers. An exporter that must move the buffer cannot
 while it is registered.
 
+**Latency (2026-10-16).** GPU MRs measured at least as fast as CPU memory on
+the TP-sized exchange: 10 KiB in 22.0 µs p50 by default and 15.8 µs with the
+low-latency profile (`docs/ZEROCOPY_VERBS.md`, round nineteen). The application's
+own GPU synchronization per exchange comes on top of that.
+
 ## Coherency contract (the application's job)
 
 DMA-BUF solves addressability and lifetime, not GPU cache ownership

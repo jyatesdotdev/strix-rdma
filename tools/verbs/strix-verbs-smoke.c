@@ -636,7 +636,10 @@ int main(int argc, char **argv)
 	init.send_cq = init.recv_cq = cq;
 	qp = ibv_create_qp(pd, &init); require(qp != NULL, "create RC QP4/4");
 	if (gpu) {
-		require(send_iters || rdma_iters, "--gpu needs send, write or read with an iteration count");
+		/* ping and exchange never touch payload bytes in GPU mode (their sequence tag
+		 * is CPU-only), so they measure the GPU-MR path's latency as-is. */
+		require(send_iters || rdma_iters || ping_iters || exchange_iters,
+			"--gpu needs send, write, read, ping or exchange with an iteration count");
 		gpu_load();
 	}
 	buffer_alloc(&tx, &htx);
