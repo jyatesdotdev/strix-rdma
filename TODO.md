@@ -37,6 +37,26 @@ continue. Evidence and background live in the linked docs.
   `tools/scripts/strix-verbs-latency-profile.sh` (pinned FIFO poller) is
   optional, for the scheduler's outliers. `docs/ZEROCOPY_VERBS.md`, round
   nineteen.
+- [ ] **Run `gufo` TP2 on this stack? (wire version 3)** `gufo`'s TP2 uses a
+  deliberately small subset of verbs:
+  - one RC QP
+  - `IBV_WR_RDMA_WRITE_WITH_IMM` as its only opcode
+  - two `ibv_reg_mr` windows of pinned host memory (`mmap` + `hipHostRegister`)
+  - a completion channel
+  - GPU kernels that signal and wait on coherent host flags
+
+  That is the design measured here at ~23 µs per 10 KiB step. Its decode is
+  bound by exchange latency: Donnerkeule publishes 8.5 µs (64 B) and 28 µs
+  (16 KiB) one-way. Missing here:
+  - **RDMA WRITE with immediate:** consume a posted receive and complete it as
+    `RECV_RDMA_WITH_IMM`, staged and zero-copy
+  - **queue depth 16** (4 today, and part of the v2 wire validation)
+  - **MRs of 144 MiB** (8 MiB cap)
+  - **messages up to the window size**, 48 MiB in prefill (2 MiB cap)
+  - **`retry_cnt`/`rnr_retry` of 7** at RTS (≤ 6 accepted)
+
+  It would run with `--tp-gid-index 0`, since our GID is not RoCE v2. The
+  wire changes need a version bump to 3.
 - [ ] **TP integration choice: resident kernel or launch-and-sync.** A
   resident kernel with host-coherent buffers gives a 10 KiB TP step of
   ~23 µs; launch-and-sync gives ~35 µs with heavier tails. A resident kernel
