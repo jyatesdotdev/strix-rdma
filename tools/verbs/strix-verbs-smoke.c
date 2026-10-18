@@ -19,6 +19,7 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #define WINDOW 4u
@@ -60,6 +61,36 @@ static bool len_given;
  * so the driver's poller has gone cold by the next one; back-to-back
  * iterations only measure a hot poller. */
 static unsigned gap_us;
+/* --tp sync|persist (exchange with --gpu-kernels): each iteration is a whole
+ * TP step from GPU memory -- a kernel produces the payload, the CPU sends it,
+ * and a kernel consumes and checks the peer's. sync launches a kernel for each
+ * hand-off and waits for it; persist keeps one kernel resident, driven through
+ * control words in coherent host memory (round nineteen). */
+enum tp_mode { TP_NONE, TP_SYNC, TP_PERSIST };
+static enum tp_mode tp_mode;
+/* Control words shared with sn_tp_persistent, each on its own 128-byte line. */
+enum { TP_GO = 0, TP_READY = 32, TP_RECVD = 64, TP_SLOT = 96, TP_DONE = 128, TP_DEBUG = 160 };
+/* --gap-gpu: fill the idle gap with GPU work (sn_spin) instead of sleeping. */
+static bool gap_gpu;
+/* --gpu-fine: allocate the GPU buffers fine-grained. hipMalloc memory is
+ * coarse-grained: HIP makes it coherent with the host and the NIC only at kernel
+ * boundaries, so a resident kernel's writes (--tp persist) never reach the
+ * staged send's copy, and its reads can miss a receive. */
+static bool gpu_fine;
+/* --gpu-host: the GPU kernels' buffers are coherent host memory (hipHostMalloc),
+ * registered as ordinary CPU MRs. On this APU it is the same DRAM, and unlike
+ * hipMalloc memory it stays coherent with the CPU and the NIC while a kernel is
+ * still running, which a resident TP kernel (--tp persist) needs. */
+static bool gpu_host;
+#define TP_STOP 0xffffffffu
+static unsigned *tp_ctl;
+/* Releases a resident kernel on any exit, so a failed run cannot hang in the
+ * HIP runtime's teardown waiting for it. */
+static void tp_release(void)
+{
+	if (tp_ctl)
+		__atomic_store_n(&tp_ctl[TP_GO], TP_STOP, __ATOMIC_RELEASE);
+}
 /* --gap-spin: busy-wait the gap instead of sleeping, so this CPU stays awake. */
 static bool gap_spin;
 /* --linger-ms N: stay idle (connection up, no traffic) for N ms after the last
@@ -83,7 +114,11 @@ static struct {
 	int (*launch)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
 		      unsigned, void *, void **, void **);
 	int (*event_sync)(void *);
+	int (*host_alloc)(void **, size_t, unsigned);
+	int (*malloc_flags)(void **, size_t, unsigned);
+	int (*host_free)(void *);
 	void *acquire, *no_fence, *fill, *check;
+	void *tp_produce, *tp_consume, *tp_persistent, *spin; /* exchange --tp */
 	unsigned *bad;		/* device counter written by sn_check */
 } hip;
 /* --gpu-kernels PATH: GPU kernels from that code object produce the pattern and
@@ -102,6 +137,8 @@ static unsigned kernel_bad_iters;
 #define HIP_EVENT_RELEASE_TO_SYSTEM 0x80000000u
 #define HIP_EVENT_DISABLE_TIMING 0x2u
 #define HIP_EVENT_DISABLE_SYSTEM_FENCE 0x20000000u
+#define HIP_HOST_COHERENT 0x40000000u
+#define HIP_DEVICE_MALLOC_FINEGRAINED 0x1u
 static void fail(const char *what)
 {
 	fprintf(stderr, "FAIL: %s (errno=%d: %s)\n", what, errno, strerror(errno));
@@ -124,6 +161,8 @@ static void gpu_load(void)
 	SYM(synchronize, "hipDeviceSynchronize"); SYM(address_range, "hipMemGetAddressRange");
 	SYM(export, "hipMemGetHandleForAddressRange"); SYM(event_create, "hipEventCreateWithFlags");
 	SYM(event_record, "hipEventRecord"); SYM(error, "hipGetErrorString");
+	SYM(malloc_flags, "hipExtMallocWithFlags");
+	SYM(host_alloc, "hipHostMalloc"); SYM(host_free, "hipHostFree");
 	hip_ok(hip.set_device(0), "hipSetDevice(0)");
 	/* Timing-enabled, system-scope: recording it emits the acquire. */
 	hip_ok(hip.event_create(&hip.acquire, HIP_EVENT_RELEASE_TO_SYSTEM), "acquire event");
@@ -135,6 +174,10 @@ static void gpu_load(void)
 		hip_ok(hip.module_load(&module, gpu_kernels), "load GPU kernels code object");
 		hip_ok(hip.module_function(&hip.fill, module, "sn_fill"), "kernel sn_fill");
 		hip_ok(hip.module_function(&hip.check, module, "sn_check"), "kernel sn_check");
+		hip_ok(hip.module_function(&hip.tp_produce, module, "sn_tp_produce"), "kernel sn_tp_produce");
+		hip_ok(hip.module_function(&hip.tp_consume, module, "sn_tp_consume"), "kernel sn_tp_consume");
+		hip_ok(hip.module_function(&hip.tp_persistent, module, "sn_tp_persistent"), "kernel sn_tp_persistent");
+		hip_ok(hip.module_function(&hip.spin, module, "sn_spin"), "kernel sn_spin");
 		hip_ok(hip.malloc((void **)&hip.bad, sizeof(*hip.bad)), "mismatch counter");
 		hip_ok(hip.event_create(&hip.no_fence, HIP_EVENT_DISABLE_TIMING |
 			HIP_EVENT_DISABLE_SYSTEM_FENCE), "fence-free completion event");
@@ -146,7 +189,13 @@ static void gpu_load(void)
 static void buffer_alloc(unsigned char **buf, unsigned char **host)
 {
 	verb(posix_memalign((void **)host, 4096, POOL), "host buffer allocation");
-	if (gpu) hip_ok(hip.malloc((void **)buf, POOL), "hipMalloc");
+	if (gpu && gpu_host) {
+		hip_ok(hip.host_alloc((void **)buf, POOL, HIP_HOST_COHERENT), "hipHostMalloc(coherent)");
+		memset(*buf, 0, POOL);
+	} else if (gpu && gpu_fine)
+		hip_ok(hip.malloc_flags((void **)buf, POOL, HIP_DEVICE_MALLOC_FINEGRAINED),
+		       "hipExtMallocWithFlags(fine-grained)");
+	else if (gpu) hip_ok(hip.malloc((void **)buf, POOL), "hipMalloc");
 	else *buf = *host;
 }
 static struct ibv_mr *buffer_register(struct ibv_pd *pd, unsigned char *buf, int access)
@@ -154,7 +203,7 @@ static struct ibv_mr *buffer_register(struct ibv_pd *pd, unsigned char *buf, int
 	void *base = NULL; size_t size = 0; int dmabuf = -1;
 	struct ibv_mr *mr;
 
-	if (!gpu) return ibv_reg_mr(pd, buf, POOL, access);
+	if (!gpu || gpu_host) return ibv_reg_mr(pd, buf, POOL, access);
 	/* The exported fd names the whole backing allocation, so the MR's offset
 	 * into it is the pointer's distance from that allocation's base. */
 	hip_ok(hip.address_range(&base, &size, buf), "hipMemGetAddressRange");
@@ -168,7 +217,8 @@ static struct ibv_mr *buffer_register(struct ibv_pd *pd, unsigned char *buf, int
 }
 static void buffer_free(unsigned char *buf, unsigned char *host)
 {
-	if (gpu && buf) hip_ok(hip.free(buf), "hipFree");
+	if (gpu && gpu_host && buf) hip_ok(hip.host_free(buf), "hipHostFree");
+	else if (gpu && buf) hip_ok(hip.free(buf), "hipFree");
 	free(host);
 }
 /* Make a host-built pattern the buffer's content and clear a landing buffer,
@@ -539,6 +589,53 @@ overrun:
 		it, slot, j, off, off + xfer_len, b[j]);
 	return false;
 }
+/* Poll until this iteration's send and the peer's matching message have both
+ * completed. The peer finishes an iteration only after receiving ours, so it is
+ * at most one message ahead: two receives, re-armed on every completion, always
+ * suffice, and a slot is not reused before the next iteration's send.
+ * slot_of[k], if given, records which receive buffer the k-th message used. */
+static void exchange_wait(struct ibv_cq *cq, struct ibv_qp *qp, struct ibv_recv_wr *rw,
+			  unsigned msg_len, bool tag, const unsigned char *rx,
+			  unsigned long long *recvs, unsigned long long *sends,
+			  unsigned it, unsigned char *slot_of, unsigned slots)
+{
+	int64_t deadline = milliseconds() + TIMEOUT_MS;
+	struct ibv_recv_wr *rbad = NULL;
+
+	while (*recvs <= it || *sends <= it) {
+		struct ibv_wc wc[4]; int n = ibv_poll_cq(cq, 4, wc);
+
+		require(n >= 0 && milliseconds() < deadline, "exchange poll/deadline");
+		for (int i = 0; i < n; i++) {
+			require(wc[i].status == IBV_WC_SUCCESS, "exchange WC status");
+			if (wc[i].opcode != IBV_WC_RECV) { (*sends)++; continue; }
+			unsigned slot = (unsigned)(wc[i].wr_id - 10);
+
+			require(slot < 2 && wc[i].byte_len == msg_len, "exchange receive geometry");
+			if (tag) {
+				uint64_t got;
+
+				memcpy(&got, rx + slot * CHUNK, sizeof(got));
+				require(got == *recvs, "exchange message order");
+			}
+			if (slot_of && *recvs < slots) slot_of[*recvs] = (unsigned char)slot;
+			(*recvs)++;
+			verb(ibv_post_recv(qp, &rw[slot], &rbad), "exchange re-arm receive");
+		}
+	}
+}
+static void tp_wait(const unsigned *word, unsigned want, const char *what)
+{
+	int64_t deadline = milliseconds() + TIMEOUT_MS;
+
+	while (__atomic_load_n(word, __ATOMIC_ACQUIRE) != want)
+		require(milliseconds() < deadline, what);
+}
+static void tp_launch(void *fn, void **args, const char *what)
+{
+	hip_ok(hip.launch(fn, 1, 1, 1, 256, 1, 1, 0, NULL, args, NULL), what);
+}
+
 int main(int argc, char **argv)
 {
 	struct ibv_device **devices; struct ibv_context *ctx = NULL;
@@ -563,6 +660,19 @@ int main(int argc, char **argv)
 		} else if (argc >= 3 && !strcmp(argv[1], "--gpu-kernels")) {
 			gpu = true; gpu_kernels = argv[2];
 			argv[2] = argv[0]; argv += 2; argc -= 2;
+		} else if (argc >= 3 && !strcmp(argv[1], "--tp")) {
+			require(!strcmp(argv[2], "sync") || !strcmp(argv[2], "persist"), "--tp sync|persist");
+			tp_mode = !strcmp(argv[2], "sync") ? TP_SYNC : TP_PERSIST;
+			argv[2] = argv[0]; argv += 2; argc -= 2;
+		} else if (!strcmp(argv[1], "--gpu-host")) {
+			gpu_host = true;
+			argv[1] = argv[0]; argv++; argc--;
+		} else if (!strcmp(argv[1], "--gpu-fine")) {
+			gpu_fine = true;
+			argv[1] = argv[0]; argv++; argc--;
+		} else if (!strcmp(argv[1], "--gap-gpu")) {
+			gap_gpu = true;
+			argv[1] = argv[0]; argv++; argc--;
 		} else if (!strcmp(argv[1], "--gap-spin")) {
 			gap_spin = true;
 			argv[1] = argv[0]; argv++; argc--;
@@ -588,12 +698,17 @@ int main(int argc, char **argv)
 			argv[2] = argv[0]; argv += 2; argc -= 2;
 		} else break;
 	}
+	/* A sleeping gap overshoots by up to the default 50 us timer slack, and an
+	 * exchange waits for the later of two hosts, so slack showed up as a fake
+	 * transport tail. Ask for 1 ns: the gap is then precise to the wake-up. */
+	if (gap_us && !gap_spin)
+		require(!prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0), "PR_SET_TIMERSLACK");
 	if (!recv_off_set) recv_off = xfer_off;
 	require(xfer_off + (unsigned long)xfer_len <= CHUNK && recv_off + (unsigned long)xfer_len <= CHUNK,
 		"--off/--recv-off + --len must fit one 2 MiB slot");
 	if ((argc < 6 || argc > 8) || strcmp(argv[1], "--live") ||
 	    (strcmp(argv[3], "listen") && strcmp(argv[3], "connect"))) {
-		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | exchange [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] [--linger-ms N] --live ... send|write|read iters\n       %s [--len N] [--gap-us N] --live ... ping|exchange iters   (message size, default 256 B; idle gap between iterations; percentiles)\n", argv[0], argv[0], argv[0], argv[0]);
+		fprintf(stderr, "usage: %s --selftest\n       %s --live strix_nhiN listen|connect explicit-IPv4 TCP-port [bench-iterations | ping [iters] | exchange [iters] | send [iters] | write [iters] | read [iters]]\n       %s [--gpu | --gpu-kernels CODE_OBJECT] [--len N] [--off N] [--linger-ms N] --live ... send|write|read iters\n       %s [--len N] [--gap-us N] --live ... ping|exchange iters   (message size, default 256 B; idle gap between iterations; percentiles)\n       %s --gpu-kernels CODE_OBJECT --tp sync|persist [--len N] --live ... exchange iters   (whole TP step from GPU memory)\n", argv[0], argv[0], argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	if (argc >= 7 && !strcmp(argv[6], "ping")) {
@@ -685,6 +800,104 @@ int main(int argc, char **argv)
 	verb(ibv_query_qp(qp, &attr, IBV_QP_STATE|IBV_QP_SQ_PSN|IBV_QP_RQ_PSN|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_MAX_QP_RD_ATOMIC|IBV_QP_MAX_DEST_RD_ATOMIC, &init), "query accepted QP attrs");
 	require(attr.qp_state == IBV_QPS_RTS && attr.sq_psn == local.psn && attr.rq_psn == peer.psn &&
 		attr.timeout == 14 && attr.retry_cnt == 3 && attr.rnr_retry == 3 && attr.max_rd_atomic == 1 && attr.max_dest_rd_atomic == 1, "preserved QP attributes");
+	if (exchange_iters && tp_mode) { /* Whole TP step from GPU memory. */
+		unsigned msg_len = len_given ? xfer_len : 10240, words = msg_len / 4;
+		unsigned side = listening, peer_side = !listening, slot_bytes = CHUNK, bad = 0;
+		int64_t *total = calloc(exchange_iters, sizeof(*total));
+		int64_t *produced = calloc(exchange_iters, sizeof(*produced));
+		int64_t *wire = calloc(exchange_iters, sizeof(*wire));
+		int64_t *consumed = calloc(exchange_iters, sizeof(*consumed));
+		unsigned char *slot_of = calloc(exchange_iters, 1);
+		struct ibv_sge rs[2], ss = { .addr = (uintptr_t)tx, .length = msg_len, .lkey = tx_mr->lkey };
+		struct ibv_recv_wr rw[2], *rbad = NULL;
+		struct ibv_send_wr sw = { .wr_id = 2, .sg_list = &ss, .num_sge = 1,
+			.opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED }, *sbad = NULL;
+		unsigned long long recvs = 0, sends = 0;
+
+		require(gpu_kernels && msg_len % 4 == 0, "--tp needs --gpu-kernels and --len a multiple of 4");
+		require(total && produced && wire && consumed && slot_of, "TP sample buffers");
+		hip_ok(hip.memset(hip.bad, 0, sizeof(*hip.bad)), "clear mismatch counter");
+		if (tp_mode == TP_PERSIST) {
+			void *args[] = { &tx, &rx, &slot_bytes, &words, &side, &tp_ctl, &hip.bad };
+
+			hip_ok(hip.host_alloc((void **)&tp_ctl, 4096, HIP_HOST_COHERENT), "TP control words");
+			memset(tp_ctl, 0, 4096);
+			atexit(tp_release);
+			tp_launch(hip.tp_persistent, args, "launch resident TP kernel");
+		}
+		for (unsigned i = 0; i < 2; i++) {
+			rs[i] = (struct ibv_sge){ .addr = (uintptr_t)(rx + i * CHUNK), .length = msg_len, .lkey = rx_mr->lkey };
+			rw[i] = (struct ibv_recv_wr){ .wr_id = 10 + i, .sg_list = &rs[i], .num_sge = 1 };
+			verb(ibv_post_recv(qp, &rw[i], &rbad), "TP prime receive");
+		}
+		barrier(fd, 1); /* align start */
+		for (unsigned it = 0; it < exchange_iters; it++) {
+			unsigned step = it + 1;
+			int64_t t0, t1, t2, t3;
+
+			if (gap_gpu && gap_us && tp_mode == TP_SYNC) {
+				unsigned long long ticks = (unsigned long long)gap_us * 100;
+				void *args[] = { &ticks };
+
+				tp_launch(hip.spin, args, "launch gap kernel");
+				hip_ok(hip.synchronize(), "gap kernel sync");
+			} else {
+				idle_gap();
+			}
+			t0 = nanoseconds();
+			if (tp_mode == TP_PERSIST) {
+				__atomic_store_n(&tp_ctl[TP_GO], step, __ATOMIC_RELEASE);
+				tp_wait(&tp_ctl[TP_READY], step, "TP produce (resident kernel)");
+			} else {
+				void *args[] = { &tx, &words, &step, &side };
+
+				tp_launch(hip.tp_produce, args, "launch TP producer");
+				hip_ok(hip.synchronize(), "TP producer sync");
+			}
+			t1 = nanoseconds();
+			verb(ibv_post_send(qp, &sw, &sbad), "TP post send");
+			exchange_wait(cq, qp, rw, msg_len, false, rx, &recvs, &sends, it, slot_of, exchange_iters);
+			t2 = nanoseconds();
+			if (tp_mode == TP_PERSIST) {
+				__atomic_store_n(&tp_ctl[TP_SLOT], slot_of[it], __ATOMIC_RELAXED);
+				__atomic_store_n(&tp_ctl[TP_RECVD], step, __ATOMIC_RELEASE);
+				tp_wait(&tp_ctl[TP_DONE], step, "TP consume (resident kernel)");
+			} else {
+				unsigned char *in = rx + (size_t)slot_of[it] * CHUNK;
+				void *args[] = { &in, &words, &step, &peer_side, &hip.bad };
+
+				tp_launch(hip.tp_consume, args, "launch TP consumer");
+				hip_ok(hip.synchronize(), "TP consumer sync");
+			}
+			t3 = nanoseconds();
+			total[it] = t3 - t0; produced[it] = t1 - t0;
+			wire[it] = t2 - t1; consumed[it] = t3 - t2;
+		}
+		barrier(fd, 2); /* both finished */
+		if (tp_mode == TP_PERSIST) {
+			tp_release();
+			hip_ok(hip.synchronize(), "resident TP kernel exit");
+		}
+		hip_ok(hip.memcpy(&bad, hip.bad, sizeof(bad), HIP_D2H), "read mismatch counter");
+		if (bad && tp_mode == TP_PERSIST && tp_ctl)
+			fprintf(stderr, "TP first mismatch: step %u word %u found 0x%08x expected 0x%08x (%u bad words)\n",
+				tp_ctl[TP_DEBUG], tp_ctl[TP_DEBUG + 1], tp_ctl[TP_DEBUG + 2], tp_ctl[TP_DEBUG + 3], bad);
+		require(!bad, "TP consumer found bytes that are not the peer's payload");
+		if (tp_ctl) {
+			hip_ok(hip.host_free(tp_ctl), "free TP control words");
+			tp_ctl = NULL;
+		}
+		if (gap_us) printf("gap: %u us %s before each iteration\n", gap_us,
+				   gap_gpu && tp_mode == TP_SYNC ? "of GPU work" : "idle");
+		report_latency(tp_mode == TP_PERSIST ? "tp-step(persist)" : "tp-step(sync)", total, exchange_iters, msg_len, argv[3]);
+		report_latency("  produce hand-off", produced, exchange_iters, msg_len, argv[3]);
+		report_latency("  transport", wire, exchange_iters, msg_len, argv[3]);
+		report_latency("  consume hand-off", consumed, exchange_iters, msg_len, argv[3]);
+		printf("PASS TP step from GPU memory: %u iterations x %u B, every received word checked by the consuming kernel (%s)\n",
+		       exchange_iters, msg_len, argv[3]);
+		free(total); free(produced); free(wire); free(consumed); free(slot_of);
+		goto done;
+	}
 	if (exchange_iters) { /* TP-shaped swap: both sides send msg_len and wait for the peer's. */
 		unsigned msg_len = len_given ? xfer_len : 256;
 		bool tag = !gpu && msg_len >= 8; /* sequence tag: catches loss or reordering */
@@ -706,35 +919,13 @@ int main(int argc, char **argv)
 		}
 		barrier(fd, 1); /* align start */
 		for (unsigned it = 0; it < exchange_iters; it++) {
-			int64_t start, deadline = milliseconds() + TIMEOUT_MS;
+			int64_t start;
 
 			idle_gap();
 			if (tag) { uint64_t v = it; memcpy(tx, &v, sizeof(v)); }
 			start = nanoseconds();
 			verb(ibv_post_send(qp, &sw, &sbad), "exchange post send");
-			while (recvs <= it || sends <= it) {
-				struct ibv_wc wc[4]; int n = ibv_poll_cq(cq, 4, wc);
-
-				require(n >= 0 && milliseconds() < deadline, "exchange poll/deadline");
-				for (int i = 0; i < n; i++) {
-					require(wc[i].status == IBV_WC_SUCCESS, "exchange WC status");
-					if (wc[i].opcode == IBV_WC_RECV) {
-						unsigned slot = (unsigned)(wc[i].wr_id - 10);
-
-						require(slot < 2 && wc[i].byte_len == msg_len, "exchange receive geometry");
-						if (tag) {
-							uint64_t got;
-
-							memcpy(&got, rx + slot * CHUNK, sizeof(got));
-							require(got == recvs, "exchange message order");
-						}
-						recvs++;
-						verb(ibv_post_recv(qp, &rw[slot], &rbad), "exchange re-arm receive");
-					} else {
-						sends++;
-					}
-				}
-			}
+			exchange_wait(cq, qp, rw, msg_len, tag, rx, &recvs, &sends, it, NULL, 0);
 			samples[it] = nanoseconds() - start;
 		}
 		barrier(fd, 2); /* both finished */
