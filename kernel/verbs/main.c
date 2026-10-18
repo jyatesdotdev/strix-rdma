@@ -28,15 +28,25 @@ module_param(idle_spin_us, uint, 0644);
 MODULE_PARM_DESC(idle_spin_us,
 	"Microseconds the poller busy-polls while cold before sleeping (default 128)");
 
-/* Keepalive, a diagnostic (default 0, off): while a session is up and the
- * poller is awake, send one SN_CREDIT -- which every receiver ignores -- once
- * the control TX ring has been idle this many microseconds. Tests whether the
- * ~20 us that the first frame after an idle gap costs comes from the transmit
- * path going cold (round nineteen). */
-static unsigned int keepalive_us;
+/* Keepalive (round nineteen). The NHI's transmit path goes cold within ~50 us
+ * of idle: the first frame after a gap costs ~20 us more, and a zero-copy burst
+ * can strand its final frame for a whole retry window (round twelve's natural
+ * stalls). While the session has carried real traffic within
+ * keepalive_window_us, send one SN_CREDIT -- which every receiver ignores --
+ * whenever the control TX ring has been idle keepalive_us. After the window
+ * the keepalives stop and the poller sleeps as before, so an idle host goes
+ * quiet. 0 disables it. */
+static unsigned int keepalive_us = 20;
 module_param(keepalive_us, uint, 0644);
 MODULE_PARM_DESC(keepalive_us,
-	"Diagnostic: send an ignored control frame after this many us of TX idle while a session is up (default 0, off)");
+	"Send an ignored control frame after this many us of TX idle while the session is active (default 20, 0 off)");
+/* 10 ms was too short: an application's CPU work between bursts (the smoke
+ * tool's pattern check of 8 MiB) let the window lapse, and the next zero-copy
+ * burst started cold and stalled. 30 ms sufficed; 50 ms leaves margin. */
+static unsigned int keepalive_window_us = 50000;
+module_param(keepalive_window_us, uint, 0644);
+MODULE_PARM_DESC(keepalive_window_us,
+	"Keep the transmit path warm this long after the last real traffic (default 50000 us)");
 
 /* Defined here, consumed by sn_data_rings_start(). See strix_nhi.h for the
  * throughput/latency trade this dial controls. */
@@ -97,18 +107,17 @@ MODULE_PARM_DESC(zc_read,
  * twelve), and more than one active E2E ring pair was the suspect. A two-boot
  * A/B per arm found no difference (round seventeen), so leave it on.
  * Read-only: the rings are allocated once, at bring-up. */
-/* Control RX ring polling mode (round nineteen), part of the low-latency
- * profile (tools/scripts/strix-verbs-latency-profile.sh). A spinning poller then
+/* Control RX ring polling mode (round nineteen), default on. A spinning poller
  * reaps control frames straight from the descriptors instead of waiting for
  * interrupt -> ring_work -> sn_ring_callback: the 256 B round trip falls from
- * ~17 to ~12 us. Off by default because, without the profile's pinned FIFO
- * poller, bulk zero-copy throughput drops 15-35%, and zero-copy READ falls back
- * far more often in either configuration; the cause is not yet understood.
+ * ~17 to ~13 us. Without the keepalive it cost 15-35% of bulk throughput and
+ * multiplied zero-copy READ stalls -- fewer interrupts left the NHI idle more
+ * often -- so the two belong together. 0 restores the callback mode.
  * Read-only: a ring's mode is fixed when it is allocated. */
-bool sn_ctl_rx_poll;
+bool sn_ctl_rx_poll = true;
 module_param_named(ctl_rx_poll, sn_ctl_rx_poll, bool, 0444);
 MODULE_PARM_DESC(ctl_rx_poll,
-	"Poll the control RX ring instead of a callback per frame; low-latency profile (default off)");
+	"Poll the control RX ring instead of a callback per frame (default on; keep keepalive_us on with it)");
 
 bool sn_ctl_e2e = true;
 module_param_named(ctl_e2e, sn_ctl_e2e, bool, 0444);
@@ -304,6 +313,10 @@ static bool sn_pass(struct sn_device *d)
 	} while (progress && --budget);
 	d->pass_busy = d->qp && (d->qp->sq_count || d->qp->zc_expect ||
 				 d->qp->response_active);
+	/* Work in flight is activity: a burst stranded on a cold path keeps
+	 * getting keepalives for as long as it waits, window or not. */
+	if (d->pass_busy)
+		WRITE_ONCE(d->last_activity_ns, ktime_get_ns());
 	mutex_unlock(&d->lock);
 	if (was_active != active && d->registered) {
 		struct ib_event event = {.device = &d->ib,
@@ -361,8 +374,12 @@ static int sn_thread(void *arg)
 		{
 			unsigned int ka = READ_ONCE(keepalive_us);
 
+			u64 now = ktime_get_ns();
+
 			if (ka && sn_ready(&d->ready) && !READ_ONCE(d->keepalive_due) &&
-			    ktime_get_ns() - READ_ONCE(d->last_tx_ns) >= (u64)ka * 1000) {
+			    now - READ_ONCE(d->last_tx_ns) >= (u64)ka * 1000 &&
+			    now - READ_ONCE(d->last_activity_ns) <
+				    (u64)READ_ONCE(keepalive_window_us) * 1000) {
 				WRITE_ONCE(d->keepalive_due, true);
 				WRITE_ONCE(d->poll_kick, true);
 				continue;

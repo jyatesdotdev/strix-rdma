@@ -198,9 +198,11 @@ struct sn_device {
 	 * at its start). tb_ring_poll() must never touch a callback-mode ring:
 	 * it would race the core's ring_work for the same frames. */
 	bool rx_polling;
-	/* keepalive_us: when the control TX ring last sent, and a pending request
-	 * for the engine to send one ignored SN_CREDIT (round nineteen). */
-	u64 last_tx_ns;
+	/* keepalive_us: when the control TX ring last sent anything; when the
+	 * session last carried real traffic (any frame but SN_CREDIT, either
+	 * way), which bounds the keepalive to keepalive_window_us; and a pending
+	 * request for the engine to send one ignored SN_CREDIT (round nineteen). */
+	u64 last_tx_ns, last_activity_ns;
 	bool keepalive_due;
 	/* Resident poller: replaces the delayed_work whose dispatch latency
 	 * (ring_work then the work item) dominated receive latency.

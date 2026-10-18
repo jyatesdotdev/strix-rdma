@@ -1656,20 +1656,32 @@ latency of an exchange that follows an idle gap.
 - an `exchange` mode: both sides send N bytes at once and each waits for the
   peer's, which is the TP all-reduce swap. Messages carry a sequence tag, so
   any loss or reordering fails the run.
-- `--gap-us N`: idle between iterations
+- `--gap-us N`: idle between iterations. The sleep asks for 1 ns of timer
+  slack; see section 6.
 - `--gap-spin`: busy-wait the gap instead of sleeping
+- `exchange --tp sync|persist` with `--gpu-kernels`: each iteration is a whole
+  TP step from GPU memory. A kernel produces 10 KiB (or `--len`), the CPU sends
+  it, and a kernel consumes and checks every word of the peer's. `sync`
+  launches and waits for a kernel at each hand-off. `persist` keeps one kernel
+  resident, driven through control words in coherent host memory. `--gap-gpu`
+  fills `sync`'s gap with GPU work, so the launches do not meet an idle GPU.
+- `--gpu-host` and `--gpu-fine`: buffer types for the GPU kernels (see GPU
+  memory below)
+- `--gpu` for `ping` and `exchange`
 
 Every sample is kept in nanoseconds, and the report gives min, avg, p50, p90,
 p99, p99.9 and max. With 1,000 samples or more, the first 100 are excluded as
 warm-up.
 
-Two scripts were added:
+Other tooling added:
 
 - `bench/scripts/verbs-latency.sh` sweeps sizes × gaps.
 - `run-verbs-smoke.sh` takes `SMOKE_PREFIX` (e.g. `taskset -c 6`).
+- `tools/verbs/strix-gpu-sync-bench.hip` times the GPU-side hand-offs on one
+  host.
 
-All figures below are 20,000 iterations unless stated, measured on 2026-10-16
-with BIOS 3.06 on both hosts.
+All figures are from 2026-10-16/17, BIOS 3.06 on both hosts, 10,000-20,000
+iterations unless stated.
 
 ### 1. The frame CRC cost ~25 µs per 4 KiB frame
 
@@ -1694,12 +1706,12 @@ to load if they differ.
 | exchange 40 KiB | 677.5 | 51.1 |
 | ping round trip 256 B | 35.1 | 19.2 |
 
-### 2. Control RX ring polling (`ctl_rx_poll`, opt-in)
+### 2. Control RX ring polling (`ctl_rx_poll`, default on)
 
 A received control frame used to reach the poller through the NHI interrupt,
 then the core's `ring_work` workqueue, then `sn_ring_callback()`. With
-`ctl_rx_poll=1` (0444, default 0) the control RX ring is allocated in the core's
-polling mode:
+`ctl_rx_poll=1` (0444) the control RX ring is allocated in the core's polling
+mode:
 
 - The core masks the ring interrupt and calls `sn_rx_start_poll()` instead.
 - The spinning poller reaps completed descriptors itself with `tb_ring_poll()`,
@@ -1708,23 +1720,37 @@ polling mode:
   frame that completed during the unmask still gets reaped.
 - Cancellation at ring stop still runs through the callbacks.
 
-The 256 B round trip falls from ~17 to ~12 µs, and the 10 KiB exchange from ~25
-to ~19 µs.
+The 256 B round trip falls from ~17 to ~12 µs.
 
-It is **off by default** because it changes bulk behaviour in ways that are not
-yet understood:
+**On its own it hurt bulk throughput and READ.** It cost 15-35% of bulk under
+the default scheduler, and zero-copy READ fell back 40-87 times per `read 2000`
+instead of almost never. Varying one runtime factor at a time under polling
+(transfer-only MiB/s):
 
-| transfer-only MiB/s, same build | callback, defaults | polling, defaults | polling, profile |
+| Factor | SEND 2000 | READ 2000 | READ fallbacks |
 |---|---|---|---|
-| SEND 2000 | 954-1,016 | 809-848 | 1,095-1,109 |
-| WRITE 2000 | 927-952 | 598-621 | 1,086-1,098 |
-| READ 2000 | 860-873 | 665-690 | 318-327 |
+| defaults | 822 | 632 | 40 |
+| 2 ms spin | 827 | 589 | 42 |
+| FIFO poller, unpinned | **428** | 560 | 26 |
+| pinned poller | 787 | 649 | 39 |
+| IRQ steering | 982 | 505 | 87 |
+| pinned FIFO poller, steered IRQs, 2 ms spin | 989 | 513 | 85 |
+| the same + keepalive | 1,106 | 882 | 1 |
+| **defaults + keepalive** | **1,091** | **870** | **1** |
 
-Zero-copy READ falls back far more often with polling: 15-18 times per run
-under defaults and 54-107 with the profile, against none with callbacks. That
-is round twelve's withheld final frame. The best guess is that faster
-control-ring handling changes when receive buffers are re-posted, and so how
-E2E credits are granted. It has not been shown.
+**The keepalive (section 4) is what fixes it.** Zero-copy READ's natural stalls
+are round twelve's: the NHI holding a burst's final frame, posted but not
+transmitted, past a 67 ms retry window. They appear to be the same cold
+transmit path. A periodic DMA on the control ring makes them practically
+vanish. Polling takes interrupts away, and so the activity they caused, so
+polling and the keepalive belong together. Both are on by default.
+
+Two settings to avoid:
+
+- A FIFO poller without pinning starves the NHI's interrupt work: SEND fell to
+  428.
+- An earlier run with the `latency-performance` tuned profile also showed
+  zero-copy READ at ~320 MiB/s. The profile script does not touch tuned.
 
 ### 3. Smaller cuts
 
@@ -1739,7 +1765,7 @@ sound and remove work.
   receiver ignores it, so a ping no longer has a CREDIT frame queued ahead of
   its data.
 
-### 4. The transmit path goes cold within ~50 µs
+### 4. The transmit path goes cold within ~50 µs: the keepalive
 
 Back-to-back numbers hid this. After a 200 µs gap, a 256 B round trip took
 ~40 µs, against ~12 hot. A trace with a 200 µs gap showed the first frame
@@ -1750,135 +1776,144 @@ queued at 2 µs but its TX completion at 24 µs, against ~4 µs hot. Ruled out:
 - **USB4 CLx:** `thunderbolt clx=0` tightens the tail but leaves the median.
 - **Control-ring E2E:** `ctl_e2e=0` gives 36.5 against 40.0 µs.
 
-`keepalive_us` (0644, default 0) has the poller send one `SN_CREDIT`, which
-every receiver ignores, once the control TX ring has been idle that long while
-a session is up. The path cools between 20 and 100 µs:
+What goes cold is hardware below the driver: the NHI's DMA engine, or the
+SoC's I/O-clock or data-fabric power management. Neither is visible or
+controllable from Linux here. The path cools between 20 and 100 µs:
 
-| ping 256 B p50 / p99 (µs) | gap 200 µs | gap 1 ms |
+| ping 256 B p50 / p99 (µs), keepalive interval | gap 200 µs | gap 1 ms |
 |---|---|---|
-| keepalive off | 39.2 / 41.7 | 48.4 / 52.2 |
+| off | 39.2 / 41.7 | 48.4 / 52.2 |
 | 20 µs | 12.8 / 14.4 | 12.9 / 14.7 |
 | 50 µs | 16.8 / 24.7 | 12.5 / 26.4 |
 | 100 µs | 22.4 / 42.7 | 24.4 / 47.7 |
 
-What goes cold is hardware below the driver: the NHI's DMA engine, or the
-SoC's I/O-clock or data-fabric power management. Neither is visible or
-controllable from Linux here. With back-to-back traffic the keepalive never
-fires, and its measured cost is about 1 µs or less.
+**`keepalive_us` (0644, default 20)** has the poller send one `SN_CREDIT`,
+which every receiver ignores, whenever the control TX ring has been idle that
+long. It only does so while the session has carried real traffic within
+**`keepalive_window_us` (0644, default 50,000)**:
+
+- Real traffic means any frame other than `SN_CREDIT`, in either direction, or
+  work in flight. So two idle hosts cannot keep each other warm, and a stranded
+  burst keeps getting keepalives for as long as it waits. ok 40 covers the
+  first part, and a mutation that counts `SN_CREDIT` as activity fails it.
+- An idle host sends nothing and its poller sleeps on the usual 1 ms tick:
+  0 frames over 2 s, measured.
+- A 10 ms window was too short. An application's CPU work between bursts, here
+  the smoke tool checking 8 MiB, let it lapse, and the next zero-copy burst
+  started cold: READ fell back 27-41 times per run. 30 ms was enough (1-3), and
+  50 ms leaves margin.
+
+With back-to-back traffic the keepalive never fires, and it costs about 1 µs
+or less.
 
 ### 5. Scheduling
 
-Under defaults the poller is an unpinned SCHED_OTHER thread. Its scheduling
-gives millisecond maxima: 5.2 ms worst on 20,000 pings, and p99.9 around
-200 µs. The profile pins the poller to its own core at SCHED_FIFO 50 and steers
-the NHI's interrupts to another core. That removes them: the worst ping over
-20,000 was 26 µs. The `latency-performance` tuned profile on its own did
+Under defaults the poller is an unpinned SCHED_OTHER thread, and the scheduler
+leaves occasional maxima of 0.1-2.6 ms. `tools/scripts/strix-verbs-latency-profile.sh`
+pins the poller at SCHED_FIFO 50 and steers the NHI's interrupts to another
+core. With the defaults above it adds only about 1 µs at the median, but it
+removes those outliers. The `latency-performance` tuned profile on its own did
 nothing measurable.
 
-### Results: defaults and the low-latency profile
+### 6. Exchange tails after a sleep were skew, not transport
 
-The **low-latency profile** is `ctl_rx_poll=1` and `thunderbolt clx=0` from
-modprobe.d, then `tools/scripts/strix-verbs-latency-profile.sh apply` after
-bring-up, with the application pinned to a third core:
+An `exchange` with a sleeping gap showed p99 ~55-60 µs after 200 µs. That was
+the two hosts starting their step at different times. `nanosleep` overshoots by
+up to the default 50 µs timer slack, and an exchange waits for the later
+host's message. No protocol counter moved, and a trace showed late frames,
+not lost ones. A busy-wait gap removes it: 10 KiB p99 23.1 instead of 59.4 µs.
+`ping` was never affected, since only one side sleeps. The tool now asks for
+1 ns of timer slack on sleeping gaps.
 
-| p50 / p99 (µs) | defaults | profile |
-|---|---|---|
-| ping 256 B, back-to-back | 15.7 / 20.0 | 11.7 / 12.5 |
-| ping 256 B, gap 200 µs | 43.5 / 50.7 | 11.4 / 13.2 |
-| ping 256 B, gap 1 ms | 63.4 / 239.7 | 13.3 / 16.0 |
-| exchange 10 KiB, back-to-back | 24.2 / 27.7 | 17.8 / 20.1 |
-| exchange 10 KiB, gap 200 µs | 43.6 / 67.1 | 18.6 / 54.2 |
+### Results
 
-Both configurations passed the regression gates byte-for-byte, with no
-`bad_frames` and no QP errors.
+On the defaults (polling, keepalive, CLx on, unpinned SCHED_OTHER poller),
+p50 / p99 in µs, with busy-wait gaps:
 
-| Bulk, transfer-only MiB/s | Defaults | Profile |
-|---|---|---|
-| SEND 2000 ×5 | 1,046-1,085 (median 1,076) | 1,105-1,107 |
-| WRITE 2000 | 1,040 | 1,086-1,095 |
-| READ 2000 | 874 ×2, zero fallbacks | see table 2 |
-
-**The profile's caveat:** zero-copy READ degrades, to ~320 MiB/s with frequent
-fallbacks. TP uses SEND and WRITE.
-
-Before this round, by comparison: a 256 B round trip of 35.1 µs and a 10 KiB
-exchange of 167 µs, both back-to-back. Donnerkeule's published 64 B figure
-(perftest half round trip, IOMMU off) is 7.4 µs one-way, a ~15 µs round trip.
-Our own stream path's floor is 9.8 µs at 4 KiB.
-
-### GPU buffers
-
-GPU-direct MRs (`hipMalloc`, DMA-BUF) keep all of this. At TP sizes the staged
-path copies through the buffer's `dma_buf_vmap` mapping, and that copy is no
-slower than for CPU memory. `strix-verbs-smoke --gpu` now runs `ping` and
-`exchange` too. GPU buffers measured faster than CPU buffers on every row. A
-likely reason is that GPU allocations are larger physically contiguous pieces,
-so there are fewer pages to walk in the copy and the IOMMU; that is not proven.
-
-| p50 / p99 (µs), 10,000 iterations | defaults, CPU | defaults, GPU | profile, CPU | profile, GPU |
+| | ping 256 B | exchange 256 B | exchange 10 KiB | exchange 40 KiB |
 |---|---|---|---|---|
-| exchange 256 B | 19.5 / 22.4 | 16.0 / 17.7 | 11.4 / 14.0 | 9.2 / 10.9 |
-| exchange 10 KiB | 26.5 / 30.9 | 22.0 / 24.9 | 17.9 / 20.2 | 15.8 / 18.2 |
-| exchange 10 KiB, gap 200 µs | 53.5 / 190.6 | 49.2 / 167.8 | 18.7 / 54.8 | 16.2 / 18.5 |
-| exchange 40 KiB, gap 200 µs | – | – | 48.1 / 92.8 | 39.9 / 54.1 |
-| ping 256 B, gap 200 µs | – | – | 12.8 / 14.4 | 10.8 / 12.9 |
+| back-to-back | 11.9 / 13.8 | - | 20.2 / 23.4 | - |
+| gap 200 µs | 12.6 / 15.0 | 11.6 / 15.9 | 21.6 / 24.0 | 49.0 / 52.2 |
+| gap 1 ms | 12.3 / 14.6 | - | - | - |
 
-The defaults columns are 5,000 iterations. GPU zero-copy bulk with the profile
-ran at WRITE 1,308-1,311 and SEND 1,326-1,338 MiB/s transfer-only, the highest
-measured.
+Before this round, the same 10 KiB exchange took 167 µs back-to-back, and a
+256 B round trip 35 µs. With the profile's scheduling on top, 10 KiB after a
+200 µs gap is 20.9 / 23.3.
 
-These figures cover the transport only. A TP step also pays the GPU's side of
-each exchange, as with any transport:
+Bulk on the defaults, transfer-only MiB/s, all byte-for-byte, with no
+`bad_frames`, no QP errors and no kernel warnings:
 
-- before the send, a system-scope release, which G4 showed is required
-  (`docs/GPU_DIRECT_VERBS.md`), and the CPU learning that the kernel finished
-- after the receive, a kernel that reads the data
+| SEND 2000 ×5 | WRITE 2000 ×3 | READ 2000 ×3 | GPU WRITE / SEND / READ 2000 |
+|---|---|---|---|
+| 1,093-1,104 | 1,071-1,095 | 859-887 (0-4 fallbacks) | 1,314 / 1,317 / 880 |
 
-`tools/verbs/strix-gpu-sync-bench.hip` (`make -C tools/verbs gpu-sync-bench`)
-times those hand-offs on one host. Every kernel writes 10 KiB and releases it
-at system scope. 20,000 iterations, p50 / p99 in µs, on max (max2 within
-0.1 µs):
+These are the highest measured on this pair. The other gates also passed:
+`write 200`, `read 500`, the SEND smoke, staged 3,000 B at offset 64 (SEND and
+READ), and SEND into receive buffers at +16 and +4097, on CPU and GPU memory,
+each with 800 refusals and 800 staged resends.
+
+### GPU memory
+
+**Transport.** GPU-direct MRs (`hipMalloc`, DMA-BUF) keep all of this. At TP
+sizes the staged path copies through the buffer's `dma_buf_vmap` mapping, and
+that copy is no slower than for CPU memory. Measured under the callback-mode
+build, GPU buffers were faster than CPU buffers on every row:
+
+- 10 KiB exchange: 22.0 against 26.5 µs by default, and 15.8 against 17.9 with
+  the profile's settings of the time
+- GPU zero-copy WRITE/SEND: 1.31-1.34 GB/s
+
+**The GPU's own hand-offs** (`strix-gpu-sync-bench`, one host, 10 KiB with a
+system-scope release, p50 / p99 µs; max2 within 0.1):
 
 | Hand-off | p50 | p99 |
 |---|---|---|
-| launch + `hipStreamSynchronize` (the usual pattern) | 7.65 | 8.04 |
+| launch + `hipStreamSynchronize` | 7.65 | 8.04 |
 | launch an empty kernel + sync (the runtime's floor) | 7.15 | 7.53 |
 | launch + `hipEventSynchronize` | 7.36 | 9.34 |
 | launch, CPU spins on a `hipStreamWriteValue32` flag | 5.93 | 6.27 |
 | launch, CPU spins on a flag stored by the kernel | 3.98 | 4.27 |
 | kernel pre-queued behind `hipStreamWaitValue32`: CPU flag → done flag | 3.05 | 3.32 |
-| **persistent kernel polling host memory: CPU flag → produce → done flag** | **1.37** | **1.63** |
-| for comparison, host staging: `hipMemcpyAsync` 10 KiB D2H / H2D + sync | 7.45 / 7.40 | 7.84 / 7.80 |
+| **resident kernel polling host memory: go → produce → done** | **1.37** | **1.63** |
+| for comparison, `hipMemcpyAsync` 10 KiB D2H / H2D + sync | 7.45 / 7.40 | 7.84 / 7.80 |
 
-`hipDeviceScheduleSpin` made no difference; the runtime already spins on
-waits this short.
+`hipDeviceScheduleSpin` made no difference.
 
-Per exchange, these hand-offs cost roughly:
+**The whole TP step, end to end** (`exchange --tp`, 10,000 steps, every word
+checked by the consuming kernel on both hosts, defaults, 200 µs gaps, p50 / p99
+µs):
 
-- **launch-and-sync:** ~11-15 µs (a sync before the send, a launch after the
-  receive), comparable to the 16 µs GPU-buffer transport itself
-- **kernels queued ahead behind stream wait/write values:** ~3-6 µs
-- **a resident kernel:** ~1.4 µs, which with the profile's transport makes
-  ~17.5 µs per exchange
+| 10 KiB step | produce | transport | consume | total |
+|---|---|---|---|---|
+| resident kernel, `--gpu-host` | 1.45 | ~17 | 3.67 | **22.9 / 25.1** |
+| launch-and-sync, GPU busy in the gap | 7.6 | ~17 | 10.7 | 35.4 / 93.3 (profile) |
 
-Staging through host memory instead would add ~15 µs of copies on top of the
-syncs. At ~96 exchanges per decode step, the choice is worth about 1 ms per
-token.
+A 40 KiB resident step takes 53.9 / 56.5. At ~96 exchanges per decode step,
+a resident kernel costs ~2.2 ms of communication per step, against ~3.4 ms
+with launch-and-sync.
 
-Two pitfalls found while writing it, both on gfx1151:
+**Buffer type matters for a resident kernel.** With `hipMalloc` (DMA-BUF) MRs,
+the staged send's CPU copy never saw a still-running kernel's writes: every
+received word was zero. That held with the system-scope release and with
+fine-grained `hipExtMallocWithFlags` memory alike. Launched kernels are fine
+with DMA-BUF MRs, since the end of the kernel writes back. On this APU,
+host-coherent memory (`hipHostMalloc`, registered as an ordinary MR) is the
+same DRAM and stays coherent both ways while the kernel runs. That is what a
+persistent TP kernel should use.
+
+Two gfx1151 pitfalls found on the way:
 
 - **A barrier after a loop that only some threads run deadlocks.** Thread 0
   polled while the rest waited at `__syncthreads()`, and the kernel stopped
-  after the first `go`. Every thread now polls.
-- **The CPU→GPU flag itself is fine.** A system-scope atomic load of
-  `hipHostMallocCoherent` memory sees the CPU's store with no flush. So do a
-  fetch-add of 0 and a `glc slc dlc` load (`--poll`), within 0.4 µs of each
-  other.
+  after the first step. Every thread now polls.
+- **A cache-bypassing `glc slc dlc` load reads zeros** from a receive slot the
+  staged path wrote through the CPU, whereas system-scope atomic loads and
+  plain loads see it.
 
 ### Open
 
-- **Why polling hurts bulk under defaults, and READ in both configurations.**
-  Fixing this would let `ctl_rx_poll` become the default.
-- **The 10 KiB exchange's p99 after a gap (54 µs) with the profile.**
 - **What exactly goes cold in the transmit path.** A cheaper warm-up than a
-  frame every 20 µs may exist.
+  20 µs frame may exist.
+- **The 40 KiB TP step's consume hand-off (10.8 µs).** That is the GPU reading
+  host-coherent memory. The step could read device memory once a resident
+  kernel can write DMA-BUF MRs visibly.

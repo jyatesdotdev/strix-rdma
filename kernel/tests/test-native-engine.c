@@ -74,6 +74,7 @@ struct sn_device {
 	struct sn_qp *qp;
 	struct sn_readiness ready;
 	bool keepalive_due; /* keepalive_us request (main.c) */
+	u64 last_activity_ns; /* bounds the keepalive window */
 	union ib_gid peer_gid;
 	u64 next_hello;
 	bool dead;
@@ -1680,9 +1681,28 @@ static void test_wire_version_mismatch(void)
 	release(a);
 	puts("ok 39 - a peer speaking another wire version is refused and reported, not counted as corruption");
 }
+static void test_keepalive_is_not_activity(void)
+{
+	struct sn_device *b, *a = zc_pair(&b);
+	struct sn_header h;
+	sn_u8 buf[SN_FRAME];
+
+	now += 1000;
+	a->last_activity_ns = b->last_activity_ns = 0;
+	h = sn_out_header(b->qp, SN_CREDIT);
+	h.sequence = b->qp->credit_revision + 1; h.total = b->qp->rq_count;
+	assert(!sn_encode(buf, sizeof(buf), &h));
+	sn_engine_receive(a, buf, SN_HEADER);
+	assert(!a->last_activity_ns && !a->bad_frames);
+	zc_op(a, b, SN_SEND, 0x41, 1);
+	assert(a->last_activity_ns && b->last_activity_ns);
+	assert(!a->errors && !b->errors);
+	release(a); release(b);
+	puts("ok 40 - a received SN_CREDIT (the keepalive) is not activity; a real operation is");
+}
 int main(void)
 {
-	puts("1..39");
+	puts("1..40");
 	test_send(); test_write_read(); test_failures(); test_gating_window();
 	test_control_overflow(); test_handshake();
 	test_zc(); test_zc_rnr(); test_zc_retry_ready(); test_zc_retry_burst();
@@ -1709,6 +1729,7 @@ int main(void)
 	test_zc_send_unaligned_receive();
 	test_read_ack_probe();
 	test_wire_version_mismatch();
+	test_keepalive_is_not_activity();
 	assert(!warnings);
 	return 0;
 }

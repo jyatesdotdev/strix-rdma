@@ -819,6 +819,10 @@ void sn_engine_receive(struct sn_device *d, const void *frame, size_t bytes)
 		d->bad_frames++;
 		return;
 	}
+	/* Real traffic keeps the keepalive window open; the peer's keepalives
+	 * (SN_CREDIT) must not, or two idle hosts would keep each other warm. */
+	if (h.opcode != SN_CREDIT)
+		WRITE_ONCE(d->last_activity_ns, ktime_get_ns());
 	switch (h.opcode) {
 	case SN_ACK: case SN_READ_ACK: sn_receive_ack(q, &h); break;
 	case SN_READ_PROBE: sn_receive_read_probe(q, &h); break;

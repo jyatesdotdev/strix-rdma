@@ -1,6 +1,32 @@
 # LOG
 Running log of noteworthy work; newest first.
 
+## 2026-10-17 — low latency by default; end-to-end TP step from GPU memory ~23 µs
+- **End-to-end TP step** (`exchange --tp persist|sync`): a kernel produces, the
+  CPU sends over verbs, a kernel on the peer consumes and checks every word.
+  10 KiB after 200 µs gaps, on the defaults:
+  - resident kernel: 22.9 µs p50 / 25.1 p99 (produce 1.45, consume 3.67)
+  - launch-and-sync: ~35 µs with heavier tails
+- **A resident kernel needs host-coherent buffers.** With `hipMalloc` DMA-BUF
+  MRs, coarse- or fine-grained, the staged send never saw a running kernel's
+  writes (all zeros). `hipHostMalloc` memory registered as an ordinary MR works.
+- **The keepalive fixes polling.** One factor at a time: with polling, bulk
+  dropped and READ fell back 40-87 times per run; adding the keepalive alone
+  restored SEND 1,091 and READ 870 with 1 fallback. Round twelve's natural READ
+  stalls were the cold transmit path.
+- **New defaults:** `ctl_rx_poll=1`, `keepalive_us=20`,
+  `keepalive_window_us=50000`. The window counts real traffic (not
+  `SN_CREDIT`, test 40) or work in flight, and an idle host sends nothing.
+  - A 10 ms window was too short (READ fallbacks returned); 30 ms was enough.
+  - Measured: ping 11.9-12.6 µs, 10 KiB exchange 20.2-21.6 µs, SEND
+    1,093-1,104, READ 859-887 (0-4 fallbacks), GPU WRITE/SEND 1,314-1,317. All
+    gates passed.
+- **The "54 µs exchange p99 after a gap" was host skew.** `nanosleep` timer
+  slack let one host start up to ~50 µs late; busy-wait gaps give a p99 of
+  23 µs. The tool now asks for 1 ns of slack.
+- **The latency profile is now scheduling only** (pinned FIFO poller, steered
+  IRQs). An unpinned FIFO poller halves SEND.
+
 ## 2026-10-17 — GPU-direct keeps the TP latency; the GPU's own hand-off costs 1.4-15 µs per exchange
 - **GPU MRs were faster than CPU memory at every TP size.** 10 KiB exchange:
   22.0 µs p50 by default, 15.8 with the profile; after a 200 µs gap, 16.2 with

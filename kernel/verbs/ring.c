@@ -357,8 +357,12 @@ int sn_ring_send(struct sn_device *d, struct sn_header *h, const void *payload, 
 	dma_wmb();
 	ret = tb_ring_tx(d->tx_ring, &s->frame);
 	if (!ret) {
+		u64 now = ktime_get_ns();
+
 		d->tx_head++; d->tx_frames++;
-		WRITE_ONCE(d->last_tx_ns, ktime_get_ns());
+		WRITE_ONCE(d->last_tx_ns, now);
+		if (h->opcode != SN_CREDIT)
+			WRITE_ONCE(d->last_activity_ns, now);
 	}
 	return ret;
 }

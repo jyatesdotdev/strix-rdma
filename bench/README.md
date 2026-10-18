@@ -159,11 +159,19 @@ scripts/verbs-e2e-ab.sh A /tmp/ab-A1       #   control-ring E2E A/B; end with ar
 For latency, the rows with an idle gap are the ones that predict tensor
 parallelism, which computes between exchanges. A hot, back-to-back loop hides a
 transmit path that goes cold within ~50 µs (`../docs/ZEROCOPY_VERBS.md`, round
-nineteen). The low-latency profile is two modprobe.d options
-(`strix_nhi ctl_rx_poll=1`, `thunderbolt clx=0`) plus
-`../tools/scripts/strix-verbs-latency-profile.sh apply` on both hosts, with the
-application pinned elsewhere (`SMOKE_PREFIX='taskset -c 6'`). It trades
-zero-copy READ throughput for latency.
+nineteen). The defaults keep that path warm (`keepalive_us`) and poll the
+control RX ring (`ctl_rx_poll`). `../tools/scripts/strix-verbs-latency-profile.sh
+apply` on both hosts adds a pinned FIFO poller and steered IRQs; with the
+application pinned elsewhere (`SMOKE_PREFIX='taskset -c 6'`), that removes
+the scheduler's outliers.
+
+For a whole TP step from GPU memory, use `exchange --tp persist|sync`
+(`make -C ../tools/verbs gpu-kernels` first):
+
+```sh
+SMOKE_FLAGS='--gpu-kernels ./strix-verbs-gpu-kernels.hsaco --gpu-host --len 10240 --gap-us 200 --gap-spin --tp persist' \
+  scripts/run-verbs-smoke.sh exchange 10000
+```
 
 `verbs-e2e-ab.sh` reboots both hosts and runs bring-up itself (BRINGUP is the
 script's path on the hosts). It reads `ctl_e2e` back and stops if the arm is
